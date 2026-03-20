@@ -645,58 +645,136 @@ public:
 		}
 
 		getCpuid(1, data);
-		if (ecx & (1U << 0)) type_ |= tSSE3;
-		if (ecx & (1U << 1)) type_ |= tPCLMULQDQ;
-		if (ecx & (1U << 9)) type_ |= tSSSE3;
-		if (ecx & (1U << 19)) type_ |= tSSE41;
-		if (ecx & (1U << 20)) type_ |= tSSE42;
 		if (ecx & (1U << 22)) type_ |= tMOVBE;
 		if (ecx & (1U << 23)) type_ |= tPOPCNT;
-		if (ecx & (1U << 25)) type_ |= tAESNI;
 		if (ecx & (1U << 26)) type_ |= tXSAVE;
 		if (ecx & (1U << 27)) type_ |= tOSXSAVE;
-		if (ecx & (1U << 29)) type_ |= tF16C;
 		if (ecx & (1U << 30)) type_ |= tRDRAND;
 
 		if (edx & (1U << 15)) type_ |= tCMOV;
 		if (edx & (1U << 23)) type_ |= tMMX;
-		if (edx & (1U << 25)) type_ |= tMMX2 | tSSE;
-		if (edx & (1U << 26)) type_ |= tSSE2;
 
+		// These features require OS support to be usable, so check for that.
+		// The OS must support saving/restoring the extended register state,
+		// If these checks are not done, then executing an instruction from these
+		// features will cause an illegal instruction exception.
+		// Some features are so common that the check is almost guaranteed to succeed,
+		// but we do it anyway for correctness.
 		if (type_ & tOSXSAVE) {
-			// check XFEATURE_ENABLED_MASK[2:1] = '11b'
 			uint64_t bv = getXfeature();
-			if ((bv & 6) == 6) {
-				if (ecx & (1U << 12)) type_ |= tFMA;
-				if (ecx & (1U << 28)) type_ |= tAVX;
-				// do *not* check AVX-512 state on macOS because it has on-demand AVX-512 support
-#if !defined(__APPLE__)
-				if (((bv >> 5) & 7) == 7)
-#endif
-				{
+			// check XCR0[1] = '1b' (OS saves/restores SSE XMM register state)
+			if (((bv >> 1) & 1) == 1) {
+				if (ecx & (1U << 0)) type_ |= tSSE3;
+				if (ecx & (1U << 1)) type_ |= tPCLMULQDQ;
+				if (ecx & (1U << 9)) type_ |= tSSSE3;
+				if (ecx & (1U << 19)) type_ |= tSSE41;
+				if (ecx & (1U << 20)) type_ |= tSSE42;
+				if (ecx & (1U << 25)) type_ |= tAESNI;
+				if (edx & (1U << 25)) type_ |= tMMX2 | tSSE;
+				if (edx & (1U << 26)) type_ |= tSSE2;
+				// SHA, GFNI, SM3, SM4 have XMM (128-bit) encodings requiring XCR0[1]
+				if (maxNum >= 7) {
 					getCpuidEx(7, 0, data);
-					if (ebx & (1U << 16)) type_ |= tAVX512F;
-					if (type_ & tAVX512F) {
-						if (ebx & (1U << 17)) type_ |= tAVX512DQ;
-						if (ebx & (1U << 21)) type_ |= tAVX512_IFMA;
-						if (ebx & (1U << 26)) type_ |= tAVX512PF;
-						if (ebx & (1U << 27)) type_ |= tAVX512ER;
-						if (ebx & (1U << 28)) type_ |= tAVX512CD;
-						if (ebx & (1U << 30)) type_ |= tAVX512BW;
-						if (ebx & (1U << 31)) type_ |= tAVX512VL;
-						if (ecx & (1U << 1)) type_ |= tAVX512_VBMI;
-						if (ecx & (1U << 6)) type_ |= tAVX512_VBMI2;
-						if (ecx & (1U << 11)) type_ |= tAVX512_VNNI;
-						if (ecx & (1U << 12)) type_ |= tAVX512_BITALG;
-						if (ecx & (1U << 14)) type_ |= tAVX512_VPOPCNTDQ;
-						if (edx & (1U << 2)) type_ |= tAVX512_4VNNIW;
-						if (edx & (1U << 3)) type_ |= tAVX512_4FMAPS;
-						if (edx & (1U << 8)) type_ |= tAVX512_VP2INTERSECT;
-						if ((type_ & tAVX512BW) && (edx & (1U << 23))) type_ |= tAVX512_FP16;
+					if (ebx & (1U << 29)) type_ |= tSHA;
+					if (ecx & (1U << 8)) type_ |= tGFNI;
+					const uint32_t maxSubLeaves7_sse = eax;
+					if (maxSubLeaves7_sse >= 1) {
+						getCpuidEx(7, 1, data);
+						if (eax & (1U << 1)) type_ |= tSM3;
+						if (eax & (1U << 2)) type_ |= tSM4;
 					}
 				}
 			}
+			// check XCR0[4:3] = '11b' (OS saves/restores MPX BNDREGS and BNDCSR state)
+			if (((bv >> 3) & 3) == 3) {
+				if (maxNum >= 7) {
+					getCpuidEx(7, 0, data);
+					if (ebx & (1U << 14)) type_ |= tMPX;
+				}
+			}
+			// check XCR0[2:1] = '11b' (OS saves/restores AVX YMM register state)
+			if (((bv >> 1) & 3) == 3) {
+				if (ecx & (1U << 12)) type_ |= tFMA;
+				if (ecx & (1U << 28)) type_ |= tAVX;
+				if (ecx & (1U << 29)) type_ |= tF16C;
+				// VAES and VPCLMULQDQ have VEX-256 forms requiring YMM state (XCR0[2:1])
+				// SHA512 operates on 256-bit YMM registers (XCR0[2:1])
+				if (maxNum >= 7) {
+					getCpuidEx(7, 0, data);
+					if (ecx & (1U << 9)) type_ |= tVAES;
+					if (ecx & (1U << 10)) type_ |= tVPCLMULQDQ;
+					const uint32_t maxSubLeaves7_avx = eax;
+					if (maxSubLeaves7_avx >= 1) {
+						getCpuidEx(7, 1, data);
+						if (eax & (1U << 0)) type_ |= tSHA512;
+					}
+				}
+				// do *not* check AVX-512 state on macOS because it has on-demand AVX-512 support
+#if !defined(__APPLE__)
+				// check XCR0[7:5] = '111b' (OS saves/restores AVX-512 opmask, ZMM_Hi256, and Hi16_ZMM state)
+				if (((bv >> 5) & 7) == 7)
+#endif
+				{
+					if (maxNum >= 7) {
+						getCpuidEx(7, 0, data);
+						if (ebx & (1U << 16)) type_ |= tAVX512F;
+						if (type_ & tAVX512F) {
+							if (ebx & (1U << 17)) type_ |= tAVX512DQ;
+							if (ebx & (1U << 21)) type_ |= tAVX512_IFMA;
+							if (ebx & (1U << 26)) type_ |= tAVX512PF;
+							if (ebx & (1U << 27)) type_ |= tAVX512ER;
+							if (ebx & (1U << 28)) type_ |= tAVX512CD;
+							if (ebx & (1U << 30)) type_ |= tAVX512BW;
+							if (ebx & (1U << 31)) type_ |= tAVX512VL;
+							if (ecx & (1U << 1)) type_ |= tAVX512_VBMI;
+							if (ecx & (1U << 6)) type_ |= tAVX512_VBMI2;
+							if (ecx & (1U << 11)) type_ |= tAVX512_VNNI;
+							if (ecx & (1U << 12)) type_ |= tAVX512_BITALG;
+							if (ecx & (1U << 14)) type_ |= tAVX512_VPOPCNTDQ;
+							if (edx & (1U << 2)) type_ |= tAVX512_4VNNIW;
+							if (edx & (1U << 3)) type_ |= tAVX512_4FMAPS;
+							if (edx & (1U << 8)) type_ |= tAVX512_VP2INTERSECT;
+							if ((type_ & tAVX512BW) && (edx & (1U << 23))) type_ |= tAVX512_FP16;
+						}
+						// AVX10 requires full AVX-512 state (XCR0[7:5])
+						const uint32_t maxSubLeaves512 = eax;
+						if (maxSubLeaves512 >= 1) {
+							getCpuidEx(7, 1, data);
+							if (edx & (1U << 19)) type_ |= tAVX10;
+						}
+					}
+				}
+			}
+
+			// check XCR0[18:17] = '11b' (OS saves/restores AMX TILECFG and TILEDATA state)
+			if (((bv >> 17) & 3) == 3) {
+				if (maxNum >= 7) {
+					getCpuidEx(7, 0, data);
+					if (edx & (1U << 22)) type_ |= tAMX_BF16;
+					if (edx & (1U << 24)) type_ |= tAMX_TILE;
+					if (edx & (1U << 25)) type_ |= tAMX_INT8;
+					const uint32_t maxSubLeaves = eax;
+					if (maxSubLeaves >= 1) {
+						getCpuidEx(7, 1, data);
+						if (eax & (1U << 21)) type_ |= tAMX_FP16;
+						getCpuidEx(0x1e, 1, data);
+						if (eax & (1U << 4)) type_ |= tAMX_FP8;
+						if (eax & (1U << 5)) type_ |= tAMX_TRANSPOSE;
+						if (eax & (1U << 6)) type_ |= tAMX_TF32;
+						if (eax & (1U << 7)) type_ |= tAMX_AVX512;
+						if (eax & (1U << 8)) type_ |= tAMX_MOVRS;
+					}
+				}
+			}
+			// check XCR0[19] = '1b' (OS saves/restores APX extended GPR state r16-r31)
+			if ((bv >> 19) & 1) {
+				if (maxNum >= 7) {
+					getCpuidEx(7, 1, data);
+					if (edx & (1U << 21)) type_ |= tAPX_F;
+				}
+			}
 		}
+		// Check for features that do not require OS support to be usable.
 		if (maxNum >= 7) {
 			getCpuidEx(7, 0, data);
 			const uint32_t maxNumSubLeaves = eax;
@@ -706,18 +784,13 @@ public:
 			if (ebx & (1U << 8)) type_ |= tBMI2;
 			if (ebx & (1U << 9)) type_ |= tENHANCED_REP;
 			if (ebx & (1U << 11)) type_ |= tRTM;
-			if (ebx & (1U << 14)) type_ |= tMPX;
 			if (ebx & (1U << 18)) type_ |= tRDSEED;
 			if (ebx & (1U << 19)) type_ |= tADX;
 			if (ebx & (1U << 20)) type_ |= tSMAP;
 			if (ebx & (1U << 23)) type_ |= tCLFLUSHOPT;
 			if (ebx & (1U << 24)) type_ |= tCLWB;
-			if (ebx & (1U << 29)) type_ |= tSHA;
 			if (ecx & (1U << 0)) type_ |= tPREFETCHWT1;
 			if (ecx & (1U << 5)) type_ |= tWAITPKG;
-			if (ecx & (1U << 8)) type_ |= tGFNI;
-			if (ecx & (1U << 9)) type_ |= tVAES;
-			if (ecx & (1U << 10)) type_ |= tVPCLMULQDQ;
 			if (ecx & (1U << 23)) type_ |= tKEYLOCKER;
 			if (ecx & (1U << 25)) type_ |= tCLDEMOTE;
 			if (ecx & (1U << 27)) type_ |= tMOVDIRI;
@@ -726,36 +799,20 @@ public:
 			if (edx & (1U << 14)) type_ |= tSERIALIZE;
 			if (edx & (1U << 15)) type_ |= tHYBRID;
 			if (edx & (1U << 16)) type_ |= tTSXLDTRK;
-			if (edx & (1U << 22)) type_ |= tAMX_BF16;
-			if (edx & (1U << 24)) type_ |= tAMX_TILE;
-			if (edx & (1U << 25)) type_ |= tAMX_INT8;
 			if (maxNumSubLeaves >= 1) {
 				getCpuidEx(7, 1, data);
-				if (eax & (1U << 0)) type_ |= tSHA512;
-				if (eax & (1U << 1)) type_ |= tSM3;
-				if (eax & (1U << 2)) type_ |= tSM4;
 				if (eax & (1U << 3)) type_ |= tRAO_INT;
-				if (eax & (1U << 4)) type_ |= tAVX_VNNI;
+				if (type_ & tAVX && (eax & (1U << 4))) type_ |= tAVX_VNNI;
 				if (type_ & tAVX512F) {
 					if (eax & (1U << 5)) type_ |= tAVX512_BF16;
 				}
 				if (eax & (1U << 7)) type_ |= tCMPCCXADD;
-				if (eax & (1U << 21)) type_ |= tAMX_FP16;
-				if (eax & (1U << 23)) type_ |= tAVX_IFMA;
+				if (type_ & tAVX && (eax & (1U << 23))) type_ |= tAVX_IFMA;
 				if (eax & (1U << 31)) type_ |= tMOVRS;
-				if (edx & (1U << 4)) type_ |= tAVX_VNNI_INT8;
-				if (edx & (1U << 5)) type_ |= tAVX_NE_CONVERT;
-				if (edx & (1U << 10)) type_ |= tAVX_VNNI_INT16;
+				if (type_ & tAVX && (edx & (1U << 4))) type_ |= tAVX_VNNI_INT8;
+				if (type_ & tAVX && (edx & (1U << 5))) type_ |= tAVX_NE_CONVERT;
+				if (type_ & tAVX && (edx & (1U << 10))) type_ |= tAVX_VNNI_INT16;
 				if (edx & (1U << 14)) type_ |= tPREFETCHITI;
-				if (edx & (1U << 19)) type_ |= tAVX10;
-				if (edx & (1U << 21)) type_ |= tAPX_F;
-
-				getCpuidEx(0x1e, 1, data);
-				if (eax & (1U << 4)) type_ |= tAMX_FP8;
-				if (eax & (1U << 5)) type_ |= tAMX_TRANSPOSE;
-				if (eax & (1U << 6)) type_ |= tAMX_TF32;
-				if (eax & (1U << 7)) type_ |= tAMX_AVX512;
-				if (eax & (1U << 8)) type_ |= tAMX_MOVRS;
 			}
 		}
 		if (maxNum >= 0x19) {
@@ -772,6 +829,7 @@ public:
 		setNumCores();
 		setCacheHierarchy();
 	}
+	void reinit() { *this = Cpu(); }
 	void putFamily() const
 	{
 #ifndef XBYAK_ONLY_CLASS_CPU
