@@ -13,6 +13,7 @@ This implementation is modeled after the [Xbyak_aarch64 Register Manager (PR #45
    - General Purpose (GP): Reg8, Reg16, Reg32, Reg64
    - Vector (Vec): Xmm, Ymm, Zmm
    - Opmask: k0-k7 (AVX-512)
+   - AMX Tile: tmm0-tmm7 (Intel AMX, runtime-detected)
 3. Implement scoped registers following the RAII technique.
 4. Ensure compatibility & minimum friction with current register manager techniques in oneDNN.
 5. Support Intel APX extended registers (r16-r31) with automatic detection.
@@ -29,10 +30,11 @@ The motivation for this project is to reduce the manual user-level register mana
 | **GP Registers** | 16 (r0-r15), 32 with APX (r0-r31) | 31 (x0-x30) |
 | **Vector Registers** | 16 (zmm0-zmm15) SSE/AVX/AVX2, 32 (zmm0-zmm31) with AVX-512 | 32 (v0-v31) for FP/SIMD |
 | **Mask Registers** | 8 opmask (k0-k7) for AVX-512 | 16 predicate (p0-p15) for SVE |
+| **Tile Registers** | 8 AMX tiles (tmm0-tmm7, runtime-detected) | N/A |
 | **Special Registers** | rsp (r4), rbp (r5), k0 | x16/x17 (IPC), x18 (platform), x29 (FP), x30 (LR) |
 | **Register Aliasing** | RAX/EAX/AX/AL share same register<br>XMM/YMM/ZMM share same register | Different sizes access same register |
 | **Calling Convention** | Windows x64 / System V AMD64 ABI (auto-detected) | AAPCS64 |
-| **Extended Support** | Intel APX adds r16-r31, AVX-512 adds zmm16-zmm31 (runtime detection) | SVE scalable vectors |
+| **Extended Support** | Intel APX adds r16-r31, AVX-512 adds zmm16-zmm31, AMX adds tmm0-tmm7 (all runtime detection) | SVE scalable vectors |
 
 ## Assumptions
 
@@ -42,6 +44,7 @@ The motivation for this project is to reduce the manual user-level register mana
 - There is no specific order that registers should be allocated in their respective sets.
 - Intel APX support is detected at runtime and extended GP registers (r16-r31) are automatically made available.
 - AVX-512 support is detected at runtime and extended vector registers (zmm16-zmm31) are automatically made available.
+- Intel AMX support is detected at runtime and tile registers (tmm0-tmm7) are automatically made available.
 - Register aliasing (e.g., RAX/EAX/AX/AL) is handled by tracking at the index level.
 
 ## Implementation
@@ -92,6 +95,18 @@ The register manager maintains three families of registers, each with three sets
 |  +-------------+                    |
 |  | preserved   | (empty)            |
 |  +-------------+                    |
+|  +-------------+                    |
+|  | used        | (tracking)         |
+|  +-------------+                    |
++-------------------------------------+
++-------------------------------------+
+| AMX Tile Registers (0-7)            |
+|  +-------------+                    |
+|  | free_regs   | ---alloc()-->      |
+|  +-------------+                    |
+|  +-------------+                    |
+|  | in_use      | <--alloc()---      |
+|  +-------------+    free()---->     |
 |  +-------------+                    |
 |  | used        | (tracking)         |
 |  +-------------+                    |
@@ -276,6 +291,12 @@ RegPoolManager() {
     has_avx512_ = cpu.has(Xbyak::util::Cpu::tAVX512F);
     max_vec_reg_idx_ = has_avx512_ ? 31 : 15;
     
+    // Detect AMX for tile registers (tmm0-tmm7)
+    // Requires XCR0[17] (XTILECFG) and XCR0[18] (XTILEDATA) to be OS-enabled
+    if (cpu.has(Xbyak::util::Cpu::tAMX_TILE)) {
+        has_amx_ = ((xcr0 >> 17) & 3) == 3;
+    }
+    
     // If APX is available, add r16-r31 to the free pool
     if (has_apx_) {
         for (int i = 16; i <= 31; ++i) {
@@ -289,6 +310,13 @@ RegPoolManager() {
             free_vec_regs.insert(i);
         }
     }
+    
+    // If AMX is available, add tmm0-tmm7 to the free pool
+    if (has_amx_) {
+        for (int i = 0; i <= 7; ++i) {
+            free_tile_regs.insert(i);
+        }
+    }
 }
 ```
 
@@ -299,13 +327,17 @@ int max_gp_registers() const;   // Returns 16 or 32
 
 bool has_avx512() const;        // Returns true if AVX-512 is supported
 int max_vec_registers() const;  // Returns 16 or 32
+
+bool has_amx() const;           // Returns true if AMX tiles are OS-enabled
+int max_tile_registers() const; // Returns 8 if AMX available, 0 otherwise
 ```
 
 **Extended ISA Implementation Notes:**
 - r16-r31 (APX) and zmm16-zmm31 (AVX-512) are automatically added as call-clobbered registers
-- All range checks use `max_gp_reg_idx_` and `max_vec_reg_idx_` instead of hardcoded values
+- tmm0-tmm7 (AMX) are added as call-clobbered tile registers when AMX is OS-enabled
+- All range checks use `max_gp_reg_idx_` and `max_vec_reg_idx_` instead of hardcoded values; AMX always uses the fixed range 0-7
 - Zero overhead: detection happens once at construction
-- Backward compatible: works seamlessly on systems without APX or AVX-512
+- Backward compatible: works seamlessly on systems without APX, AVX-512, or AMX
 
 ### Error Handling & Strictness
 
@@ -318,6 +350,7 @@ The manager assumes that the user knows what they are doing, in so far that it w
   - GP: 0-15 (without APX) or 0-31 (with APX)
   - Vec: 0-16 (without AVX-512) or 0-31 (with AVX-512)
   - Opmask: 0-7
+  - AMX Tile: 0-7
 - The user attempts to add a register to the free GP pool when the register is already tracked.
 - There are no registers in free_regs or preserved when `alloc()` is called for a register type.
 - The user calls `makeScoped` on a register that is not in use.
@@ -386,6 +419,19 @@ if (rm.has_avx512()) {
     std::cout << "AVX-512 supported, " << rm.max_vec_registers() 
               << " vector registers available" << std::endl;
 }
+
+// AMX tile support
+if (rm.has_amx()) {
+    std::cout << "AMX supported, " << rm.max_tile_registers()
+              << " tile registers available" << std::endl;
+    Tmm t0 = rm.alloc<Tmm>();      // allocate next free tile
+    Tmm t3 = rm.alloc<Tmm>(3);    // allocate tmm3 specifically
+    rm.free(t0);
+    rm.free(t3);
+    // RAII:
+    auto scoped_tile = rm.makeScoped(rm.alloc<Tmm>());
+    // freed when scoped_tile goes out of scope
+}
 ```
 
 ## Helper Methods
@@ -393,13 +439,14 @@ if (rm.has_avx512()) {
 The manager includes minimal helpers to keep it lightweight:
 
 - `reg_in_use(reg)`: Returns true if a register object is in the in-use set
-- `gp_idx_in_use(idx)`, `vec_idx_in_use(idx)`, `opmask_idx_in_use(idx)`: Check if an index is in use for a given family
+- `gp_idx_in_use(idx)`, `vec_idx_in_use(idx)`, `opmask_idx_in_use(idx)`, `tile_idx_in_use(idx)`: Check if an index is in use for a given family
 - `makeScoped(reg)`: Creates an RAII guard for automatic deallocation
 - `add_to_gp_pool(idx)`: Adds a register to the free GP pool (for special use cases)
 - Special register helpers: `_stack_pointer()`, `_base_pointer()`, `_opmask_k0()`
 - APX query methods: `has_apx()`, `max_gp_registers()`
 - AVX-512 query methods: `has_avx512()`, `max_vec_registers()`
-- Getters for in-use, free, preserved, and used sets for each register family
+- AMX query methods: `has_amx()`, `max_tile_registers()`
+- Getters for in-use, free, preserved, and used sets for each register family (AMX has no preserved set)
 
 ## Implementation Notes for x86-64
 
@@ -460,11 +507,20 @@ The manager includes minimal helpers to keep it lightweight:
    - k0 is special (unmasked)
    - AArch64: 16 predicate registers (p0-p15) for SVE
 
+8. **AMX Tile Registers**
+   - x86-64 AMX: 8 tile registers (tmm0-tmm7), introduced with Sapphire Rapids
+   - Available only when hardware supports AMX and the OS enables XCR0[17:18]
+   - No register aliasing; each Tmm is a distinct 2D accumulator (up to 1KB each)
+   - No callee-saved tile registers in any standard calling convention
+   - Requires `LDTILECFG` / `TILERELEASE` lifecycle management in real kernels
+   - AArch64 has no equivalent
+
 ## References
 
 - [System V AMD64 ABI](https://gitlab.com/x86-psABIs/x86-64-ABI)
 - [Microsoft x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention)
 - [Overview of x64 Calling Conventions](https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions)
 - [Intel APX Specification](https://www.intel.com/content/www/us/en/developer/articles/technical/advanced-performance-extensions-apx.html)
+- [Intel AMX Programming Reference](https://www.intel.com/content/www/us/en/develop/documentation/cpp-compiler-developer-guide-and-reference/top/compiler-reference/intrinsics/intrinsics-for-amx-instructions.html)
 - [Xbyak Documentation](https://github.com/herumi/xbyak)
 - [AArch64 Register Manager (PR #4587)](https://github.com/uxlfoundation/oneDNN/pull/4587)

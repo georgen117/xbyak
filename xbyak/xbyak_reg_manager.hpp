@@ -29,7 +29,7 @@
 
 namespace Xbyak {
 // Static definitions for different types of registers in relation to which family they belong to.
-enum class RegFamily { GP, Vec, Opmask };
+enum class RegFamily { GP, Vec, Opmask, AMX };
 
 template <class RegT>
 struct reg_family;
@@ -72,6 +72,12 @@ struct reg_family<Opmask> {
     static constexpr RegFamily value = RegFamily::Opmask;
 };
 
+// AMX tile registers (tmm0-tmm7)
+template <>
+struct reg_family<Tmm> {
+    static constexpr RegFamily value = RegFamily::AMX;
+};
+
 class RegPoolManager {
 public:
     // Constructor - detects APX and AVX-512 support and sets up register pools accordingly
@@ -102,11 +108,33 @@ public:
             }
         }
 
+        // XCR0[1] = SSE state (XMM registers), XCR0[2] = AVX state (YMM upper half)
+        // Both must be OS-enabled before vector registers can be safely used
+        const bool has_vec_base = ((xcr0 >> 1) & 3) == 3;
+        if (has_vec_base) {
+            free_vec_regs = base_free_vec();
+            preserved_vec = base_preserved_vec();
+        }
+
         // If AVX-512 is available, add zmm16-zmm31 to the free pool
         // Extended vector registers are caller-saved (call-clobbered)
         if (has_avx512_) {
             for (int i = 16; i <= 31; ++i) {
                 free_vec_regs.insert(i);
+            }
+        }
+
+        // Detect AMX for tile registers (tmm0-tmm7)
+        // Requires both XCR0[17] (XTILECFG) and XCR0[18] (XTILEDATA) to be OS-enabled
+        if (cpu.has(Xbyak::util::Cpu::tAMX_TILE)) {
+            has_amx_ = ((xcr0 >> 17) & 3) == 3;
+        }
+
+        // If AMX is available, add tmm0-tmm7 to the free pool
+        // All tile registers are caller-saved (call-clobbered)
+        if (has_amx_) {
+            for (int i = 0; i <= 7; ++i) {
+                free_tile_regs.insert(i);
             }
         }
     }
@@ -134,6 +162,11 @@ public:
                 opmask_reg(idx);
                 return RegT(idx);
             }
+            case RegFamily::AMX: {
+                const int idx = next_tile_idx();
+                tile_reg(idx);
+                return RegT(idx);
+            }
             default: throw std::runtime_error("Unknown register family");
         }
     }
@@ -144,6 +177,7 @@ public:
             case RegFamily::GP: gp_reg(idx); return RegT(idx);
             case RegFamily::Vec: vec_reg(idx); return RegT(idx);
             case RegFamily::Opmask: opmask_reg(idx); return RegT(idx);
+            case RegFamily::AMX: tile_reg(idx); return RegT(idx);
             default: throw std::runtime_error("Unknown register family");
         }
     }
@@ -156,6 +190,7 @@ public:
             case RegFamily::GP: release_gp(idx); break;
             case RegFamily::Vec: release_vec(idx); break;
             case RegFamily::Opmask: release_opmask(idx); break;
+            case RegFamily::AMX: release_tile(idx); break;
             default: throw std::runtime_error("Unknown register family");
         }
     }
@@ -198,6 +233,16 @@ public:
         return make_index_vector(used_opmask);
     }
 
+    std::vector<int> get_free_tiles() const {
+        return make_index_vector(free_tile_regs);
+    }
+    std::vector<int> get_in_use_tiles() const {
+        return make_index_vector(in_use_tile);
+    }
+    std::vector<int> get_used_tiles() const {
+        return make_index_vector(used_tile);
+    }
+
     // member function - add a register to the free pool of general registers
     void add_to_gp_pool(const Reg64 &reg) { add_to_gp_pool(reg.getIdx()); }
     void add_to_gp_pool(int idx) {
@@ -226,6 +271,9 @@ public:
     }
     bool opmask_idx_in_use(int reg_idx) const {
         return reg_in_use_idx(reg_idx, RegFamily::Opmask);
+    }
+    bool tile_idx_in_use(int reg_idx) const {
+        return reg_in_use_idx(reg_idx, RegFamily::AMX);
     }
 
     // scoped register handling with RAII
@@ -282,6 +330,10 @@ public:
     bool has_avx512() const { return has_avx512_; }
     int max_vec_registers() const { return max_vec_reg_idx_ + 1; }
 
+    // helper methods to query AMX support
+    bool has_amx() const { return has_amx_; }
+    int max_tile_registers() const { return has_amx_ ? 8 : 0; }
+
     // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
     // Stack pointer: rsp
     inline Reg64 _stack_pointer() {
@@ -330,6 +382,9 @@ private:
             case RegFamily::Opmask:
                 return "Cannot create Opmask scoped reg for a register that is "
                        "not in use";
+            case RegFamily::AMX:
+                return "Cannot create AMX scoped reg for a register that is "
+                       "not in use";
             default: return "Cannot create scoped reg for unknown family";
         }
     }
@@ -353,6 +408,12 @@ private:
                             "Opmask register index out of range");
                 }
                 return in_use_opmask.find(idx) != in_use_opmask.end();
+            case RegFamily::AMX:
+                if (idx < 0 || idx > 7) {
+                    throw std::runtime_error(
+                            "AMX tile register index out of range");
+                }
+                return in_use_tile.find(idx) != in_use_tile.end();
             default: throw std::runtime_error("Unknown register family");
         }
     }
@@ -372,6 +433,10 @@ private:
         if (!free_opmask_regs.empty()) return *free_opmask_regs.begin();
         if (!preserved_opmask.empty()) return *preserved_opmask.begin();
         throw std::runtime_error("No free Opmask registers available");
+    }
+    int next_tile_idx() const {
+        if (!free_tile_regs.empty()) return *free_tile_regs.begin();
+        throw std::runtime_error("No free AMX tile registers available");
     }
 
     // tracking for in-use indices for a given register family
@@ -459,6 +524,29 @@ private:
         in_use_opmask.erase(it);
         free_opmask_regs.insert(idx);
     }
+    void tile_reg(int idx) {
+        if (reg_in_use_idx(idx, RegFamily::AMX))
+            throw std::runtime_error(
+                    "Specified AMX tile register currently in use");
+        auto it = free_tile_regs.find(idx);
+        if (it != free_tile_regs.end()) {
+            in_use_tile.insert(idx);
+            free_tile_regs.erase(it);
+            used_tile.insert(idx);
+        } else {
+            throw std::runtime_error(
+                    "Requested AMX tile register not in free pool.");
+        }
+    }
+    void release_tile(int idx) {
+        if (idx < 0 || idx > 7)
+            throw std::runtime_error("AMX tile register index out of range");
+        auto it = in_use_tile.find(idx);
+        if (it == in_use_tile.end())
+            throw std::runtime_error("AMX tile register not in use");
+        in_use_tile.erase(it);
+        free_tile_regs.insert(idx);
+    }
 
     // General Purpose registers (GP):
     // Indices: rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7, r8-r15=8-15
@@ -526,8 +614,8 @@ private:
 
     std::set<int> used_vec;
     std::set<int> in_use_vec;
-    std::set<int> free_vec_regs = base_free_vec();
-    std::set<int> preserved_vec = base_preserved_vec();
+    std::set<int> free_vec_regs;              // populated in constructor after XCR0[1:2] check
+    std::set<int> preserved_vec;              // populated in constructor after XCR0[1:2] check
 
     // Opmask registers (k0-k7) for AVX-512
     // k0 has special meaning (unmasked), typically k1-k7 are used
@@ -555,6 +643,15 @@ private:
     bool has_avx512_ = false;
     // 15 without (SSE/AVX/AVX2), 31 with AVX-512
     int max_vec_reg_idx_ = 15;
+
+    // AMX tile registers (tmm0-tmm7): no preserved tiles, all caller-saved
+    // Pool is empty by default; tmm0-tmm7 are added in constructor if AMX detected
+    std::set<int> used_tile;
+    std::set<int> in_use_tile;
+    std::set<int> free_tile_regs;
+
+    // AMX feature support
+    bool has_amx_ = false;
 };
 
 } // namespace Xbyak

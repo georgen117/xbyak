@@ -23,6 +23,12 @@
  *   realisticKernel         – code-generation using manager for register strategy
  *   dynamicSaveRestore      – dynamic push/pop using get_in_use_gps() +
  *                             gp_idx_in_use() to save/restore across a real call
+ *   amxSupport              – has_amx() / max_tile_registers() reflect AMX capability
+ *   amxTileRegisters        – alloc / free of Tmm (tmm0-tmm7)
+ *   amxTileExhaustion       – allocating more tiles than available throws
+ *   mixedAllocationWithAMX  – mix of GP / Vec / Opmask / AMX in one manager
+ *   amxScopedRegisters      – RAII makeScoped auto-free for Tmm
+ *   amxRegInUse             – tile_idx_in_use / reg_in_use helpers for Tmm
  *
  * Build:
  *   # via CMake (from xbyak/test/build/):
@@ -701,4 +707,182 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()),
                           (uint64_t)(111 + 222 + 333 + 444));
     }
+}
+
+// =============================================================================
+// Test 17 – AMX support detection
+// =============================================================================
+CYBOZU_TEST_AUTO(amxSupport)
+{
+    RegPoolManager rm;
+
+    if (rm.has_amx()) {
+        // AMX present: 8 tile registers (tmm0-tmm7), free pool starts full.
+        CYBOZU_TEST_EQUAL(rm.max_tile_registers(), 8);
+        CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
+        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    } else {
+        // No AMX: pool is empty and max is 0.
+        CYBOZU_TEST_EQUAL(rm.max_tile_registers(), 0);
+        CYBOZU_TEST_ASSERT(rm.get_free_tiles().empty());
+        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    }
+}
+
+// =============================================================================
+// Test 18 – AMX tile register allocation and deallocation
+// =============================================================================
+CYBOZU_TEST_AUTO(amxTileRegisters)
+{
+    RegPoolManager rm;
+
+    if (!rm.has_amx()) {
+        // Without AMX hardware alloc must throw immediately.
+        CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(), std::runtime_error);
+        return;
+    }
+
+    // Allocate a few tile registers.
+    auto t0 = rm.alloc<Tmm>();
+    auto t1 = rm.alloc<Tmm>();
+    auto t2 = rm.alloc<Tmm>(2);  // allocate specific tile
+
+    CYBOZU_TEST_EQUAL((int)rm.get_in_use_tiles().size(), 3);
+    CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 5);  // 8 - 3
+
+    // Indices must be within the valid AMX range.
+    CYBOZU_TEST_ASSERT(t0.getIdx() >= 0 && t0.getIdx() <= 7);
+    CYBOZU_TEST_ASSERT(t1.getIdx() >= 0 && t1.getIdx() <= 7);
+    CYBOZU_TEST_EQUAL(t2.getIdx(), 2);
+
+    // Duplicate allocation of tile 2 must throw.
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(2), std::runtime_error);
+
+    rm.free(t0);
+    rm.free(t1);
+    rm.free(t2);
+
+    CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
+
+    // Freeing a tile that is not in use must throw.
+    CYBOZU_TEST_EXCEPTION(rm.free(t0), std::runtime_error);
+}
+
+// =============================================================================
+// Test 19 – AMX tile exhaustion
+// =============================================================================
+CYBOZU_TEST_AUTO(amxTileExhaustion)
+{
+    RegPoolManager rm;
+    std::vector<Tmm> allocated;
+
+    // Allocate until exhausted; expect an exception when the pool is empty.
+    try {
+        for (int i = 0; i < 10; ++i)
+            allocated.push_back(rm.alloc<Tmm>());
+    } catch (const std::runtime_error &) {
+        // Exhaustion exception is expected.
+    }
+
+    if (rm.has_amx()) {
+        // All 8 tile registers should have been allocated before exhaustion.
+        CYBOZU_TEST_EQUAL((int)allocated.size(), 8);
+    } else {
+        // No AMX: first alloc throws, nothing allocated.
+        CYBOZU_TEST_EQUAL((int)allocated.size(), 0);
+    }
+
+    for (auto &t : allocated) rm.free(t);
+    CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+}
+
+// =============================================================================
+// Test 20 – Mixed allocation including AMX tiles
+// =============================================================================
+CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
+{
+    RegPoolManager rm;
+
+    auto r64 = rm.alloc<Reg64>();
+    auto xmm = rm.alloc<Xmm>();
+    auto k   = rm.alloc<Opmask>();
+
+    CYBOZU_TEST_EQUAL((int)rm.get_in_use_gps().size(),     1);
+    CYBOZU_TEST_EQUAL((int)rm.get_in_use_vecs().size(),    1);
+    CYBOZU_TEST_EQUAL((int)rm.get_in_use_opmasks().size(), 1);
+
+    if (rm.has_amx()) {
+        auto t0 = rm.alloc<Tmm>();
+        auto t1 = rm.alloc<Tmm>();
+        CYBOZU_TEST_EQUAL((int)rm.get_in_use_tiles().size(), 2);
+        rm.free(t0);
+        rm.free(t1);
+        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    } else {
+        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    }
+
+    rm.free(r64);
+    rm.free(xmm);
+    rm.free(k);
+
+    CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_in_use_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_in_use_opmasks().empty());
+}
+
+// =============================================================================
+// Test 21 – AMX scoped registers (RAII)
+// =============================================================================
+CYBOZU_TEST_AUTO(amxScopedRegisters)
+{
+    RegPoolManager rm;
+
+    if (!rm.has_amx()) {
+        // Nothing to scope without AMX.
+        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+        return;
+    }
+
+    {
+        auto s0 = rm.makeScoped(rm.alloc<Tmm>());
+        auto s1 = rm.makeScoped(rm.alloc<Tmm>());
+        CYBOZU_TEST_EQUAL((int)rm.get_in_use_tiles().size(), 2);
+        // s0 and s1 are freed here by their destructors.
+    }
+
+    CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
+}
+
+// =============================================================================
+// Test 22 – AMX reg_in_use and tile_idx_in_use helpers
+// =============================================================================
+CYBOZU_TEST_AUTO(amxRegInUse)
+{
+    RegPoolManager rm;
+
+    if (!rm.has_amx()) {
+        // tile_idx_in_use on valid indices must return false.
+        CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(0));
+        CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(7));
+        // Out-of-range must throw regardless of AMX availability.
+        CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), std::runtime_error);
+        return;
+    }
+
+    auto t3 = rm.alloc<Tmm>(3);
+
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(t3));
+    CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(3));
+    CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(4));
+
+    // Out-of-range index must throw.
+    CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), std::runtime_error);
+
+    rm.free(t3);
+
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(t3));
+    CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(3));
 }
