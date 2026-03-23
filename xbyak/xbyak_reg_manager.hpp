@@ -141,7 +141,11 @@ public:
 
     // Usage:
     // Reg64 rax = rm.alloc<Reg64>(); // Allocate next available 64-bit register (freed by user)
+    // Reg64 rdx = rm.alloc(rdx);     // Allocate a specific register by name (RegT deduced) (Must be in a CodeGenerator) (freed by user)
+    // Reg64 r10 = rm.alloc<Reg64>(10); // Allocate a specific register by index (freed by user)
     // rm.free(rax);                  // Free rax
+    // rm.free(rdx);                  // Free rdx
+    // rm.free(r10);                  // Free r10
 
     // register allocation method - accepts int to specify an unused reg, or no arg to get next free reg
     template <class RegT>
@@ -180,6 +184,21 @@ public:
             case RegFamily::Tile: tile_reg(idx); return RegT(idx);
             default: throw std::runtime_error("Unknown register family");
         }
+    }
+
+    // Accepts an Xbyak register object directly.
+    // RegT is deduced from the argument — no explicit template parameter needed.
+    // Equivalent to alloc<RegT>(reg.getIdx()) but reads like familiar register names.
+    // Example: alloc(rdx)  instead of  alloc<Reg64>(2)
+    //
+    // NOTE: Named register constants (rax, rdx, r10, xmm2, tmm0, k1, etc.) are
+    // const members of Xbyak::CodeGenerator. This overload must therefore be
+    // called from within a class that inherits Xbyak::CodeGenerator so that
+    // those names are in scope. Outside a CodeGenerator subclass, use the
+    // index-based overload alloc<RegT>(int idx) instead.
+    template <class RegT>
+    RegT alloc(const RegT &reg) {
+        return alloc<RegT>(reg.getIdx());
     }
 
     // takes register object and moves it from in use to free set

@@ -6,7 +6,8 @@
  *
  * Tests covered (matching the sample/test_xbyak_reg_manager.cpp):
  *   basicAllocation         – alloc / free round-trip for GP registers
- *   specificAllocation      – named-register alloc + duplicate-alloc exception
+ *   specificAllocation      – index-based alloc<T>(int) + duplicate-alloc exception
+ *   namedRegisterAlloc      – named-register alloc(reg) overload across all families
  *   scopedRegisters         – RAII makeScoped auto-free on scope exit
  *   vectorRegisters         – alloc / free of Xmm / Ymm / Zmm
  *   opmaskRegisters         – alloc / free of Opmask (k1-k7, k0 is special)
@@ -105,7 +106,7 @@ extern "C" int call_function_that_clobbers_registers() {
 }
 
 // =============================================================================
-// Test 1 – Basic allocation and deallocation
+// Test – Basic allocation and deallocation
 // =============================================================================
 CYBOZU_TEST_AUTO(basicAllocation)
 {
@@ -125,7 +126,7 @@ CYBOZU_TEST_AUTO(basicAllocation)
 }
 
 // =============================================================================
-// Test 2 – Specific register allocation
+// Test – Specific register allocation
 // =============================================================================
 CYBOZU_TEST_AUTO(specificAllocation)
 {
@@ -145,7 +146,94 @@ CYBOZU_TEST_AUTO(specificAllocation)
 }
 
 // =============================================================================
-// Test 3 – RAII scoped registers
+// Test – Named-register alloc(reg) overload
+// =============================================================================
+CYBOZU_TEST_AUTO(namedRegisterAlloc)
+{
+    // Named register constants (rax, rdx, r10, xmm2, zmm4, k1, etc.) are
+    // member variables of CodeGenerator — they are available by name inside any
+    // CodeGenerator subclass without any explicit index.  This inner struct
+    // mirrors the real usage pattern, where a JIT kernel inherits CodeGenerator
+    // and writes rm.alloc(rdx) instead of rm.alloc<Reg64>(2).
+    struct NamedAllocTest : Xbyak::CodeGenerator {
+        void run() {
+            RegPoolManager rm;
+
+            // GP Reg64 — names match assembly register notation exactly.
+            auto reg_rdx = rm.alloc(rdx);   // rdx: caller-saved on both ABIs
+            auto reg_r10 = rm.alloc(r10);   // r10: caller-saved
+            CYBOZU_TEST_EQUAL(reg_rdx.getIdx(), rdx.getIdx());
+            CYBOZU_TEST_EQUAL(reg_r10.getIdx(), r10.getIdx());
+            CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(rdx.getIdx()));
+            CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(r10.getIdx()));
+
+            // GP Reg32 and Reg16 — r8d and r9w are distinct physical registers.
+            auto reg_r8d = rm.alloc(r8d);
+            auto reg_r9w = rm.alloc(r9w);
+            CYBOZU_TEST_EQUAL(reg_r8d.getIdx(), r8d.getIdx());
+            CYBOZU_TEST_EQUAL(reg_r9w.getIdx(), r9w.getIdx());
+
+            // Vec — Xmm, Ymm and Zmm each deduce a different RegT.
+            auto reg_xmm2 = rm.alloc(xmm2);
+            auto reg_ymm3 = rm.alloc(ymm3);
+            auto reg_zmm4 = rm.alloc(zmm4);
+            CYBOZU_TEST_EQUAL(reg_xmm2.getIdx(), xmm2.getIdx());
+            CYBOZU_TEST_EQUAL(reg_ymm3.getIdx(), ymm3.getIdx());
+            CYBOZU_TEST_EQUAL(reg_zmm4.getIdx(), zmm4.getIdx());
+            CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(xmm2.getIdx()));
+            CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(ymm3.getIdx()));
+            CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(zmm4.getIdx()));
+
+            // Opmask — k1 and k2.
+            auto reg_k1 = rm.alloc(k1);
+            auto reg_k2 = rm.alloc(k2);
+            CYBOZU_TEST_EQUAL(reg_k1.getIdx(), k1.getIdx());
+            CYBOZU_TEST_EQUAL(reg_k2.getIdx(), k2.getIdx());
+            CYBOZU_TEST_ASSERT(rm.opmask_idx_in_use(k1.getIdx()));
+            CYBOZU_TEST_ASSERT(rm.opmask_idx_in_use(k2.getIdx()));
+
+            // AMX Tile — tmm0 and tmm1 (skipped if AMX is not available).
+            // tmm0-tmm7 are const Tmm members of CodeGenerator, so they work
+            // identically to rax, xmm2, k1 etc.
+            if (rm.has_amx()) {
+                auto reg_tmm0 = rm.alloc(tmm0);
+                auto reg_tmm1 = rm.alloc(tmm1);
+                CYBOZU_TEST_EQUAL(reg_tmm0.getIdx(), tmm0.getIdx());
+                CYBOZU_TEST_EQUAL(reg_tmm1.getIdx(), tmm1.getIdx());
+                CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tmm0.getIdx()));
+                CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tmm1.getIdx()));
+
+                // Duplicate alloc by name must throw for tiles too.
+                CYBOZU_TEST_EXCEPTION(rm.alloc(tmm0), std::runtime_error);
+
+                rm.free(reg_tmm0);
+                rm.free(reg_tmm1);
+                CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+            }
+
+            // Allocating an already-in-use register by name must throw — the
+            // same error path as alloc<Reg64>(int idx) for a duplicate index.
+            CYBOZU_TEST_EXCEPTION(rm.alloc(rdx),  std::runtime_error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm2), std::runtime_error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   std::runtime_error);
+
+            // Free all and confirm every pool is clean.
+            rm.free(reg_rdx);  rm.free(reg_r10);
+            rm.free(reg_r8d);  rm.free(reg_r9w);
+            rm.free(reg_xmm2); rm.free(reg_ymm3); rm.free(reg_zmm4);
+            rm.free(reg_k1);   rm.free(reg_k2);
+
+            CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
+            CYBOZU_TEST_ASSERT(rm.get_in_use_vecs().empty());
+            CYBOZU_TEST_ASSERT(rm.get_in_use_opmasks().empty());
+        }
+    };
+    NamedAllocTest t;
+    t.run();
+}
+
+// =============================================================================
+// Test – RAII scoped registers
 // =============================================================================
 CYBOZU_TEST_AUTO(scopedRegisters)
 {
@@ -162,7 +250,7 @@ CYBOZU_TEST_AUTO(scopedRegisters)
 }
 
 // =============================================================================
-// Test 4 – Vector register (Xmm / Ymm / Zmm) allocation
+// Test – Vector register (Xmm / Ymm / Zmm) allocation
 // =============================================================================
 CYBOZU_TEST_AUTO(vectorRegisters)
 {
@@ -186,7 +274,7 @@ CYBOZU_TEST_AUTO(vectorRegisters)
 }
 
 // =============================================================================
-// Test 5 – Opmask register (k1-k7) allocation
+// Test – Opmask register (k1-k7) allocation
 // =============================================================================
 CYBOZU_TEST_AUTO(opmaskRegisters)
 {
@@ -209,7 +297,7 @@ CYBOZU_TEST_AUTO(opmaskRegisters)
 }
 
 // =============================================================================
-// Test 6 – APX support detection
+// Test – APX support detection
 // =============================================================================
 CYBOZU_TEST_AUTO(apxSupport)
 {
@@ -226,7 +314,7 @@ CYBOZU_TEST_AUTO(apxSupport)
 }
 
 // =============================================================================
-// Test 7 – Special register accessors and add_to_gp_pool
+// Test – Special register accessors and add_to_gp_pool
 // =============================================================================
 CYBOZU_TEST_AUTO(addToPool)
 {
@@ -251,7 +339,7 @@ CYBOZU_TEST_AUTO(addToPool)
 }
 
 // =============================================================================
-// Test 8 – Exhausting all allocatable GP registers
+// Test – Exhausting all allocatable GP registers
 // =============================================================================
 CYBOZU_TEST_AUTO(registerExhaustion)
 {
@@ -275,7 +363,7 @@ CYBOZU_TEST_AUTO(registerExhaustion)
 }
 
 // =============================================================================
-// Test 9 – Mixed register family allocation
+// Test – Mixed register family allocation
 // =============================================================================
 CYBOZU_TEST_AUTO(mixedAllocation)
 {
@@ -303,7 +391,7 @@ CYBOZU_TEST_AUTO(mixedAllocation)
 }
 
 // =============================================================================
-// Test 10 – reg_in_use / gp_idx_in_use helpers
+// Test – reg_in_use / gp_idx_in_use helpers
 // =============================================================================
 CYBOZU_TEST_AUTO(regInUse)
 {
@@ -320,7 +408,7 @@ CYBOZU_TEST_AUTO(regInUse)
 }
 
 // =============================================================================
-// Test 11 – GP register aliasing (RAX / EAX / AX share index 0)
+// Test – GP register aliasing (RAX / EAX / AX share index 0)
 // =============================================================================
 CYBOZU_TEST_AUTO(gpRegisterAliasing)
 {
@@ -347,7 +435,7 @@ CYBOZU_TEST_AUTO(gpRegisterAliasing)
 }
 
 // =============================================================================
-// Test 12 – Vector register aliasing (XMM / YMM / ZMM share index)
+// Test – Vector register aliasing (XMM / YMM / ZMM share index)
 // =============================================================================
 CYBOZU_TEST_AUTO(vectorRegisterAliasing)
 {
@@ -372,7 +460,7 @@ CYBOZU_TEST_AUTO(vectorRegisterAliasing)
 }
 
 // =============================================================================
-// Test 13 – Write and read register contents via JIT execution
+// Test – Write and read register contents via JIT execution
 // =============================================================================
 CYBOZU_TEST_AUTO(registerContentsViaJIT)
 {
@@ -411,7 +499,7 @@ CYBOZU_TEST_AUTO(registerContentsViaJIT)
 }
 
 // =============================================================================
-// Test 14 – Function call convention: parameter passing and non-volatile
+// Test – Function call convention: parameter passing and non-volatile
 //           register preservation across a JIT-to-JIT call.
 // =============================================================================
 CYBOZU_TEST_AUTO(functionCallConvention)
@@ -529,7 +617,7 @@ CYBOZU_TEST_AUTO(functionCallConvention)
 }
 
 // =============================================================================
-// Test 15 – Realistic JIT kernel using the register manager for strategy
+// Test – Realistic JIT kernel using the register manager for strategy
 // =============================================================================
 CYBOZU_TEST_AUTO(realisticKernel)
 {
@@ -613,7 +701,7 @@ CYBOZU_TEST_AUTO(realisticKernel)
 }
 
 // =============================================================================
-// Test 16 – Dynamic save/restore across a real function call
+// Test – Dynamic save/restore across a real function call
 // =============================================================================
 CYBOZU_TEST_AUTO(dynamicSaveRestore)
 {
@@ -716,7 +804,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
 }
 
 // =============================================================================
-// Test 17 – AMX support detection
+// Test – AMX support detection
 // =============================================================================
 CYBOZU_TEST_AUTO(amxSupport)
 {
@@ -736,7 +824,7 @@ CYBOZU_TEST_AUTO(amxSupport)
 }
 
 // =============================================================================
-// Test 18 – AMX tile register allocation and deallocation
+// Test – AMX tile register allocation and deallocation
 // =============================================================================
 CYBOZU_TEST_AUTO(amxTileRegisters)
 {
@@ -776,7 +864,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
 }
 
 // =============================================================================
-// Test 19 – AMX tile exhaustion
+// Test – AMX tile exhaustion
 // =============================================================================
 CYBOZU_TEST_AUTO(amxTileExhaustion)
 {
@@ -804,7 +892,7 @@ CYBOZU_TEST_AUTO(amxTileExhaustion)
 }
 
 // =============================================================================
-// Test 20 – Mixed allocation including AMX tiles
+// Test – Mixed allocation including AMX tiles
 // =============================================================================
 CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
 {
@@ -839,7 +927,7 @@ CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
 }
 
 // =============================================================================
-// Test 21 – AMX scoped registers (RAII)
+// Test – AMX scoped registers (RAII)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxScopedRegisters)
 {
@@ -863,7 +951,7 @@ CYBOZU_TEST_AUTO(amxScopedRegisters)
 }
 
 // =============================================================================
-// Test 22 – AMX reg_in_use and tile_idx_in_use helpers
+// Test – AMX reg_in_use and tile_idx_in_use helpers
 // =============================================================================
 CYBOZU_TEST_AUTO(amxRegInUse)
 {
@@ -894,7 +982,7 @@ CYBOZU_TEST_AUTO(amxRegInUse)
 }
 
 // =============================================================================
-// Test 23 – In-use volatile / preserved GP register queries
+// Test – In-use volatile / preserved GP register queries
 // =============================================================================
 CYBOZU_TEST_AUTO(inUseVolatilePreservedGPs)
 {
@@ -945,7 +1033,7 @@ CYBOZU_TEST_AUTO(inUseVolatilePreservedGPs)
 }
 
 // =============================================================================
-// Test 24 – Volatile GP query drives optimal caller-save in JIT code
+// Test – Volatile GP query drives optimal caller-save in JIT code
 // =============================================================================
 CYBOZU_TEST_AUTO(volatileGPCallerSave)
 {
@@ -1025,7 +1113,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
 }
 
 // =============================================================================
-// Test 25 – In-use volatile / preserved vector register queries
+// Test – In-use volatile / preserved vector register queries
 // =============================================================================
 CYBOZU_TEST_AUTO(vecVolatilePreserved)
 {
@@ -1071,7 +1159,7 @@ CYBOZU_TEST_AUTO(vecVolatilePreserved)
 }
 
 // =============================================================================
-// Test 26 – Opmask volatile query (all opmasks are caller-saved)
+// Test – Opmask volatile query (all opmasks are caller-saved)
 // =============================================================================
 CYBOZU_TEST_AUTO(opmaskVolatile)
 {
@@ -1094,7 +1182,7 @@ CYBOZU_TEST_AUTO(opmaskVolatile)
 }
 
 // =============================================================================
-// Test 27 – Comprehensive multi-family volatile / preserved queries
+// Test – Comprehensive multi-family volatile / preserved queries
 // =============================================================================
 CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
 {
@@ -1166,7 +1254,7 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
 }
 
 // =============================================================================
-// Test 28 – AMX volatile tile query (all tiles are caller-saved)
+// Test – AMX volatile tile query (all tiles are caller-saved)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxVolatileTiles)
 {
