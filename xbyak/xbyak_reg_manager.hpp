@@ -29,7 +29,7 @@
 
 namespace Xbyak {
 // Static definitions for different types of registers in relation to which family they belong to.
-enum class RegFamily { GP, Vec, Opmask, AMX };
+enum class RegFamily { GP, Vec, Opmask, Tile };
 
 template <class RegT>
 struct reg_family;
@@ -75,7 +75,7 @@ struct reg_family<Opmask> {
 // AMX tile registers (tmm0-tmm7)
 template <>
 struct reg_family<Tmm> {
-    static constexpr RegFamily value = RegFamily::AMX;
+    static constexpr RegFamily value = RegFamily::Tile;
 };
 
 class RegPoolManager {
@@ -162,7 +162,7 @@ public:
                 opmask_reg(idx);
                 return RegT(idx);
             }
-            case RegFamily::AMX: {
+            case RegFamily::Tile: {
                 const int idx = next_tile_idx();
                 tile_reg(idx);
                 return RegT(idx);
@@ -177,7 +177,7 @@ public:
             case RegFamily::GP: gp_reg(idx); return RegT(idx);
             case RegFamily::Vec: vec_reg(idx); return RegT(idx);
             case RegFamily::Opmask: opmask_reg(idx); return RegT(idx);
-            case RegFamily::AMX: tile_reg(idx); return RegT(idx);
+            case RegFamily::Tile: tile_reg(idx); return RegT(idx);
             default: throw std::runtime_error("Unknown register family");
         }
     }
@@ -190,7 +190,7 @@ public:
             case RegFamily::GP: release_gp(idx); break;
             case RegFamily::Vec: release_vec(idx); break;
             case RegFamily::Opmask: release_opmask(idx); break;
-            case RegFamily::AMX: release_tile(idx); break;
+            case RegFamily::Tile: release_tile(idx); break;
             default: throw std::runtime_error("Unknown register family");
         }
     }
@@ -207,6 +207,32 @@ public:
     }
     std::vector<int> get_used_gps() const { return make_index_vector(used_gp); }
 
+    // Returns only in-use registers that are volatile (caller-saved)
+    // These MUST be saved by the caller before making a function call
+    std::vector<int> get_in_use_volatile_gps() const {
+        std::vector<int> result;
+        const auto& base_free = base_free_gp();
+        for (int idx : in_use_gp) {
+            if (base_free.count(idx) > 0) {
+                result.push_back(idx);
+            }
+        }
+        return result;
+    }
+
+    // Returns only in-use registers that are preserved (callee-saved)
+    // These will be saved by the callee if it uses them
+    std::vector<int> get_in_use_preserved_gps() const {
+        std::vector<int> result;
+        const auto& base_preserved = base_preserved_gp();
+        for (int idx : in_use_gp) {
+            if (base_preserved.count(idx) > 0) {
+                result.push_back(idx);
+            }
+        }
+        return result;
+    }
+
     std::vector<int> get_free_vecs() const {
         return make_index_vector(free_vec_regs);
     }
@@ -218,6 +244,35 @@ public:
     }
     std::vector<int> get_used_vecs() const {
         return make_index_vector(used_vec);
+    }
+
+    // Returns only in-use vector registers that are volatile (caller-saved)
+    // These MUST be saved by the caller before making a function call
+    // IMPORTANT for cross-platform code: On Windows, xmm6-xmm15 are preserved (callee-saved),
+    // but on Linux/macOS ALL vector registers are volatile (caller-saved).
+    // Use this method to write portable code that avoids unnecessary saves on Windows.
+    std::vector<int> get_in_use_volatile_vecs() const {
+        std::vector<int> result;
+        const auto& base_free = base_free_vec();
+        for (int idx : in_use_vec) {
+            if (base_free.count(idx) > 0) {
+                result.push_back(idx);
+            }
+        }
+        return result;
+    }
+
+    // Returns only in-use vector registers that are preserved (callee-saved)
+    // These will be saved by the callee if it uses them
+    std::vector<int> get_in_use_preserved_vecs() const {
+        std::vector<int> result;
+        const auto& base_preserved = base_preserved_vec();
+        for (int idx : in_use_vec) {
+            if (base_preserved.count(idx) > 0) {
+                result.push_back(idx);
+            }
+        }
+        return result;
     }
 
     std::vector<int> get_free_opmasks() const {
@@ -233,6 +288,13 @@ public:
         return make_index_vector(used_opmask);
     }
 
+    // Returns in-use opmask registers (all opmasks are volatile/caller-saved)
+    // These MUST be saved by the caller before making a function call
+    // Note: All opmask registers are caller-saved on both Windows and Linux
+    std::vector<int> get_in_use_volatile_opmasks() const {
+        return make_index_vector(in_use_opmask);
+    }
+
     std::vector<int> get_free_tiles() const {
         return make_index_vector(free_tile_regs);
     }
@@ -241,6 +303,13 @@ public:
     }
     std::vector<int> get_used_tiles() const {
         return make_index_vector(used_tile);
+    }
+
+    // Returns in-use AMX tile registers (all tiles are volatile/caller-saved)
+    // These MUST be saved by the caller before making a function call
+    // Note: All AMX tile registers are caller-saved on both Windows and Linux
+    std::vector<int> get_in_use_volatile_tiles() const {
+        return make_index_vector(in_use_tile);
     }
 
     // member function - add a register to the free pool of general registers
@@ -273,7 +342,7 @@ public:
         return reg_in_use_idx(reg_idx, RegFamily::Opmask);
     }
     bool tile_idx_in_use(int reg_idx) const {
-        return reg_in_use_idx(reg_idx, RegFamily::AMX);
+        return reg_in_use_idx(reg_idx, RegFamily::Tile);
     }
 
     // scoped register handling with RAII
@@ -382,8 +451,8 @@ private:
             case RegFamily::Opmask:
                 return "Cannot create Opmask scoped reg for a register that is "
                        "not in use";
-            case RegFamily::AMX:
-                return "Cannot create AMX scoped reg for a register that is "
+            case RegFamily::Tile:
+                return "Cannot create Tile scoped reg for a register that is "
                        "not in use";
             default: return "Cannot create scoped reg for unknown family";
         }
@@ -408,7 +477,7 @@ private:
                             "Opmask register index out of range");
                 }
                 return in_use_opmask.find(idx) != in_use_opmask.end();
-            case RegFamily::AMX:
+            case RegFamily::Tile:
                 if (idx < 0 || idx > 7) {
                     throw std::runtime_error(
                             "AMX tile register index out of range");
@@ -525,7 +594,7 @@ private:
         free_opmask_regs.insert(idx);
     }
     void tile_reg(int idx) {
-        if (reg_in_use_idx(idx, RegFamily::AMX))
+        if (reg_in_use_idx(idx, RegFamily::Tile))
             throw std::runtime_error(
                     "Specified AMX tile register currently in use");
         auto it = free_tile_regs.find(idx);

@@ -29,6 +29,12 @@
  *   mixedAllocationWithAMX  – mix of GP / Vec / Opmask / AMX in one manager
  *   amxScopedRegisters      – RAII makeScoped auto-free for Tmm
  *   amxRegInUse             – tile_idx_in_use / reg_in_use helpers for Tmm
+ *   inUseVolatilePreservedGPs – get_in_use_volatile/preserved_gps() correctness
+ *   volatileGPCallerSave    – JIT caller-saves only volatile GPs around a call
+ *   vecVolatilePreserved    – get_in_use_volatile/preserved_vecs() correctness
+ *   opmaskVolatile          – get_in_use_volatile_opmasks(): all opmasks are volatile
+ *   comprehensiveSaveRestore – multi-family volatile/preserved queries agree with totals
+ *   amxVolatileTiles        – get_in_use_volatile_tiles(): all tiles are volatile
  *
  * Build:
  *   # via CMake (from xbyak/test/build/):
@@ -885,4 +891,310 @@ CYBOZU_TEST_AUTO(amxRegInUse)
 
     CYBOZU_TEST_ASSERT(!rm.reg_in_use(t3));
     CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(3));
+}
+
+// =============================================================================
+// Test 23 – In-use volatile / preserved GP register queries
+// =============================================================================
+CYBOZU_TEST_AUTO(inUseVolatilePreservedGPs)
+{
+    RegPoolManager rm;
+
+    // Allocate three registers from the volatile (free) pool.
+    auto v1 = rm.alloc<Reg64>();
+    auto v2 = rm.alloc<Reg64>();
+    auto v3 = rm.alloc<Reg64>();
+
+    // Allocate up to two preserved registers (if any are available).
+    auto preserved_list = rm.get_preserved_gps();
+    std::vector<Reg64> preserved_regs;
+    for (size_t i = 0; i < std::min(size_t(2), preserved_list.size()); ++i)
+        preserved_regs.push_back(rm.alloc<Reg64>(preserved_list[i]));
+
+    auto in_use_all      = rm.get_in_use_gps();
+    auto in_use_volatile = rm.get_in_use_volatile_gps();
+    auto in_use_preserved = rm.get_in_use_preserved_gps();
+
+    // Volatile + preserved must equal total in-use.
+    CYBOZU_TEST_EQUAL(in_use_volatile.size() + in_use_preserved.size(),
+                      in_use_all.size());
+
+    // Every volatile index must be in the base free pool.
+    auto base_free = rm.get_free_gps();
+    // (base_free is dynamic; the three newly allocated registers were taken from
+    //  it so we check via get_preserved_gps non-membership instead.)
+    for (int idx : in_use_volatile) {
+        // A volatile register must NOT be in the preserved set.
+        CYBOZU_TEST_ASSERT(std::find(preserved_list.begin(),
+                                     preserved_list.end(), idx)
+                           == preserved_list.end());
+    }
+    // Every preserved index must be in the preserved pool.
+    for (int idx : in_use_preserved) {
+        CYBOZU_TEST_ASSERT(std::find(preserved_list.begin(),
+                                     preserved_list.end(), idx)
+                           != preserved_list.end());
+    }
+
+    rm.free(v1);  rm.free(v2);  rm.free(v3);
+    for (auto &r : preserved_regs) rm.free(r);
+
+    // After full cleanup both queries must be empty.
+    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_in_use_preserved_gps().empty());
+}
+
+// =============================================================================
+// Test 24 – Volatile GP query drives optimal caller-save in JIT code
+// =============================================================================
+CYBOZU_TEST_AUTO(volatileGPCallerSave)
+{
+    // Generates a function that:
+    //   1. Allocates a mix of volatile and preserved GP registers.
+    //   2. Initialises them.
+    //   3. Uses get_in_use_volatile_gps() to save ONLY volatile registers
+    //      before a real function call (optimal — no unnecessary push/pop).
+    //   4. Calls call_function_that_clobbers_registers() (returns 210).
+    //   5. Restores only the volatile registers.
+    //   6. Returns the sum of all allocated registers + 210.
+    class OptimalCallerJit : public CodeGenerator {
+    public:
+        OptimalCallerJit() : CodeGenerator(8192) {}
+
+        void gen(RegPoolManager &rm) {
+            push(rbx);  // rbx is callee-saved; we use it to stash the call result
+
+            auto r1 = rm.alloc<Reg64>();
+            auto r2 = rm.alloc<Reg64>();
+            auto r3 = rm.alloc<Reg64>();
+            mov(r1, 100);  mov(r2, 200);  mov(r3, 300);
+
+            // Optionally grab one preserved register.
+            auto preserved_list = rm.get_preserved_gps();
+            Reg64 r4(0);
+            bool have_preserved = false;
+            if (!preserved_list.empty()) {
+                // skip rbx (idx 3) since we already pushed it manually
+                for (int idx : preserved_list) {
+                    if (idx != rbx.getIdx()) {
+                        r4 = rm.alloc<Reg64>(idx);
+                        have_preserved = true;
+                        break;
+                    }
+                }
+            }
+            if (have_preserved) mov(r4, 400);
+
+            // Save ONLY volatile in-use registers.
+            auto volatile_regs = rm.get_in_use_volatile_gps();
+            for (int idx : volatile_regs) push(Reg64(idx));
+
+            mov(rax, reinterpret_cast<uint64_t>(
+                         &call_function_that_clobbers_registers));
+            call(rax);
+            mov(rbx, rax);  // stash return value (210)
+
+            // Restore only volatile registers (in reverse order).
+            for (auto it = volatile_regs.rbegin(); it != volatile_regs.rend(); ++it)
+                pop(Reg64(*it));
+
+            // Sum all allocated registers + the call's return value.
+            mov(rax, r1);
+            add(rax, r2);
+            add(rax, r3);
+            if (have_preserved) add(rax, r4);
+            add(rax, rbx);
+
+            rm.free(r1);  rm.free(r2);  rm.free(r3);
+            if (have_preserved) rm.free(r4);
+            pop(rbx);
+            ret();
+        }
+    };
+
+    RegPoolManager rm;
+    OptimalCallerJit jit;
+    jit.gen(rm);
+
+    // The sum depends on whether a preserved register was grabbed, but we
+    // always know the function-return contribution is 210.
+    uint64_t result = call_jit(jit.getCode());
+    // Minimum: 100 + 200 + 300 + 210 = 810 (no preserved reg allocated)
+    // With preserved: 100 + 200 + 300 + 400 + 210 = 1210
+    CYBOZU_TEST_ASSERT(result == 810 || result == 1210);
+}
+
+// =============================================================================
+// Test 25 – In-use volatile / preserved vector register queries
+// =============================================================================
+CYBOZU_TEST_AUTO(vecVolatilePreserved)
+{
+    RegPoolManager rm;
+
+    // Allocate some vector registers from the free (volatile) pool.
+    auto xr1 = rm.alloc<Xmm>();
+    auto xr2 = rm.alloc<Xmm>();
+    auto yr3 = rm.alloc<Ymm>();
+
+    // Optionally allocate preserved vector registers (Windows only).
+    auto preserved_vec_list = rm.get_preserved_vecs();
+    std::vector<Xmm> preserved_vecs;
+    for (size_t i = 0; i < std::min(size_t(2), preserved_vec_list.size()); ++i)
+        preserved_vecs.push_back(rm.alloc<Xmm>(preserved_vec_list[i]));
+
+    auto all_in_use       = rm.get_in_use_vecs();
+    auto volatile_in_use  = rm.get_in_use_volatile_vecs();
+    auto preserved_in_use = rm.get_in_use_preserved_vecs();
+
+    // Volatile + preserved must equal total.
+    CYBOZU_TEST_EQUAL(volatile_in_use.size() + preserved_in_use.size(),
+                      all_in_use.size());
+
+    // On Linux/macOS all vector registers are caller-saved: no preserved.
+#ifndef _WIN32
+    CYBOZU_TEST_ASSERT(preserved_in_use.empty());
+    CYBOZU_TEST_EQUAL(volatile_in_use.size(), all_in_use.size());
+#endif
+
+    // Every preserved index must be in the preserved pool.
+    for (int idx : preserved_in_use) {
+        CYBOZU_TEST_ASSERT(std::find(preserved_vec_list.begin(),
+                                     preserved_vec_list.end(), idx)
+                           != preserved_vec_list.end());
+    }
+
+    rm.free(xr1);  rm.free(xr2);  rm.free(yr3);
+    for (auto &v : preserved_vecs) rm.free(v);
+
+    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_in_use_preserved_vecs().empty());
+}
+
+// =============================================================================
+// Test 26 – Opmask volatile query (all opmasks are caller-saved)
+// =============================================================================
+CYBOZU_TEST_AUTO(opmaskVolatile)
+{
+    RegPoolManager rm;
+
+    auto k1 = rm.alloc<Opmask>();
+    auto k2 = rm.alloc<Opmask>();
+    auto k3 = rm.alloc<Opmask>();
+
+    auto all_in_use      = rm.get_in_use_opmasks();
+    auto volatile_in_use = rm.get_in_use_volatile_opmasks();
+
+    // All opmasks are volatile on both Windows and Linux.
+    CYBOZU_TEST_EQUAL(all_in_use.size(), volatile_in_use.size());
+    CYBOZU_TEST_ASSERT(all_in_use == volatile_in_use);
+
+    rm.free(k1);  rm.free(k2);  rm.free(k3);
+
+    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_opmasks().empty());
+}
+
+// =============================================================================
+// Test 27 – Comprehensive multi-family volatile / preserved queries
+// =============================================================================
+CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
+{
+    RegPoolManager rm;
+
+    // GP registers
+    auto r1 = rm.alloc<Reg64>();
+    auto r2 = rm.alloc<Reg64>();
+    auto gp_preserved_list = rm.get_preserved_gps();
+    Reg64 r3(0);
+    bool have_gp_preserved = false;
+    for (int idx : gp_preserved_list) {
+        // avoid rsp (4) and rbp (5)
+        if (idx != 4 && idx != 5) {
+            r3 = rm.alloc<Reg64>(idx);
+            have_gp_preserved = true;
+            break;
+        }
+    }
+
+    // Vector registers
+    auto xmm1 = rm.alloc<Xmm>();
+    auto ymm2  = rm.alloc<Ymm>();
+    auto vec_preserved_list = rm.get_preserved_vecs();
+    Xmm xmm3(0);
+    bool have_vec_preserved = false;
+    if (!vec_preserved_list.empty()) {
+        xmm3 = rm.alloc<Xmm>(vec_preserved_list[0]);
+        have_vec_preserved = true;
+    }
+
+    // Opmask registers
+    auto k1 = rm.alloc<Opmask>();
+    auto k2 = rm.alloc<Opmask>();
+
+    // Query all families
+    auto gp_volatile   = rm.get_in_use_volatile_gps();
+    auto gp_preserved  = rm.get_in_use_preserved_gps();
+    auto vec_volatile  = rm.get_in_use_volatile_vecs();
+    auto vec_preserved = rm.get_in_use_preserved_vecs();
+    auto om_volatile   = rm.get_in_use_volatile_opmasks();
+
+    // Within each family: volatile + preserved == total in-use.
+    CYBOZU_TEST_EQUAL(gp_volatile.size()  + gp_preserved.size(),
+                      rm.get_in_use_gps().size());
+    CYBOZU_TEST_EQUAL(vec_volatile.size() + vec_preserved.size(),
+                      rm.get_in_use_vecs().size());
+    CYBOZU_TEST_EQUAL(om_volatile.size(), rm.get_in_use_opmasks().size());
+
+    // If a preserved GP was allocated it must appear in gp_preserved.
+    if (have_gp_preserved) {
+        CYBOZU_TEST_ASSERT(std::find(gp_preserved.begin(), gp_preserved.end(),
+                                     r3.getIdx())
+                           != gp_preserved.end());
+    }
+    // If a preserved vec was allocated it must appear in vec_preserved.
+    if (have_vec_preserved) {
+        CYBOZU_TEST_ASSERT(std::find(vec_preserved.begin(), vec_preserved.end(),
+                                     xmm3.getIdx())
+                           != vec_preserved.end());
+    }
+
+    // Cleanup
+    rm.free(r1);  rm.free(r2);
+    if (have_gp_preserved) rm.free(r3);
+    rm.free(xmm1);  rm.free(ymm2);
+    if (have_vec_preserved) rm.free(xmm3);
+    rm.free(k1);  rm.free(k2);
+}
+
+// =============================================================================
+// Test 28 – AMX volatile tile query (all tiles are caller-saved)
+// =============================================================================
+CYBOZU_TEST_AUTO(amxVolatileTiles)
+{
+    RegPoolManager rm;
+
+    if (!rm.has_amx()) {
+        // Without AMX the in-use set is always empty.
+        CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_tiles().empty());
+        return;
+    }
+
+    auto t1 = rm.alloc<Tmm>();
+    auto t2 = rm.alloc<Tmm>();
+    auto t3 = rm.alloc<Tmm>();
+
+    auto all_in_use      = rm.get_in_use_tiles();
+    auto volatile_in_use = rm.get_in_use_volatile_tiles();
+
+    // All AMX tile registers are caller-saved on both Windows and Linux.
+    CYBOZU_TEST_EQUAL(all_in_use.size(), volatile_in_use.size());
+    CYBOZU_TEST_ASSERT(all_in_use == volatile_in_use);
+    CYBOZU_TEST_EQUAL(volatile_in_use.size(), size_t(3));
+
+    // Freeing one tile must be reflected immediately.
+    rm.free(t3);
+    CYBOZU_TEST_EQUAL(rm.get_in_use_volatile_tiles().size(), size_t(2));
+
+    rm.free(t1);
+    rm.free(t2);
+    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_tiles().empty());
 }
