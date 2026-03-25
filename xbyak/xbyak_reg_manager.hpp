@@ -18,7 +18,6 @@
 
 #include <cstdint>
 #include <set>
-#include <stdexcept>
 #include <vector>
 #include <type_traits>
 
@@ -171,7 +170,7 @@ public:
                 tile_reg(idx);
                 return RegT(idx);
             }
-            default: throw std::runtime_error("Unknown register family");
+            default: XBYAK_THROW_RET(ERR_INTERNAL, RegT(0))
         }
     }
 
@@ -182,7 +181,7 @@ public:
             case RegFamily::Vec: vec_reg(idx); return RegT(idx);
             case RegFamily::Opmask: opmask_reg(idx); return RegT(idx);
             case RegFamily::Tile: tile_reg(idx); return RegT(idx);
-            default: throw std::runtime_error("Unknown register family");
+            default: XBYAK_THROW_RET(ERR_INTERNAL, RegT(0))
         }
     }
 
@@ -210,7 +209,7 @@ public:
             case RegFamily::Vec: release_vec(idx); break;
             case RegFamily::Opmask: release_opmask(idx); break;
             case RegFamily::Tile: release_tile(idx); break;
-            default: throw std::runtime_error("Unknown register family");
+            default: XBYAK_THROW(ERR_INTERNAL)
         }
     }
 
@@ -334,13 +333,13 @@ public:
     // member function - add a register to the free pool of general registers
     void add_to_gp_pool(const Reg64 &reg) { add_to_gp_pool(reg.getIdx()); }
     void add_to_gp_pool(int idx) {
-        if ((idx < 0 || idx > max_gp_reg_idx_))
-            throw std::runtime_error("Register index out of range");
+        if (idx < 0 || idx > max_gp_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
         const bool in_free = free_gp_regs.count(idx) != 0;
         const bool in_preserved = preserved_gp.count(idx) != 0;
         const bool in_use = in_use_gp.count(idx) != 0;
         if (in_free || in_preserved || in_use)
-            throw std::runtime_error("Register already tracked");
+            XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         free_gp_regs.insert(idx);
     }
 
@@ -453,56 +452,30 @@ private:
     // helper method - checks reg in use before scoping
     template <class RegT>
     static void validate_scoped_reg(RegPoolManager *rm, RegT reg) {
-        const RegFamily family = reg_family<RegT>::value;
         if (!rm->reg_in_use(reg))
-            throw std::runtime_error(scoped_reg_error(family));
-    }
-
-    // helper switch case for error messages
-    static const char *scoped_reg_error(RegFamily family) noexcept {
-        switch (family) {
-            case RegFamily::GP:
-                return "Cannot create GP scoped reg for a register that is not "
-                       "in use";
-            case RegFamily::Vec:
-                return "Cannot create Vec scoped reg for a register that is "
-                       "not in use";
-            case RegFamily::Opmask:
-                return "Cannot create Opmask scoped reg for a register that is "
-                       "not in use";
-            case RegFamily::Tile:
-                return "Cannot create Tile scoped reg for a register that is "
-                       "not in use";
-            default: return "Cannot create scoped reg for unknown family";
-        }
+            XBYAK_THROW(ERR_RM_SCOPED_REG_NOT_IN_USE)
     }
 
     // helper method - checks if a register index for a given family is currently in use
     bool reg_in_use_idx(int idx, RegFamily family) const {
         switch (family) {
             case RegFamily::GP:
-                if (idx < 0 || idx > max_gp_reg_idx_) {
-                    throw std::runtime_error("GP register index out of range");
-                }
+                if (idx < 0 || idx > max_gp_reg_idx_)
+                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
                 return in_use_gp.find(idx) != in_use_gp.end();
             case RegFamily::Vec:
-                if (idx < 0 || idx > max_vec_reg_idx_) {
-                    throw std::runtime_error("Vec register index out of range");
-                }
+                if (idx < 0 || idx > max_vec_reg_idx_)
+                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
                 return in_use_vec.find(idx) != in_use_vec.end();
             case RegFamily::Opmask:
-                if (idx < 0 || idx > 7) {
-                    throw std::runtime_error(
-                            "Opmask register index out of range");
-                }
+                if (idx < 0 || idx > 7)
+                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
                 return in_use_opmask.find(idx) != in_use_opmask.end();
             case RegFamily::Tile:
-                if (idx < 0 || idx > 7) {
-                    throw std::runtime_error(
-                            "AMX tile register index out of range");
-                }
+                if (idx < 0 || idx > 7)
+                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
                 return in_use_tile.find(idx) != in_use_tile.end();
-            default: throw std::runtime_error("Unknown register family");
+            default: XBYAK_THROW_RET(ERR_INTERNAL, false)
         }
     }
 
@@ -510,27 +483,27 @@ private:
     int next_gp_idx() const {
         if (!free_gp_regs.empty()) return *free_gp_regs.begin();
         if (!preserved_gp.empty()) return *preserved_gp.begin();
-        throw std::runtime_error("No free GP registers available");
+        XBYAK_THROW_RET(ERR_RM_NO_FREE_GP, 0)
     }
     int next_vec_idx() const {
         if (!free_vec_regs.empty()) return *free_vec_regs.begin();
         if (!preserved_vec.empty()) return *preserved_vec.begin();
-        throw std::runtime_error("No free Vec registers available");
+        XBYAK_THROW_RET(ERR_RM_NO_FREE_VEC, 0)
     }
     int next_opmask_idx() const {
         if (!free_opmask_regs.empty()) return *free_opmask_regs.begin();
         if (!preserved_opmask.empty()) return *preserved_opmask.begin();
-        throw std::runtime_error("No free Opmask registers available");
+        XBYAK_THROW_RET(ERR_RM_NO_FREE_OPMASK, 0)
     }
     int next_tile_idx() const {
         if (!free_tile_regs.empty()) return *free_tile_regs.begin();
-        throw std::runtime_error("No free AMX tile registers available");
+        XBYAK_THROW_RET(ERR_RM_NO_FREE_TILE, 0)
     }
 
     // tracking for in-use indices for a given register family
     void gp_reg(int idx) {
         if (reg_in_use_idx(idx, RegFamily::GP))
-            throw std::runtime_error("Specified GP register currently in use");
+            XBYAK_THROW(ERR_RM_GP_IN_USE)
         auto it = free_gp_regs.find(idx);
         auto pres_it = preserved_gp.find(idx);
         if (it != free_gp_regs.end()) {
@@ -542,13 +515,12 @@ private:
             preserved_gp.erase(pres_it);
             used_gp.insert(idx);
         } else {
-            throw std::runtime_error(
-                    "Requested register not in free/preserved pools.");
+            XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
         }
     }
     void vec_reg(int idx) {
         if (reg_in_use_idx(idx, RegFamily::Vec))
-            throw std::runtime_error("Specified Vec register currently in use");
+            XBYAK_THROW(ERR_RM_VEC_IN_USE)
         auto it = free_vec_regs.find(idx);
         auto pres_it = preserved_vec.find(idx);
         if (it != free_vec_regs.end()) {
@@ -560,14 +532,12 @@ private:
             preserved_vec.erase(pres_it);
             used_vec.insert(idx);
         } else {
-            throw std::runtime_error(
-                    "Requested register not in free/preserved/in-use sets.");
+            XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
         }
     }
     void opmask_reg(int idx) {
         if (reg_in_use_idx(idx, RegFamily::Opmask))
-            throw std::runtime_error(
-                    "Specified Opmask register currently in use");
+            XBYAK_THROW(ERR_RM_OPMASK_IN_USE)
         auto it = free_opmask_regs.find(idx);
         auto pres_it = preserved_opmask.find(idx);
         if (it != free_opmask_regs.end()) {
@@ -579,59 +549,56 @@ private:
             preserved_opmask.erase(pres_it);
             used_opmask.insert(idx);
         } else {
-            throw std::runtime_error(
-                    "Requested opmask register not in free/preserved pools.");
+            XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
         }
     }
 
     // member function - moves given index from in-use set to free set for given family
     void release_gp(int idx) {
-        if ((idx < 0 || idx > max_gp_reg_idx_))
-            throw std::runtime_error("Register index out of range");
+        if (idx < 0 || idx > max_gp_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
         auto it = in_use_gp.find(idx);
         if (it == in_use_gp.end())
-            throw std::runtime_error("GP register not in use");
+            XBYAK_THROW(ERR_RM_GP_NOT_IN_USE)
         in_use_gp.erase(it);
         free_gp_regs.insert(idx);
     }
     void release_vec(int idx) {
-        if ((idx < 0 || idx > max_vec_reg_idx_))
-            throw std::runtime_error("Register index out of range");
+        if (idx < 0 || idx > max_vec_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
         auto it = in_use_vec.find(idx);
         if (it == in_use_vec.end())
-            throw std::runtime_error("Vec register not in use");
+            XBYAK_THROW(ERR_RM_VEC_NOT_IN_USE)
         in_use_vec.erase(it);
         free_vec_regs.insert(idx);
     }
     void release_opmask(int idx) {
-        if ((idx < 0 || idx > 7))
-            throw std::runtime_error("Opmask register index out of range");
+        if (idx < 0 || idx > 7)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
         auto it = in_use_opmask.find(idx);
         if (it == in_use_opmask.end())
-            throw std::runtime_error("Opmask register not in use");
+            XBYAK_THROW(ERR_RM_OPMASK_NOT_IN_USE)
         in_use_opmask.erase(it);
         free_opmask_regs.insert(idx);
     }
     void tile_reg(int idx) {
         if (reg_in_use_idx(idx, RegFamily::Tile))
-            throw std::runtime_error(
-                    "Specified AMX tile register currently in use");
+            XBYAK_THROW(ERR_RM_TILE_IN_USE)
         auto it = free_tile_regs.find(idx);
         if (it != free_tile_regs.end()) {
             in_use_tile.insert(idx);
             free_tile_regs.erase(it);
             used_tile.insert(idx);
         } else {
-            throw std::runtime_error(
-                    "Requested AMX tile register not in free pool.");
+            XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
         }
     }
     void release_tile(int idx) {
         if (idx < 0 || idx > 7)
-            throw std::runtime_error("AMX tile register index out of range");
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
         auto it = in_use_tile.find(idx);
         if (it == in_use_tile.end())
-            throw std::runtime_error("AMX tile register not in use");
+            XBYAK_THROW(ERR_RM_TILE_NOT_IN_USE)
         in_use_tile.erase(it);
         free_tile_regs.insert(idx);
     }

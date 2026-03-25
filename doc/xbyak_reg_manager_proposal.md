@@ -48,7 +48,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [ ] 8. Stack Frame Management: `StackFrame` RAII Helper
 - [ ] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
 - [ ] 10. End-of-JIT Validation: `assert_all_free()`
-- [ ] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
+- [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
 - [x] 12. Named-Register `alloc()` Overload
 - [ ] 13. Remove `used_*` Sets
 - [x] 14. In-Use Volatile / Preserved Getters

@@ -139,7 +139,7 @@ CYBOZU_TEST_AUTO(specificAllocation)
     CYBOZU_TEST_EQUAL(r11.getIdx(), 11);
 
     // Allocating an already-in-use index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), Xbyak::Error);
 
     rm.free(r10);
     rm.free(r11);
@@ -204,7 +204,7 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
                 CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tmm1.getIdx()));
 
                 // Duplicate alloc by name must throw for tiles too.
-                CYBOZU_TEST_EXCEPTION(rm.alloc(tmm0), std::runtime_error);
+                CYBOZU_TEST_EXCEPTION(rm.alloc(tmm0), Xbyak::Error);
 
                 rm.free(reg_tmm0);
                 rm.free(reg_tmm1);
@@ -213,9 +213,9 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
 
             // Allocating an already-in-use register by name must throw — the
             // same error path as alloc<Reg64>(int idx) for a duplicate index.
-            CYBOZU_TEST_EXCEPTION(rm.alloc(rdx),  std::runtime_error);
-            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm2), std::runtime_error);
-            CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   std::runtime_error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(rdx),  Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm2), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   Xbyak::Error);
 
             // Free all and confirm every pool is clean.
             rm.free(reg_rdx);  rm.free(reg_r10);
@@ -329,13 +329,13 @@ CYBOZU_TEST_AUTO(addToPool)
     CYBOZU_TEST_EQUAL(rbp_reg.getIdx(), 5);
 
     // add_to_gp_pool with an out-of-range index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(200), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(200), Xbyak::Error);
 
     // add_to_gp_pool for an index already in the free pool (rax=0, always
     // caller-saved) or the preserved pool (rbx=3, always callee-saved) must
     // throw on both Windows and Linux.
-    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(0), std::runtime_error);
-    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(3), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(0), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(3), Xbyak::Error);
 }
 
 // =============================================================================
@@ -350,7 +350,7 @@ CYBOZU_TEST_AUTO(registerExhaustion)
     try {
         for (int i = 0; i < 50; ++i)
             allocated.push_back(rm.alloc<Reg64>());
-    } catch (const std::runtime_error &) {
+    } catch (const Xbyak::Error &) {
         // Exhaustion exception is expected.
     }
 
@@ -420,9 +420,9 @@ CYBOZU_TEST_AUTO(gpRegisterAliasing)
     CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(0));
 
     // EAX (Reg32(0)) shares the same physical register – must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg32>(0), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg32>(0), Xbyak::Error);
     // AX (Reg16(0)) also shares it – must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg16>(0), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg16>(0), Xbyak::Error);
 
     rm.free(rax_reg);
 
@@ -446,8 +446,8 @@ CYBOZU_TEST_AUTO(vectorRegisterAliasing)
     CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(0));
 
     // YMM0 and ZMM0 share the same physical register – both must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Ymm>(0), std::runtime_error);
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Zmm>(0), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Ymm>(0), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Zmm>(0), Xbyak::Error);
 
     rm.free(xmm0);
 
@@ -832,7 +832,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
 
     if (!rm.has_amx()) {
         // Without AMX hardware alloc must throw immediately.
-        CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(), std::runtime_error);
+        CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(), Xbyak::Error);
         return;
     }
 
@@ -850,7 +850,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
     CYBOZU_TEST_EQUAL(t2.getIdx(), 2);
 
     // Duplicate allocation of tile 2 must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(2), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(2), Xbyak::Error);
 
     rm.free(t0);
     rm.free(t1);
@@ -860,7 +860,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
     CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
 
     // Freeing a tile that is not in use must throw.
-    CYBOZU_TEST_EXCEPTION(rm.free(t0), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.free(t0), Xbyak::Error);
 }
 
 // =============================================================================
@@ -875,7 +875,7 @@ CYBOZU_TEST_AUTO(amxTileExhaustion)
     try {
         for (int i = 0; i < 10; ++i)
             allocated.push_back(rm.alloc<Tmm>());
-    } catch (const std::runtime_error &) {
+    } catch (const Xbyak::Error &) {
         // Exhaustion exception is expected.
     }
 
@@ -962,7 +962,7 @@ CYBOZU_TEST_AUTO(amxRegInUse)
         CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(0));
         CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(7));
         // Out-of-range must throw regardless of AMX availability.
-        CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), std::runtime_error);
+        CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), Xbyak::Error);
         return;
     }
 
@@ -973,7 +973,7 @@ CYBOZU_TEST_AUTO(amxRegInUse)
     CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(4));
 
     // Out-of-range index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), std::runtime_error);
+    CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), Xbyak::Error);
 
     rm.free(t3);
 
