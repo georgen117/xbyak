@@ -728,11 +728,31 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             auto in_use = rm.get_in_use_gps();
             for (int idx : in_use) push(Reg64(idx));
 
+#ifdef _WIN32
+            // Win64 ABI: allocate 32-byte shadow space; also re-align the stack
+            // to 16 bytes at the call instruction.  On entry rsp%16==8 (return
+            // address pushed by caller).  After push(rbx) + in_use.size() pushes
+            // the adjustment needed is:
+            //   total_pushes_from_entry = 1 + in_use.size()
+            //   bytes_pushed = total_pushes_from_entry * 8
+            //   rsp_mod16 = (8 + bytes_pushed) % 16   (8 = initial offset)
+            //   If rsp_mod16 == 8: already aligned before call, just add 32 shadow.
+            //   If rsp_mod16 == 0: need 8-byte pad + 32 shadow = 40 bytes.
+            {
+                size_t total_pushes = 1 + in_use.size(); // rbx + in_use
+                bool needs_pad = (total_pushes % 2) == 0;
+                int adj = needs_pad ? 40 : 32;
+                sub(rsp, adj);
+#endif
             // Call a real function that clobbers caller-saved registers.
             mov(rax,
                 reinterpret_cast<uint64_t>(&call_function_that_clobbers_registers));
             call(rax);
             mov(rbx, rax);  // stash the return value (210) in rbx
+#ifdef _WIN32
+                add(rsp, adj);
+            }
+#endif
 
             // Generate restore code in reverse order.
             for (auto it = in_use.rbegin(); it != in_use.rend(); ++it)
@@ -1077,10 +1097,25 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             auto volatile_regs = rm.get_in_use_volatile_gps();
             for (int idx : volatile_regs) push(Reg64(idx));
 
+#ifdef _WIN32
+            // Win64 ABI: 32-byte shadow space + 16-byte alignment.
+            // On entry rsp%16==8. After push(rbx) + volatile_regs.size() pushes:
+            //   total_pushes_from_entry = 1 + volatile_regs.size()
+            //   needs_pad if (total_pushes_from_entry % 2) == 0
+            {
+                size_t total_pushes = 1 + volatile_regs.size();
+                bool needs_pad = (total_pushes % 2) == 0;
+                int adj = needs_pad ? 40 : 32;
+                sub(rsp, adj);
+#endif
             mov(rax, reinterpret_cast<uint64_t>(
                          &call_function_that_clobbers_registers));
             call(rax);
             mov(rbx, rax);  // stash return value (210)
+#ifdef _WIN32
+                add(rsp, adj);
+            }
+#endif
 
             // Restore only volatile registers (in reverse order).
             for (auto it = volatile_regs.rbegin(); it != volatile_regs.rend(); ++it)

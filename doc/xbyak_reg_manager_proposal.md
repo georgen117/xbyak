@@ -55,6 +55,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [ ] 15. ABI Configuration: Windows x64 vs SysV
 - [ ] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [ ] 17. Accept External `Xbyak::util::Cpu` Reference
+- [ ] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
 
 ---
 
@@ -1921,6 +1922,197 @@ public:
 
 ---
 
+## 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
+
+### Motivation
+
+When JIT code calls a real C function, two platform-specific requirements must be
+satisfied at the `call` instruction site:
+
+**Windows x64 (Win64 ABI):**
+1. **32-byte shadow space** — the caller must subtract 32 from `rsp` before any
+   `call` instruction, unconditionally, even if the callee takes no arguments.
+   This space is for the callee's own use (e.g. home area for register arguments)
+   and must be provided by every caller. Omitting it causes the callee to corrupt
+   whatever happens to live just below the caller's stack frame.
+2. **16-byte stack alignment** — `rsp` must be 16-byte aligned *at* the `call`
+   instruction (i.e. `rsp % 16 == 0` before `call` pushes the return address,
+   so the callee receives `rsp % 16 == 8`). If the total number of `push`
+   instructions since JIT function entry is even, an extra 8-byte pad is needed
+   before the shadow space allocation.
+
+The combined adjustment is:
+
+```
+total_pushes = all push instructions from JIT entry to call site
+needs_pad    = (total_pushes % 2) == 0   // true when rsp would be misaligned
+adj          = 32 + (needs_pad ? 8 : 0)  // 32 shadow + optional 8-byte pad
+
+sub rsp, adj
+call target
+add rsp, adj
+```
+
+**Linux / macOS (SysV AMD64 ABI):**
+
+SysV has **no shadow space** requirement — the callee owns only what it allocates
+itself. However the 16-byte alignment rule still applies: `rsp % 16 == 0` at the
+`call` instruction. The adjustment is therefore just:
+
+```
+needs_pad = (total_pushes % 2) == 0
+adj       = needs_pad ? 8 : 0   // only align; no shadow space
+
+// if adj > 0: sub rsp, adj / call target / add rsp, adj
+// if adj == 0: call target  (already aligned)
+```
+
+In practice many SysV JIT kernels that call leaf functions already happen to be
+aligned and need no adjustment at all. The requirement is real but the common case
+is zero cost.
+
+Without this abstraction, callers must reason about push-count parity and
+platform differences every time they emit a `call`. Both the `dynamicSaveRestore`
+and `volatileGPCallerSave` tests in `test/reg_manager_test.cpp` currently contain
+`#ifdef _WIN32` blocks that manually compute and apply this adjustment — exactly
+the kind of boilerplate that `emit_call()` eliminates.
+
+**Prerequisite:** §6 (`set_code_generator()`) must be in place so the manager has
+a `CodeGenerator*` with which to emit `sub`/`add rsp` instructions.
+
+### Design
+
+The manager tracks the number of `push`-equivalent stack moves it has observed
+since function entry or the last `reset()`. This count is incremented by:
+
+- `emit_prologue()` (§9) — one per callee-saved GP pushed
+- `spill()` (§7) — one per register spilled
+- `StackFrame` construction (§8) — equivalent to `size / 8` slots (fractional
+  pushes are accounted for in the alignment calculation as bytes, not push units)
+
+For the common case where the caller also pushes registers manually before calling
+`emit_call()`, an optional `extra_pushes` parameter allows the caller to declare
+any additional pushes the manager has not seen.
+
+### Proposed API
+
+```cpp
+// Emit an ABI-correct call to a runtime C function.
+//
+// func_ptr       — address of the target function (loaded into a scratch register
+//                  by the manager; rax is used as a scratch register internally).
+// extra_pushes   — number of manual push instructions the caller emitted that
+//                  the manager has not tracked (default: 0).  Used to compute
+//                  the correct alignment and shadow space adjustment.
+//
+// What emit_call() emits (Win64):
+//   sub  rsp, adj        ; adj = 32 + (8 if alignment pad needed)
+//   mov  rax, func_ptr
+//   call rax
+//   add  rsp, adj
+//
+// What emit_call() emits (SysV):
+//   [sub rsp, 8]         ; only if alignment pad needed
+//   mov  rax, func_ptr
+//   call rax
+//   [add rsp, 8]         ; matching restore
+//
+// Returns: nothing.  The caller reads the return value from rax as usual.
+//
+// Throws ERR_RM_NO_CG if cg_ is null.
+void emit_call(uint64_t func_ptr, size_t extra_pushes = 0);
+
+// Convenience overload: accept a typed function pointer directly.
+template <typename FuncT>
+void emit_call(FuncT *func_ptr, size_t extra_pushes = 0) {
+    emit_call(reinterpret_cast<uint64_t>(func_ptr), extra_pushes);
+}
+```
+
+### Internal State Changes
+
+```cpp
+// Running count of push-equivalent 8-byte slots emitted by the manager
+// (incremented by emit_prologue, spill, and StackFrame construction).
+// Used by emit_call() to compute alignment.
+size_t managed_push_count_ = 0;  // added alongside §7 / §9 state
+```
+
+### Usage Example — Before and After
+
+**Before `emit_call()` (current state in tests):**
+
+```cpp
+// Save volatile registers.
+auto vol = rm.get_in_use_volatile_gps();
+for (int idx : vol) push(Reg64(idx));          // manual push, count = vol.size()
+
+#ifdef _WIN32
+// Must manually compute shadow space + alignment pad.
+size_t total_pushes = 1 + vol.size();          // 1 = earlier push(rbx)
+bool needs_pad = (total_pushes % 2) == 0;
+int adj = needs_pad ? 40 : 32;
+sub(rsp, adj);
+#endif
+mov(rax, reinterpret_cast<uint64_t>(&my_func));
+call(rax);
+#ifdef _WIN32
+add(rsp, adj);
+#endif
+
+for (auto it = vol.rbegin(); it != vol.rend(); ++it) pop(Reg64(*it));
+```
+
+**After `emit_call()` (target state once §6 + §18 are implemented):**
+
+```cpp
+// Save volatile registers.
+auto vol = rm.get_in_use_volatile_gps();
+for (int idx : vol) push(Reg64(idx));
+
+// emit_call handles shadow space, alignment, and load — on all platforms.
+rm.emit_call(&my_func, /*extra_pushes=*/1 + vol.size());
+// or equivalently, if the manager tracks all pushes itself via emit_prologue/spill:
+// rm.emit_call(&my_func);
+
+for (auto it = vol.rbegin(); it != vol.rend(); ++it) pop(Reg64(*it));
+```
+
+### Removing the `#ifdef _WIN32` Blocks From Tests
+
+Once `emit_call()` is implemented, the manual `#ifdef _WIN32` adjustment blocks in
+`test/reg_manager_test.cpp` must be removed and replaced with `emit_call()` calls.
+The affected tests are:
+
+- `dynamicSaveRestore` — `gen_caller_saves_all()` contains an `#ifdef _WIN32`
+  block that computes `adj = needs_pad ? 40 : 32` and emits `sub`/`add rsp`.
+- `volatileGPCallerSave` — `OptimalCallerJit::gen()` contains an equivalent
+  `#ifdef _WIN32` block.
+
+Both blocks are intentional workarounds for the missing `emit_call()` abstraction
+and are marked with comments referencing this proposal item. Deleting them in favour
+of `emit_call()` is the acceptance criterion for completing §18.
+
+### Notes
+
+- `emit_call()` uses `rax` as a scratch register to load the function address
+  (matching the pattern the tests already use). Since `rax` is volatile on both
+  ABIs, this is always safe — the callee is free to clobber it anyway.
+- If §9 (`emit_prologue`) is in use, the manager already knows how many callee-save
+  pushes it emitted; `managed_push_count_` tracks this. The `extra_pushes` parameter
+  covers any additional manual pushes the caller emits outside of manager control
+  (e.g. `push(rbx)` to stash a return value).
+- On SysV, the most common call sites after `emit_prologue()` will have
+  `extra_pushes == 0` and an odd `managed_push_count_`, meaning no adjustment is
+  needed at all and `emit_call()` reduces to a plain `call rax` with no `sub`/`add`.
+- The function pointer is loaded via `mov rax, imm64` even on SysV. For
+  position-independent code compiled with `-fPIC`, the target function must be
+  reachable via an absolute address; this is always the case for statically-linked
+  helper functions and PLT-resolved library symbols whose abs address is known at
+  JIT construction time.
+
+---
+
 ## Summary Table
 
 | # | Change | API Impact | New Data Members | Requires §6 |
@@ -1942,6 +2134,7 @@ public:
 | 15 | ABI configuration (Windows / SysV) | Constructor parameter | `abi_` enum member | No |
 | 16 | Manager `reset()` | 1 new method | None | No |
 | 17 | External `Cpu` constructor overload | 1 new constructor overload | None | No |
+| 18 | `emit_call()` — ABI-correct outgoing calls | 1 new method (+ template overload) | `managed_push_count_` | Yes (§6) |
 
 ### Recommended Implementation Order
 
@@ -1952,9 +2145,10 @@ public:
 5. §5 (pinned registers — no code gen dependency)
 6. §10 (`assert_all_free()` only — `assert_spill_stack_empty()` companion must wait until step 9 when `spill_stack_gp_` exists)
 7. §6 (code generator coupling — prerequisite for §7, §8, §9)
-8. §9 (prologue/epilogue tracking — can be done before spill)
-9. §7 (spill/restore — builds on §9 for alignment accounting; add `assert_spill_stack_empty()` companion here)
-10. §8 (StackFrame — builds on §7 and §9)
+8. §9 (prologue/epilogue tracking — can be done before spill; establishes `managed_push_count_`)
+9. §18 (`emit_call()` — builds directly on §6 + §9; removes all `#ifdef _WIN32` shadow-space blocks from tests once implemented)
+10. §7 (spill/restore — builds on §9 for alignment accounting; add `assert_spill_stack_empty()` companion here)
+11. §8 (StackFrame — builds on §7 and §9)
 11. §2 (bitmask optimisation — internal only, do last when API is stable)
 12. §12 (named-register alloc — pure convenience, no dependencies, add anytime)
 13. §13 (remove `used_*` — breaking removal, do after §9 is in place so callers have a replacement)

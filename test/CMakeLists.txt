@@ -25,7 +25,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(MSVC)
     # MSVC: exceptions on, standard warnings, suppress secure CRT warnings
-    set(COMMON_FLAGS /EHsc /W4 /D_CRT_SECURE_NO_WARNINGS)
+    set(COMMON_FLAGS /EHsc /W4 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX)
 else()
     # GCC/Clang: optimize + all warnings from CFLAGS_WARN.cfg
     set(COMMON_FLAGS -O2 ${CFLAGS_WARN})
