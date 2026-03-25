@@ -330,6 +330,69 @@ public:
         return make_index_vector(in_use_tile);
     }
 
+    // Prevents a register from being returned by alloc() without marking it as in-use.
+    // Useful for protecting registers that must stay off-limits during code generation,
+    // such as ABI argument registers or registers dedicated to a runtime helper.
+    //
+    // The register must not be currently allocated. Reserving an already-in-use register,
+    // or calling mark_unavailable() twice on the same register, throws Xbyak::Error.
+    // Reserved registers are not visible to get_in_use_gps() / get_in_use_vecs() etc.
+    // Call mark_available() to return the register to the normal allocation pool.
+    //
+    // Named-register and index-based overloads are both available:
+    //   rm.mark_unavailable(rdi);        // named (requires CodeGenerator subclass scope)
+    //   rm.mark_unavailable<Reg64>(7);   // GP register by index
+    //   rm.mark_unavailable<Xmm>(0);     // vector register by index
+    //   rm.mark_unavailable<Opmask>(1);  // opmask register by index
+    //   rm.mark_unavailable<Tmm>(0);     // tile register by index
+
+    // Index-based overload — RegT must be specified explicitly (e.g. mark_unavailable<Reg64>(7)).
+    template <class RegT>
+    void mark_unavailable(int idx) {
+        switch (reg_family<RegT>::value) {
+            case RegFamily::GP:     reserve_reg_gp(idx);     return;
+            case RegFamily::Vec:    reserve_reg_vec(idx);    return;
+            case RegFamily::Opmask: reserve_reg_opmask(idx); return;
+            case RegFamily::Tile:   reserve_reg_tile(idx);   return;
+            default: XBYAK_THROW(ERR_INTERNAL)
+        }
+    }
+
+    // Named-register overload — RegT is deduced from the argument.
+    template <class RegT>
+    void mark_unavailable(const RegT &reg) { mark_unavailable<RegT>(reg.getIdx()); }
+
+    template <class RegT>
+    void mark_available(int idx) {
+        switch (reg_family<RegT>::value) {
+            case RegFamily::GP:     unreserve_reg_gp(idx);     return;
+            case RegFamily::Vec:    unreserve_reg_vec(idx);    return;
+            case RegFamily::Opmask: unreserve_reg_opmask(idx); return;
+            case RegFamily::Tile:   unreserve_reg_tile(idx);   return;
+            default: XBYAK_THROW(ERR_INTERNAL)
+        }
+    }
+
+    // Returns a previously reserved register to the allocation pool so that alloc() may
+    // return it again. Throws Xbyak::Error if the register is not currently reserved.
+    template <class RegT>
+    void mark_available(const RegT &reg) { mark_available<RegT>(reg.getIdx()); }
+
+    // Returns true if the register has been reserved with mark_unavailable().
+    template <class RegT>
+    bool is_reserved(const RegT &reg) const { return is_reserved<RegT>(reg.getIdx()); }
+
+    template <class RegT>
+    bool is_reserved(int idx) const {
+        switch (reg_family<RegT>::value) {
+            case RegFamily::GP:     return reserved_gp.count(idx) != 0;
+            case RegFamily::Vec:    return reserved_vec.count(idx) != 0;
+            case RegFamily::Opmask: return reserved_opmask.count(idx) != 0;
+            case RegFamily::Tile:   return reserved_tile.count(idx) != 0;
+            default: XBYAK_THROW_RET(ERR_INTERNAL, false)
+        }
+    }
+
     // member function - add a register to the free pool of general registers
     void add_to_gp_pool(const Reg64 &reg) { add_to_gp_pool(reg.getIdx()); }
     void add_to_gp_pool(int idx) {
@@ -447,6 +510,90 @@ private:
         for (int idx : set)
             indices.emplace_back(idx);
         return indices;
+    }
+
+    //private helpers — reserve / unreserve for each family
+    void reserve_reg_gp(int idx) {
+        if (idx < 0 || idx > max_gp_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (in_use_gp.count(idx))   XBYAK_THROW(ERR_RM_GP_IN_USE)
+        if (reserved_gp.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+        // Remove from whichever pool currently holds it.
+        if (!free_gp_regs.erase(idx) && !preserved_gp.erase(idx))
+            XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
+        reserved_gp.insert(idx);
+    }
+
+    void unreserve_reg_gp(int idx) {
+        if (idx < 0 || idx > max_gp_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (!reserved_gp.erase(idx))
+            XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
+        // Return to original pool based on ABI classification.
+        // APX extended regs (r16-r31) are always volatile.
+        if (idx <= max_gp_reg_idx_ && base_preserved_gp().count(idx))
+            preserved_gp.insert(idx);
+        else
+            free_gp_regs.insert(idx);
+    }
+
+    void reserve_reg_vec(int idx) {
+        if (idx < 0 || idx > max_vec_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (in_use_vec.count(idx))   XBYAK_THROW(ERR_RM_VEC_IN_USE)
+        if (reserved_vec.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+        if (!free_vec_regs.erase(idx) && !preserved_vec.erase(idx))
+            XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
+        reserved_vec.insert(idx);
+    }
+
+    void unreserve_reg_vec(int idx) {
+        if (idx < 0 || idx > max_vec_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (!reserved_vec.erase(idx))
+            XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
+        if (base_preserved_vec().count(idx))
+            preserved_vec.insert(idx);
+        else
+            free_vec_regs.insert(idx);
+    }
+
+    void reserve_reg_opmask(int idx) {
+        if (idx < 0 || idx > 7)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (in_use_opmask.count(idx))   XBYAK_THROW(ERR_RM_OPMASK_IN_USE)
+        if (reserved_opmask.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+        if (!free_opmask_regs.erase(idx) && !preserved_opmask.erase(idx))
+            XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
+        reserved_opmask.insert(idx);
+    }
+
+    void unreserve_reg_opmask(int idx) {
+        if (idx < 0 || idx > 7)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (!reserved_opmask.erase(idx))
+            XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
+        // All opmask registers are volatile; return to free pool.
+        free_opmask_regs.insert(idx);
+    }
+
+    void reserve_reg_tile(int idx) {
+        if (idx < 0 || idx > 7)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (in_use_tile.count(idx))    XBYAK_THROW(ERR_RM_TILE_IN_USE)
+        if (reserved_tile.count(idx))  XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+        if (!free_tile_regs.erase(idx))
+            XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
+        reserved_tile.insert(idx);
+    }
+
+    void unreserve_reg_tile(int idx) {
+        if (idx < 0 || idx > 7)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        if (!reserved_tile.erase(idx))
+            XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
+        // All tile registers are volatile; return to free pool.
+        free_tile_regs.insert(idx);
     }
 
     // helper method - checks reg in use before scoping
@@ -689,6 +836,12 @@ private:
     std::set<int> in_use_opmask;
     std::set<int> free_opmask_regs = base_free_opmask();
     std::set<int> preserved_opmask = base_preserved_opmask();
+
+    // Registers blocked from allocation via mark_unavailable().
+    std::set<int> reserved_gp;
+    std::set<int> reserved_vec;
+    std::set<int> reserved_opmask;
+    std::set<int> reserved_tile;
 
     // APX feature support
     bool has_apx_ = false;

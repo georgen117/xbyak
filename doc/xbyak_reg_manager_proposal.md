@@ -40,8 +40,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 
 - [x] 1. Bug Fix: XCR0 Operator Precedence
 - [ ] 2. Performance: Replace `std::set` with Bitmask Pools
-- [ ] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
-- [ ] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
+- [x] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
+- [x] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
 - [ ] 5. Pinned Registers: `pin()` and `alloc_pinned()`
 - [ ] 6. Code Emission Coupling: `set_code_generator()`
 - [ ] 7. Register Spill / Restore: `spill()` and `restore()`
@@ -1947,7 +1947,7 @@ public:
 
 1. §1 (bug fix — zero risk, immediate value)
 2. §11 (error handling — aligns XBYAK_THROW usage; needed by everything that follows)
-3. §3 (pool parity — trivial, fills obvious gap)
+3. §3 (pool parity — trivial, fills obvious gap) *(REJECTED — see §3)*
 4. §4 (mark_unavailable — no code gen dependency)
 5. §5 (pinned registers — no code gen dependency)
 6. §10 (`assert_all_free()` only — `assert_spill_stack_empty()` companion must wait until step 9 when `spill_stack_gp_` exists)

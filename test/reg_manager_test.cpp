@@ -1286,3 +1286,277 @@ CYBOZU_TEST_AUTO(amxVolatileTiles)
     rm.free(t2);
     CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_tiles().empty());
 }
+
+// =============================================================================
+// Test – mark_unavailable / mark_available / is_reserved: GP registers
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailableGP)
+{
+    RegPoolManager rm;
+
+    // Pick a known volatile GP register (rdi = 7 on SysV, or r8 = 8 on both ABIs).
+    // r8 (idx=8) is caller-saved on both Windows and Linux, so it starts in free_gp_regs.
+    const int idx = 8;  // r8
+
+    // Initially not reserved and not in-use.
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(idx));
+    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(idx));
+
+    // After mark_unavailable, the register should be reserved and not allocatable.
+    rm.mark_unavailable<Reg64>(idx);
+    CYBOZU_TEST_ASSERT(rm.is_reserved<Reg64>(idx));
+    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(idx));
+
+    // Reserved registers must not appear in the free GP pool.
+    {
+        auto free_gps = rm.get_free_gps();
+        CYBOZU_TEST_ASSERT(std::find(free_gps.begin(), free_gps.end(), idx)
+                           == free_gps.end());
+    }
+
+    // Attempting to alloc the reserved register by index must throw.
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(idx), Xbyak::Error);
+
+    // The next free alloc() must skip the reserved register.
+    auto alloc1 = rm.alloc<Reg64>();
+    CYBOZU_TEST_ASSERT(alloc1.getIdx() != idx);
+    rm.free(alloc1);
+
+    // Double-reserving must throw.
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(idx), Xbyak::Error);
+
+    // mark_available releases it back to its pool.
+    rm.mark_available<Reg64>(idx);
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(idx));
+    {
+        auto free_gps = rm.get_free_gps();
+        CYBOZU_TEST_ASSERT(std::find(free_gps.begin(), free_gps.end(), idx)
+                           != free_gps.end());
+    }
+
+    // Register is now allocatable again.
+    auto r = rm.alloc<Reg64>(idx);
+    CYBOZU_TEST_EQUAL(r.getIdx(), idx);
+    rm.free(r);
+
+    // mark_available on a non-reserved register must throw.
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Reg64>(idx), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – mark_unavailable on a preserved (callee-saved) GP register
+//            and verify it returns to the preserved pool on mark_available
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailablePreservedGP)
+{
+    RegPoolManager rm;
+
+    // rbx = 3 is callee-saved on both ABIs.
+    const int idx = 3;  // rbx
+
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(idx));
+    {
+        const auto pres = rm.get_preserved_gps();
+        CYBOZU_TEST_ASSERT(std::find(pres.begin(), pres.end(), idx) != pres.end());
+    }
+
+    rm.mark_unavailable<Reg64>(idx);
+    CYBOZU_TEST_ASSERT(rm.is_reserved<Reg64>(idx));
+
+    // Must have left the preserved pool too.
+    {
+        const auto pres = rm.get_preserved_gps();
+        CYBOZU_TEST_ASSERT(std::find(pres.begin(), pres.end(), idx) == pres.end());
+    }
+
+    rm.mark_available<Reg64>(idx);
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(idx));
+
+    // Must have returned to the preserved pool (not free).
+    {
+        const auto pres = rm.get_preserved_gps();
+        const auto free = rm.get_free_gps();
+        CYBOZU_TEST_ASSERT(std::find(pres.begin(), pres.end(), idx) != pres.end());
+        CYBOZU_TEST_ASSERT(std::find(free.begin(), free.end(), idx) == free.end());
+    }
+}
+
+// =============================================================================
+// Test – mark_unavailable / mark_available: Vec and Opmask families
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
+{
+    RegPoolManager rm;
+
+    // ---- Vec ----
+    // xmm0 (idx=0) is caller-saved on both ABIs.
+    const int vec_idx = 0;
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Xmm>(vec_idx));
+
+    rm.mark_unavailable<Xmm>(vec_idx);
+    CYBOZU_TEST_ASSERT(rm.is_reserved<Xmm>(vec_idx));
+    CYBOZU_TEST_ASSERT(!rm.vec_idx_in_use(vec_idx));
+
+    // The reserved vector register must not appear in the free pool.
+    {
+        const auto free_vecs = rm.get_free_vecs();
+        CYBOZU_TEST_ASSERT(std::find(free_vecs.begin(), free_vecs.end(), vec_idx)
+                           == free_vecs.end());
+    }
+
+    // alloc by index must throw for reserved vec.
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Xmm>(vec_idx), Xbyak::Error);
+
+    rm.mark_available<Xmm>(vec_idx);
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Xmm>(vec_idx));
+    {
+        const auto free_vecs = rm.get_free_vecs();
+        CYBOZU_TEST_ASSERT(std::find(free_vecs.begin(), free_vecs.end(), vec_idx)
+                           != free_vecs.end());
+    }
+
+    // ---- Opmask ----
+    // k1 (idx=1) is always in the free opmask pool.
+    const int opmask_idx = 1;
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
+
+    rm.mark_unavailable<Opmask>(opmask_idx);
+    CYBOZU_TEST_ASSERT(rm.is_reserved<Opmask>(opmask_idx));
+    CYBOZU_TEST_ASSERT(!rm.opmask_idx_in_use(opmask_idx));
+
+    // alloc by index must throw for reserved opmask.
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Opmask>(opmask_idx), Xbyak::Error);
+
+    rm.mark_available<Opmask>(opmask_idx);
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
+    {
+        const auto free_masks = rm.get_free_opmasks();
+        CYBOZU_TEST_ASSERT(std::find(free_masks.begin(), free_masks.end(), opmask_idx)
+                           != free_masks.end());
+    }
+}
+
+// =============================================================================
+// Test – mark_unavailable / mark_available / is_reserved for tile registers
+// (only exercised when has_amx() is true; skipped silently otherwise)
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailableTile)
+{
+    RegPoolManager rm;
+    if (!rm.has_amx()) return; // tile pool is empty without AMX hardware
+
+    const int tile_idx = 0; // tmm0 is caller-saved
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Tmm>(tile_idx));
+
+    rm.mark_unavailable<Tmm>(tile_idx);
+    CYBOZU_TEST_ASSERT(rm.is_reserved<Tmm>(tile_idx));
+    CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(tile_idx));
+
+    // Reserved tile must not appear in the free tile pool.
+    {
+        const auto free_tiles = rm.get_free_tiles();
+        CYBOZU_TEST_ASSERT(std::find(free_tiles.begin(), free_tiles.end(), tile_idx)
+                           == free_tiles.end());
+    }
+
+    // Allocating a reserved tile by index must throw.
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(tile_idx), Xbyak::Error);
+
+    // Double-reserve must throw.
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::Error);
+
+    rm.mark_available<Tmm>(tile_idx);
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Tmm>(tile_idx));
+
+    // After release the register must be back in the free pool.
+    {
+        const auto free_tiles = rm.get_free_tiles();
+        CYBOZU_TEST_ASSERT(std::find(free_tiles.begin(), free_tiles.end(), tile_idx)
+                           != free_tiles.end());
+    }
+
+    // Alloc must succeed after mark_available.
+    auto t = rm.alloc<Tmm>(tile_idx);
+    CYBOZU_TEST_EQUAL(t.getIdx(), tile_idx);
+    CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tile_idx));
+
+    // Reserving an in-use tile must throw.
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::Error);
+
+    rm.free(t);
+}
+
+// =============================================================================
+// Test – named-register overloads (mark_unavailable(reg) / mark_available(reg))
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailableNamedReg)
+{
+    struct NamedTest : Xbyak::CodeGenerator {
+        void run() {
+            RegPoolManager rm;
+
+            // mark_unavailable(rdi) — named overload
+            rm.mark_unavailable(rdi);
+            CYBOZU_TEST_ASSERT(rm.is_reserved(rdi));
+            CYBOZU_TEST_EXCEPTION(rm.alloc(rdi), Xbyak::Error);
+
+            rm.mark_available(rdi);
+            CYBOZU_TEST_ASSERT(!rm.is_reserved(rdi));
+
+            // After release, alloc by name must succeed.
+            auto r = rm.alloc(rdi);
+            CYBOZU_TEST_EQUAL(r.getIdx(), rdi.getIdx());
+            rm.free(r);
+
+            // Vec named overload
+            rm.mark_unavailable(xmm1);
+            CYBOZU_TEST_ASSERT(rm.is_reserved(xmm1));
+            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm1), Xbyak::Error);
+            rm.mark_available(xmm1);
+            CYBOZU_TEST_ASSERT(!rm.is_reserved(xmm1));
+
+            // Opmask named overload
+            rm.mark_unavailable(k2);
+            CYBOZU_TEST_ASSERT(rm.is_reserved(k2));
+            CYBOZU_TEST_EXCEPTION(rm.alloc(k2), Xbyak::Error);
+            rm.mark_available(k2);
+            CYBOZU_TEST_ASSERT(!rm.is_reserved(k2));
+        }
+    };
+    NamedTest t;
+    t.run();
+}
+
+// =============================================================================
+// Test – reserving an already-in-use register must throw
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailableInUseThrows)
+{
+    RegPoolManager rm;
+
+    auto r = rm.alloc<Reg64>(9);  // r9 is caller-saved
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(9));
+
+    // Trying to reserve an already-allocated register must throw.
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(9), Xbyak::Error);
+
+    rm.free(r);
+}
+
+// =============================================================================
+// Test – out-of-range index handling
+// =============================================================================
+CYBOZU_TEST_AUTO(markUnavailableOutOfRange)
+{
+    RegPoolManager rm;
+
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(200), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Xmm>(200), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Opmask>(8), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(8),    Xbyak::Error);
+
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Reg64>(200), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Xmm>(200), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Opmask>(8), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Tmm>(8),    Xbyak::Error);
+}
