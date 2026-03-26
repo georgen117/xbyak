@@ -1677,3 +1677,92 @@ CYBOZU_TEST_AUTO(allFreeTile)
     CYBOZU_TEST_ASSERT(rm.all_free());
     rm.assert_all_free();
 }
+
+// =============================================================================
+// Test – has_code_generator() is false when constructed without a pointer
+// =============================================================================
+CYBOZU_TEST_AUTO(setCodeGeneratorDefault)
+{
+    RegPoolManager rm;
+    CYBOZU_TEST_ASSERT(!rm.has_code_generator());
+
+    // Explicitly passing NULL behaves the same as the default constructor.
+    RegPoolManager rm2(NULL);
+    CYBOZU_TEST_ASSERT(!rm2.has_code_generator());
+}
+
+// =============================================================================
+// Test – set_code_generator() attaches and detaches a CodeGenerator
+// =============================================================================
+CYBOZU_TEST_AUTO(setCodeGeneratorLateInject)
+{
+    Xbyak::CodeGenerator cg(4096);
+    RegPoolManager rm;
+
+    CYBOZU_TEST_ASSERT(!rm.has_code_generator());
+
+    rm.set_code_generator(&cg);
+    CYBOZU_TEST_ASSERT(rm.has_code_generator());
+
+    // Passing NULL detaches the generator.
+    rm.set_code_generator(NULL);
+    CYBOZU_TEST_ASSERT(!rm.has_code_generator());
+
+    // Re-attaching after detach works.
+    rm.set_code_generator(&cg);
+    CYBOZU_TEST_ASSERT(rm.has_code_generator());
+}
+
+// =============================================================================
+// Test – composition pattern: RegPoolManager as a member initialised with 'this'
+// =============================================================================
+CYBOZU_TEST_AUTO(codeGeneratorComposition)
+{
+    // The recommended pattern for JIT kernels that do not want to inherit from
+    // RegPoolManager directly.  The CodeGenerator base is fully constructed before
+    // rm_(this) runs, so the pointer is valid when the manager stores it.
+    struct MyKernel : public Xbyak::CodeGenerator {
+        Xbyak::RegPoolManager rm_;
+        MyKernel() : Xbyak::CodeGenerator(4096), rm_(this) {}
+    };
+
+    MyKernel k;
+    CYBOZU_TEST_ASSERT(k.rm_.has_code_generator());
+
+    // Register allocation still works normally after coupling.
+    auto r1 = k.rm_.alloc<Reg64>();
+    auto r2 = k.rm_.alloc<Reg64>();
+    CYBOZU_TEST_EQUAL((int)k.rm_.get_in_use_gps().size(), 2);
+    k.rm_.free(r1);
+    k.rm_.free(r2);
+    CYBOZU_TEST_ASSERT(k.rm_.all_free());
+}
+
+// =============================================================================
+// Test – inheritance pattern: kernel inherits both CodeGenerator and RegPoolManager
+// =============================================================================
+CYBOZU_TEST_AUTO(codeGeneratorInheritance)
+{
+    // CodeGenerator must appear first in the base-class list so it is fully
+    // constructed before RegPoolManager(this) runs.
+    struct MyKernel : public Xbyak::CodeGenerator, public Xbyak::RegPoolManager {
+        MyKernel()
+            : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(this) {}
+
+        void build() {
+            // Register-manager methods are called without a prefix because they
+            // are brought into scope by direct inheritance.
+            CYBOZU_TEST_ASSERT(has_code_generator());
+            auto r1 = alloc<Reg64>();
+            auto r2 = alloc<Reg64>();
+            CYBOZU_TEST_EQUAL((int)get_in_use_gps().size(), 2);
+            RegPoolManager::free(r1);
+            RegPoolManager::free(r2);
+            ret();
+        }
+    };
+
+    MyKernel k;
+    k.build();
+    CYBOZU_TEST_ASSERT(k.all_free());
+}

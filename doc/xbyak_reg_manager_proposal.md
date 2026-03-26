@@ -43,7 +43,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
 - [x] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
 - [x] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
-- [ ] 6. Code Emission Coupling: `set_code_generator()`
+- [x] 6. Code Emission Coupling: `set_code_generator()`
 - [ ] 7. Register Spill / Restore: `spill()` and `restore()`
 - [ ] 8. Stack Frame Management: `StackFrame` RAII Helper
 - [ ] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`

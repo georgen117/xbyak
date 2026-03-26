@@ -79,8 +79,29 @@ struct reg_family<Tmm> {
 
 class RegPoolManager {
 public:
-    // Constructor - detects APX and AVX-512 support and sets up register pools accordingly
-    RegPoolManager() {
+    // Constructs the manager, detects APX, AVX-512, and AMX support, and populates
+    // the register pools accordingly.
+    //
+    // Pass a pointer to the CodeGenerator into which instructions will be emitted by
+    // spill(), restore(), make_stack_frame(), emit_prologue(), and emit_epilogue().
+    // When only register tracking is required (alloc / free / mark_unavailable etc.),
+    // the default NULL is sufficient and the manager operates with no emission overhead.
+    //
+    // Composition pattern (RegPoolManager as a member):
+    //   class MyKernel : public Xbyak::CodeGenerator {
+    //       Xbyak::RegPoolManager rm_;
+    //   public:
+    //       MyKernel() : Xbyak::CodeGenerator(4096), rm_(this) {}
+    //   };
+    //
+    // Direct-inheritance pattern (RegPoolManager IS-A CodeGenerator):
+    //   class MyKernel : public Xbyak::CodeGenerator,
+    //                    public Xbyak::RegPoolManager {
+    //   public:
+    //       MyKernel() : Xbyak::CodeGenerator(4096),
+    //                    Xbyak::RegPoolManager(this) {}
+    //   };
+    explicit RegPoolManager(Xbyak::CodeGenerator *cg = NULL) : cg_(cg) {
         Xbyak::util::Cpu cpu;
         uint64_t xcr0 = 0;
         if (cpu.has(Xbyak::util::Cpu::tOSXSAVE)) {
@@ -484,7 +505,7 @@ public:
     class Scoped {
     public:
         explicit Scoped(RegPoolManager &rm, Reg r)
-            // pointer to allocator, allocate scoped reg at construction & track, unowned = nullptr
+            // pointer to allocator, allocate scoped reg at construction & track, unowned = NULL
             : rm_(&rm), reg_(r) {
             validate_scoped_reg(rm_, reg_);
         }
@@ -501,7 +522,7 @@ public:
 
         // move constructor - used when scoped regs initialised from rvalue (incl. std::move)
         Scoped(Scoped &&other) noexcept : rm_(other.rm_), reg_(other.reg_) {
-            other.rm_ = nullptr; // set previous owner to no longer own
+            other.rm_ = NULL; // set previous owner to no longer own
         }
 
         // expose underlying register for implicit use in JIT helpers
@@ -510,7 +531,7 @@ public:
 
     private:
         RegPoolManager *rm_
-                = nullptr; // pointer to allocator, initialised as nullptr
+                = NULL; // pointer to allocator, initialised as NULL
         Reg reg_ {};
     };
 
@@ -531,6 +552,17 @@ public:
     // helper methods to query AMX support
     bool has_amx() const { return has_amx_; }
     int max_tile_registers() const { return has_amx_ ? 8 : 0; }
+
+    // Associates a CodeGenerator with this manager so that features that emit
+    // machine instructions (e.g. spill/restore) have access to the code stream.
+    // Pass NULL to detach any previously associated generator.
+    // The caller is responsible for ensuring the pointer remains valid for the
+    // lifetime of this manager.
+    void set_code_generator(Xbyak::CodeGenerator *cg) { cg_ = cg; }
+
+    // Returns true if a CodeGenerator has been associated with this manager,
+    // either at construction or via set_code_generator().
+    bool has_code_generator() const { return cg_ != NULL; }
 
     // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
     // Stack pointer: rsp
@@ -908,6 +940,10 @@ private:
 
     // AMX feature support
     bool has_amx_ = false;
+
+    // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
+    // Null when the manager is used for tracking only.
+    Xbyak::CodeGenerator *cg_;
 };
 
 } // namespace Xbyak
