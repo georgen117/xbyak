@@ -1595,3 +1595,85 @@ CYBOZU_TEST_AUTO(markUnavailableOutOfRange)
     CYBOZU_TEST_EXCEPTION(rm.mark_available<Opmask>(8), Xbyak::Error);
     CYBOZU_TEST_EXCEPTION(rm.mark_available<Tmm>(8),    Xbyak::Error);
 }
+
+// =============================================================================
+// Test – all_free() and assert_all_free() with GP registers
+// =============================================================================
+CYBOZU_TEST_AUTO(allFreeGP)
+{
+    RegPoolManager rm;
+
+    // Fresh manager: nothing allocated.
+    CYBOZU_TEST_ASSERT(rm.all_free());
+    rm.assert_all_free();
+
+    // Allocated register: not all free.
+    auto r = rm.alloc<Reg64>();
+    CYBOZU_TEST_ASSERT(!rm.all_free());
+
+    // After release: all free again.
+    rm.free(r);
+    CYBOZU_TEST_ASSERT(rm.all_free());
+    rm.assert_all_free();
+}
+
+// =============================================================================
+// Test – all_free() and assert_all_free() across GP, Vec, and Opmask families
+// =============================================================================
+CYBOZU_TEST_AUTO(allFreeMultiFamily)
+{
+    RegPoolManager rm;
+
+    auto r0 = rm.alloc<Reg64>();
+    auto r1 = rm.alloc<Reg64>();
+    auto v0 = rm.alloc<Xmm>();
+    auto v1 = rm.alloc<Ymm>();
+    auto k0 = rm.alloc<Opmask>();
+
+    CYBOZU_TEST_ASSERT(!rm.all_free());
+
+    rm.free(r0);
+    CYBOZU_TEST_ASSERT(!rm.all_free()); // four still in use
+
+    rm.free(r1);
+    rm.free(v0);
+    rm.free(v1);
+    rm.free(k0);
+
+    CYBOZU_TEST_ASSERT(rm.all_free());
+    rm.assert_all_free();
+}
+
+// =============================================================================
+// Test – reserved registers (mark_unavailable) are invisible to all_free()
+// =============================================================================
+CYBOZU_TEST_AUTO(allFreeWithReserved)
+{
+    RegPoolManager rm;
+
+    // Reserved registers are not in-use, so all_free() must still return true.
+    rm.mark_unavailable<Reg64>(8);
+    rm.mark_unavailable<Xmm>(0);
+    CYBOZU_TEST_ASSERT(rm.all_free());
+    rm.assert_all_free();
+
+    rm.mark_available<Reg64>(8);
+    rm.mark_available<Xmm>(0);
+    CYBOZU_TEST_ASSERT(rm.all_free());
+}
+
+// =============================================================================
+// Test – all_free() with tile registers when AMX is available
+// =============================================================================
+CYBOZU_TEST_AUTO(allFreeTile)
+{
+    RegPoolManager rm;
+    if (!rm.has_amx()) return;
+
+    auto t = rm.alloc<Tmm>(0);
+    CYBOZU_TEST_ASSERT(!rm.all_free());
+
+    rm.free(t);
+    CYBOZU_TEST_ASSERT(rm.all_free());
+    rm.assert_all_free();
+}

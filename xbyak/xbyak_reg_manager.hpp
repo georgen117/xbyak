@@ -330,6 +330,54 @@ public:
         return make_index_vector(in_use_tile);
     }
 
+    // Returns true if every register allocated with alloc() has been returned with free().
+    // Returns false if any register is still currently allocated.
+    //
+    // Use this to inspect allocation state programmatically. For a hard stop in debug
+    // builds, use assert_all_free() instead.
+    bool all_free() const {
+        return in_use_gp.empty() && in_use_vec.empty()
+            && in_use_opmask.empty() && in_use_tile.empty();
+    }
+
+    // Checks that every register allocated with alloc() has been returned with free().
+    //
+    // Call this at the end of JIT kernel construction to confirm there are no
+    // mismatched alloc/free pairs. A forgotten free() does not affect the correctness
+    // of the emitted machine code, but leaves the manager in an unexpected state that
+    // may cause incorrect behaviour in a subsequent alloc() on the same instance.
+    //
+    // In debug builds (NDEBUG not defined): triggers an assertion if any register is
+    // still allocated. A message listing the leaked register indices by family is
+    // printed to stderr before the assertion fires.
+    //
+    // In release builds (NDEBUG defined): compiles to nothing — no check, no overhead.
+    void assert_all_free() const {
+#ifndef NDEBUG
+        if (!in_use_gp.empty()) {
+            fprintf(stderr, "assert_all_free: GP registers still allocated:");
+            for (int idx : in_use_gp) fprintf(stderr, " %d", idx);
+            fprintf(stderr, "\n");
+        }
+        if (!in_use_vec.empty()) {
+            fprintf(stderr, "assert_all_free: Vec registers still allocated:");
+            for (int idx : in_use_vec) fprintf(stderr, " %d", idx);
+            fprintf(stderr, "\n");
+        }
+        if (!in_use_opmask.empty()) {
+            fprintf(stderr, "assert_all_free: Opmask registers still allocated:");
+            for (int idx : in_use_opmask) fprintf(stderr, " %d", idx);
+            fprintf(stderr, "\n");
+        }
+        if (!in_use_tile.empty()) {
+            fprintf(stderr, "assert_all_free: Tile registers still allocated:");
+            for (int idx : in_use_tile) fprintf(stderr, " %d", idx);
+            fprintf(stderr, "\n");
+        }
+        assert(all_free() && "assert_all_free: registers are still allocated — missing free() call(s)");
+#endif
+    }
+
     // Prevents a register from being returned by alloc() without marking it as in-use.
     // Useful for protecting registers that must stay off-limits during code generation,
     // such as ABI argument registers or registers dedicated to a runtime helper.

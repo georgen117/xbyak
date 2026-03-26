@@ -42,12 +42,12 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [ ] 2. Performance: Replace `std::set` with Bitmask Pools
 - [x] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
 - [x] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
-- [ ] 5. Pinned Registers: `pin()` and `alloc_pinned()`
+- [x] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
 - [ ] 6. Code Emission Coupling: `set_code_generator()`
 - [ ] 7. Register Spill / Restore: `spill()` and `restore()`
 - [ ] 8. Stack Frame Management: `StackFrame` RAII Helper
 - [ ] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
-- [ ] 10. End-of-JIT Validation: `assert_all_free()`
+- [x] 10. End-of-JIT Validation: `assert_all_free()`
 - [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
 - [x] 12. Named-Register `alloc()` Overload
 - [ ] 13. Remove `used_*` Sets
@@ -330,6 +330,22 @@ rm.free(scratch);
 ---
 
 ## 5. Pinned Registers: `pin()` and `alloc_pinned()`
+
+> **REJECTED — Do not implement.**
+>
+> The sole purpose of `pin()` is to suppress false positives from `assert_all_free()`
+> for registers that are intentionally kept in-use for the lifetime of a kernel. However
+> `assert_all_free()` is a debug-only developer aid that compiles to nothing in release
+> builds. Adding an entire new API surface (`pin`, `alloc_pinned`, `unpin`, `is_pinned`,
+> three new `pinned_*` sets, and modifications to `assert_all_free`) to silence a
+> debug-only assertion is not justified when the same result is trivially achieved by
+> calling `free()` on long-lived registers before invoking `assert_all_free()`. The
+> emitted JIT code is unaffected either way.
+>
+> Long-lived registers that truly outlive any scope are simply left allocated until
+> kernel emission ends; `assert_all_free()` should be called after those registers have
+> been released, or not called at all in kernels that intentionally keep registers live.
+> This section is kept for reference only.
 
 ### Motivation
 
@@ -2142,7 +2158,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 2. §11 (error handling — aligns XBYAK_THROW usage; needed by everything that follows)
 3. §3 (pool parity — trivial, fills obvious gap) *(REJECTED — see §3)*
 4. §4 (mark_unavailable — no code gen dependency)
-5. §5 (pinned registers — no code gen dependency)
+5. §5 (pinned registers — no code gen dependency) *(REJECTED — see §5)*
 6. §10 (`assert_all_free()` only — `assert_spill_stack_empty()` companion must wait until step 9 when `spill_stack_gp_` exists)
 7. §6 (code generator coupling — prerequisite for §7, §8, §9)
 8. §9 (prologue/epilogue tracking — can be done before spill; establishes `managed_push_count_`)
