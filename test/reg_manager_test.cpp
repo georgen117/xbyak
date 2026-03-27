@@ -2294,3 +2294,179 @@ CYBOZU_TEST_AUTO(spillEmitCallAlignment)
         CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)33);
     }
 }
+
+// =============================================================================
+// Test – make_stack_frame() throws when no CodeGenerator is set
+// =============================================================================
+CYBOZU_TEST_AUTO(stackFrameThrowsNoCG)
+{
+    RegPoolManager rm; // no CG attached
+    auto r = rm.alloc<Reg64>();
+    CYBOZU_TEST_EXCEPTION(rm.make_stack_frame(16), Xbyak::Error);
+    rm.free(r);
+}
+
+// =============================================================================
+// Test – StackFrame: sub rsp / add rsp RAII around GP spill-reload pattern
+// =============================================================================
+CYBOZU_TEST_AUTO(stackFrameGPRoundTrip)
+{
+    // Store two 64-bit constants in a 16-byte stack frame, recover them
+    // with read_from_stack, and verify the final sum.
+    struct FrameKernel : public CodeGenerator, public RegPoolManager {
+        FrameKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            // Frame layout: [rsp+0] = a (8 bytes), [rsp+8] = b (8 bytes)
+            constexpr ptrdiff_t off_a = 0;
+            constexpr ptrdiff_t off_b = 8;
+            constexpr ptrdiff_t frame_sz = 16;
+
+            {
+                auto frame = make_stack_frame(frame_sz); // emits: sub rsp, 16
+
+                // Load constants into registers, park them on the frame.
+                auto ra = alloc<Reg64>();
+                mov(ra, (uint64_t)77);
+                frame.put_on_stack(ra, off_a); // emits: mov [rsp+0], ra; frees ra
+
+                auto rb = alloc<Reg64>();
+                mov(rb, (uint64_t)33);
+                frame.put_on_stack(rb, off_b); // emits: mov [rsp+8], rb; frees rb
+
+                // Recover, sum, return.
+                auto ra2 = frame.read_from_stack<Reg64>(off_a); // emits: mov ra2, [rsp+0]
+                auto rb2 = frame.read_from_stack<Reg64>(off_b); // emits: mov rb2, [rsp+8]
+                mov(rax, ra2);
+                add(rax, rb2);
+                free(ra2);
+                free(rb2);
+
+            } // frame dtor emits: add rsp, 16
+            ret();
+        }
+    };
+
+    FrameKernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)110); // 77 + 33
+}
+
+// =============================================================================
+// Test – StackFrame: put_on_stack (const overload) does not free the register
+// =============================================================================
+CYBOZU_TEST_AUTO(stackFrameConstOverload)
+{
+    // put_on_stack(const RegT &, offset) stores without freeing; the register
+    // must remain in the in-use set.
+    struct ConstKernel : public CodeGenerator, public RegPoolManager {
+        ConstKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            {
+                auto frame = make_stack_frame(16);
+
+                auto r = alloc<Reg64>();
+                mov(r, (uint64_t)55);
+
+                // Pass as const reference → store-only, no free.
+                const Reg64 &cr = r;
+                frame.put_on_stack(cr, 0);
+
+                // r must still be in use; overwrite it to prove we can re-use it.
+                mov(r, (uint64_t)99);
+                frame.put_on_stack(cr, 8); // store updated value
+
+                // Recover first-stored value (55) and return it.
+                auto r2 = frame.read_from_stack<Reg64>(0);
+                mov(rax, r2);
+                free(r2);
+                free(r);
+
+            } // frame dtor emits: add rsp, 16
+            ret();
+        }
+    };
+
+    ConstKernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)55);
+}
+
+// =============================================================================
+// Test – StackFrame: offset out-of-bounds throws
+// =============================================================================
+CYBOZU_TEST_AUTO(stackFrameOffsetOOB)
+{
+    struct OOBKernel : public CodeGenerator, public RegPoolManager {
+        OOBKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+
+    OOBKernel k;
+    {
+        auto frame = k.make_stack_frame(16);
+        auto r = k.alloc<Reg64>();
+
+        // offset == size: out of bounds
+        CYBOZU_TEST_EXCEPTION(
+            frame.put_on_stack(static_cast<const Reg64 &>(r), 16),
+            Xbyak::Error);
+
+        // negative offset: out of bounds
+        CYBOZU_TEST_EXCEPTION(
+            frame.put_on_stack(static_cast<const Reg64 &>(r), -1),
+            Xbyak::Error);
+
+        k.free(r);
+        // frame dtor emits add rsp, 16
+    }
+}
+
+// =============================================================================
+// Test – StackFrame: managed_push_count_ updated so emit_call stays aligned
+// =============================================================================
+CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
+{
+    // A 16-byte frame (2 extra 8-byte slots) raises managed_push_count_ by 2.
+    // Combined with 0 prologue pushes, total = 2 (even) → emit_call pads on SysV.
+    // A misaligned stack would fault inside call_function_that_clobbers_registers.
+    {
+        struct Kernel16 : public CodeGenerator, public RegPoolManager {
+            Kernel16() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                {
+                    auto frame = make_stack_frame(16); // managed_push_count_ += 2
+                    emit_call(&call_function_that_clobbers_registers);
+                    // rax = 210 on return
+                } // frame dtor: add rsp, 16; managed_push_count_ -= 2
+                ret();
+            }
+        };
+
+        Kernel16 k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
+    }
+
+    // An 8-byte frame (1 slot) raises managed_push_count_ by 1 (odd) →
+    // no alignment pad; still must return 210 without faulting.
+    {
+        struct Kernel8 : public CodeGenerator, public RegPoolManager {
+            Kernel8() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                {
+                    auto frame = make_stack_frame(8); // managed_push_count_ += 1
+                    emit_call(&call_function_that_clobbers_registers);
+                    // rax = 210 on return
+                } // frame dtor: add rsp, 8; managed_push_count_ -= 1
+                ret();
+            }
+        };
+
+        Kernel8 k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
+    }
+}

@@ -102,7 +102,11 @@ public:
     //                    Xbyak::RegPoolManager(this) {}
     //   };
     explicit RegPoolManager(Xbyak::CodeGenerator *cg = NULL)
-            : prologue_gp_cursor_(0), prologue_vec_cursor_(0), managed_push_count_(0), cg_(cg) {
+            : prologue_gp_cursor_(0),
+              prologue_vec_cursor_(0),
+              managed_push_count_(0),
+              allocated_stack_space_(0),
+              cg_(cg) {
         Xbyak::util::Cpu cpu;
         uint64_t xcr0 = 0;
         if (cpu.has(Xbyak::util::Cpu::tOSXSAVE)) {
@@ -540,6 +544,125 @@ public:
     template <class Reg>
     inline Scoped<Reg> makeScoped(Reg r) & {
         return Scoped<Reg>(*this, r);
+    }
+
+    // RAII helper owning a stack frame allocated via make_stack_frame().
+    // Construction emits: sub rsp, size
+    // Destruction emits:  add rsp, size
+    // Move-only; do not copy.  All nested frames must be destroyed in LIFO order.
+    class StackFrame {
+    public:
+        StackFrame(RegPoolManager &rm, ptrdiff_t size)
+                : rm_(&rm), size_(size) {
+            if (!rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
+            rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(size_));
+            rm_->managed_push_count_ += static_cast<size_t>(size_) / 8;
+            rm_->allocated_stack_space_ += size_;
+        }
+
+        ~StackFrame() {
+            if (!rm_ || !rm_->cg_) return;
+            rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
+            rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
+            rm_->allocated_stack_space_ -= size_;
+        }
+
+        StackFrame(const StackFrame &) = delete;
+        StackFrame &operator=(const StackFrame &) = delete;
+
+        StackFrame(StackFrame &&other) noexcept : rm_(other.rm_), size_(other.size_) {
+            other.rm_ = NULL;
+        }
+
+        // Store reg at [rsp + offset] and free it from the allocator.
+        // Use this to park a register value on the stack while reclaiming the
+        // hardware register for other uses.
+        template <class RegT>
+        void put_on_stack(RegT &reg, ptrdiff_t offset) {
+            check_offset(offset);
+            do_store(rm_->cg_, reg, offset);
+            rm_->free(reg);
+        }
+
+        // Store reg at [rsp + offset] without freeing it.
+        template <class RegT>
+        void put_on_stack(const RegT &reg, ptrdiff_t offset) {
+            check_offset(offset);
+            do_store(rm_->cg_, reg, offset);
+        }
+
+        // Allocate a register of type RegT, load [rsp + offset] into it, and
+        // return it.  Caller is responsible for freeing the returned register.
+        template <class RegT>
+        RegT read_from_stack(ptrdiff_t offset) {
+            check_offset(offset);
+            RegT reg = rm_->alloc<RegT>();
+            do_load(rm_->cg_, reg, offset);
+            return reg;
+        }
+
+        ptrdiff_t size() const { return size_; }
+
+    private:
+        RegPoolManager *rm_;
+        ptrdiff_t       size_;
+
+        void check_offset(ptrdiff_t offset) const {
+            if (offset < 0 || offset >= size_)
+                XBYAK_THROW(ERR_RM_STACK_FRAME_OFFSET_OOB)
+        }
+
+        // GP store / load — one overload per concrete register type (C++11).
+        static void do_store(Xbyak::CodeGenerator *cg, const Reg64 &r, ptrdiff_t off) {
+            cg->mov(cg->qword[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Reg32 &r, ptrdiff_t off) {
+            cg->mov(cg->dword[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Reg16 &r, ptrdiff_t off) {
+            cg->mov(cg->word[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Xmm &r, ptrdiff_t off) {
+            cg->vmovdqu(cg->ptr[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Ymm &r, ptrdiff_t off) {
+            cg->vmovdqu(cg->ptr[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Zmm &r, ptrdiff_t off) {
+            cg->vmovdqu32(cg->ptr[cg->rsp + off], r);
+        }
+
+        static void do_load(Xbyak::CodeGenerator *cg, Reg64 &r, ptrdiff_t off) {
+            cg->mov(r, cg->qword[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Reg32 &r, ptrdiff_t off) {
+            cg->mov(r, cg->dword[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Reg16 &r, ptrdiff_t off) {
+            cg->mov(r, cg->word[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Xmm &r, ptrdiff_t off) {
+            cg->vmovdqu(r, cg->ptr[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Ymm &r, ptrdiff_t off) {
+            cg->vmovdqu(r, cg->ptr[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Zmm &r, ptrdiff_t off) {
+            cg->vmovdqu32(r, cg->ptr[cg->rsp + off]);
+        }
+    };
+
+    // Allocates a stack frame of size bytes.  Emits sub rsp, size immediately
+    // and add rsp, size when the returned StackFrame is destroyed.
+    // size must be a positive multiple of 8; multiples of 16 ensure the stack
+    // remains 16-byte aligned after the allocation.
+    // The StackFrame MUST be destroyed before ret() is emitted.  Use a block
+    // scope to guarantee correct ordering:
+    //   { auto frame = make_stack_frame(N); ...; } // add rsp, N emitted here
+    //   ret();                                      // ret emitted after
+    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    StackFrame make_stack_frame(ptrdiff_t size) {
+        return StackFrame(*this, size);
     }
 
     // helper methods to query APX support
@@ -1118,6 +1241,9 @@ private:
     // since function entry (incremented by emit_prologue and spill, decremented
     // by restore).  Used by emit_call to compute 16-byte stack alignment.
     size_t managed_push_count_;
+
+    // Total bytes currently reserved by live StackFrame objects.
+    ptrdiff_t allocated_stack_space_;
 
     // LIFO stack of GP register indices currently pushed onto the hardware stack
     // by spill().  restore() pops entries from the back in reverse order.

@@ -44,7 +44,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
 - [x] 6. Code Emission Coupling: `set_code_generator()`
 - [x] 7. Register Spill / Restore: `spill()` and `restore()`
-- [ ] 8. Stack Frame Management: `StackFrame` RAII Helper
+- [x] 8. Stack Frame Management: `StackFrame` RAII Helper
 - [x] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
 - [x] 10. End-of-JIT Validation: `assert_all_free()`
 - [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
