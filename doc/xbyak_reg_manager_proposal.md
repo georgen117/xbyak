@@ -55,7 +55,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [ ] 15. ABI Configuration: Windows x64 vs SysV
 - [ ] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [ ] 17. Accept External `Xbyak::util::Cpu` Reference
-- [ ] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
+- [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
 
 ---
 

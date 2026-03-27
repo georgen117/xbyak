@@ -102,7 +102,7 @@ public:
     //                    Xbyak::RegPoolManager(this) {}
     //   };
     explicit RegPoolManager(Xbyak::CodeGenerator *cg = NULL)
-            : prologue_gp_cursor_(0), prologue_vec_cursor_(0), cg_(cg) {
+            : prologue_gp_cursor_(0), prologue_vec_cursor_(0), managed_push_count_(0), cg_(cg) {
         Xbyak::util::Cpu cpu;
         uint64_t xcr0 = 0;
         if (cpu.has(Xbyak::util::Cpu::tOSXSAVE)) {
@@ -579,9 +579,11 @@ public:
     // sequence.  Throws Xbyak::Error if no CodeGenerator was provided.
     void emit_prologue() {
         if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        const int n_new = (int)allocated_preserved_gp_.size() - prologue_gp_cursor_;
         for (int i = prologue_gp_cursor_; i < (int)allocated_preserved_gp_.size(); ++i)
             cg_->push(Reg64(allocated_preserved_gp_[i]));
         prologue_gp_cursor_ = (int)allocated_preserved_gp_.size();
+        managed_push_count_ += n_new;
 #ifdef _WIN32
         // Windows x64: xmm6-xmm15 are callee-saved and must be saved to the
         // stack with movdqu; there is no push instruction for XMM registers.
@@ -589,7 +591,7 @@ public:
         if (new_vecs > 0) {
             cg_->sub(cg_->rsp, new_vecs * 16);
             for (int i = 0; i < new_vecs; ++i)
-                cg_->movdqu(ptr[cg_->rsp + i * 16],
+                cg_->movdqu(cg_->ptr[cg_->rsp + i * 16],
                             Xmm(allocated_preserved_vec_[prologue_vec_cursor_ + i]));
             prologue_vec_cursor_ = (int)allocated_preserved_vec_.size();
         }
@@ -610,12 +612,45 @@ public:
         if (!allocated_preserved_vec_.empty()) {
             const int n = (int)allocated_preserved_vec_.size();
             for (int i = 0; i < n; ++i)
-                cg_->movdqu(Xmm(allocated_preserved_vec_[i]), ptr[cg_->rsp + i * 16]);
+                cg_->movdqu(Xmm(allocated_preserved_vec_[i]), cg_->ptr[cg_->rsp + i * 16]);
             cg_->add(cg_->rsp, n * 16);
         }
 #endif
         for (int i = (int)allocated_preserved_gp_.size() - 1; i >= 0; --i)
             cg_->pop(Reg64(allocated_preserved_gp_[i]));
+    }
+
+    // Emits an ABI-correct call to a runtime C function.
+    // Handles 16-byte stack alignment and (on Windows x64) the 32-byte shadow
+    // space requirement automatically.
+    //
+    // func_ptr     — address of the target function.
+    // extra_pushes — number of manual push instructions emitted since JIT
+    //                function entry that the manager has not tracked (e.g.
+    //                push(rbx) to stash a return value, or one push per
+    //                volatile register saved in a caller-save loop).  Default 0.
+    //
+    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    void emit_call(uint64_t func_ptr, size_t extra_pushes = 0) {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        const size_t total_pushes = managed_push_count_ + extra_pushes;
+        const bool needs_pad = (total_pushes % 2) == 0;
+#ifdef _WIN32
+        const int adj = 32 + (needs_pad ? 8 : 0);
+#else
+        const int adj = needs_pad ? 8 : 0;
+#endif
+        if (adj > 0) cg_->sub(cg_->rsp, adj);
+        cg_->mov(cg_->rax, func_ptr);
+        cg_->call(cg_->rax);
+        if (adj > 0) cg_->add(cg_->rsp, adj);
+    }
+
+    // Convenience overload: accepts a typed function pointer.
+    // The pointer is reinterpreted as a uint64_t address before emission.
+    template <typename FuncT>
+    void emit_call(FuncT *func_ptr, size_t extra_pushes = 0) {
+        emit_call(reinterpret_cast<uint64_t>(func_ptr), extra_pushes);
     }
 
     // Returns the indices of callee-saved GP registers promoted by alloc(),
@@ -1020,6 +1055,11 @@ private:
     // by previous emit_prologue() calls.
     int prologue_gp_cursor_;
     int prologue_vec_cursor_;
+
+    // Running count of push-equivalent 8-byte stack slots emitted by the manager
+    // since function entry (incremented by emit_prologue).  Used by emit_call to
+    // compute 16-byte stack alignment without requiring the caller to track pushes.
+    size_t managed_push_count_;
 
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.

@@ -499,8 +499,8 @@ CYBOZU_TEST_AUTO(registerContentsViaJIT)
 }
 
 // =============================================================================
-// Test – Function call convention: parameter passing and non-volatile
-//           register preservation across a JIT-to-JIT call.
+// Test – Function call convention: parameter passing, preserved register
+//        survival, and volatile register save/restore.
 // =============================================================================
 CYBOZU_TEST_AUTO(functionCallConvention)
 {
@@ -509,15 +509,15 @@ CYBOZU_TEST_AUTO(functionCallConvention)
         FunctionCallJit() : CodeGenerator(4096) {}
 
         // Callee: sum 4 integer parameters and return in rax.
+        // Parameter registers differ between Win64 (rcx, rdx, r8, r9) and
+        // SysV AMD64 (rdi, rsi, rdx, rcx).
         void gen_callee_function() {
 #ifdef _WIN32
-            // Windows x64: rcx, rdx, r8, r9
             mov(rax, rcx);
             add(rax, rdx);
             add(rax, r8);
             add(rax, r9);
 #else
-            // System V AMD64: rdi, rsi, rdx, rcx
             mov(rax, rdi);
             add(rax, rsi);
             add(rax, rdx);
@@ -526,9 +526,12 @@ CYBOZU_TEST_AUTO(functionCallConvention)
             ret();
         }
 
-        // Caller: store known values in preserved registers, call the callee,
-        // add the preserved-register values to the return value to demonstrate
-        // they survived the call.
+        // Caller: store known values in preserved registers, call the callee
+        // (JIT-to-JIT, no shadow space needed), add the preserved-register
+        // values to the return value to demonstrate they survived the call.
+        //
+        // Win64 preserves rbx, rdi, rsi (3 registers → result = 10+100+200+300).
+        // SysV AMD64 preserves rbx, r12 only (rdi/rsi are volatile → result = 10+100+200).
         void gen_caller_with_preserved_regs(uint64_t callee_addr) {
 #ifdef _WIN32
             push(rbx);  push(rsi);  push(rdi);
@@ -547,28 +550,10 @@ CYBOZU_TEST_AUTO(functionCallConvention)
 #endif
             ret();
         }
-
-        // Save volatile registers, zero them out (simulating a clobbering
-        // call), restore them, then return their sum.
-        void gen_volatile_reg_save_restore() {
-#ifdef _WIN32
-            mov(rcx, 10);  mov(rdx, 20);  mov(r8, 30);  mov(r9, 40);
-            push(rcx);  push(rdx);  push(r8);  push(r9);
-            xor_(rcx, rcx);  xor_(rdx, rdx);  xor_(r8, r8);  xor_(r9, r9);
-            pop(r9);  pop(r8);  pop(rdx);  pop(rcx);
-            mov(rax, rcx);  add(rax, rdx);  add(rax, r8);  add(rax, r9);
-#else
-            mov(rdi, 10);  mov(rsi, 20);  mov(rdx, 30);  mov(rcx, 40);
-            push(rdi);  push(rsi);  push(rdx);  push(rcx);
-            xor_(rdi, rdi);  xor_(rsi, rsi);  xor_(rdx, rdx);  xor_(rcx, rcx);
-            pop(rcx);  pop(rdx);  pop(rsi);  pop(rdi);
-            mov(rax, rdi);  add(rax, rsi);  add(rax, rdx);  add(rax, rcx);
-#endif
-            ret();
-        }
     };
 
-    // Parameter passing: (1+2+3+4) plus non-volatile register values.
+    // Scenario 1: Parameter passing — (1+2+3+4) plus non-volatile register values.
+    // Expected result differs by ABI because Win64 has more preserved registers.
     {
         FunctionCallJit callee;  callee.gen_callee_function();
         FunctionCallJit caller;
@@ -582,32 +567,54 @@ CYBOZU_TEST_AUTO(functionCallConvention)
 #endif
     }
 
-    // Volatile register save/restore: sum must survive the clobber.
+    // Scenario 2: Volatile register save/restore using manager-allocated registers.
+    // The manager allocates from the volatile pool on each ABI, so this works
+    // without naming specific ABI registers.
     {
-        FunctionCallJit jit;
-        jit.gen_volatile_reg_save_restore();
+        class VolatileSaveRestoreJit : public CodeGenerator {
+        public:
+            VolatileSaveRestoreJit() : CodeGenerator(4096) {}
+
+            void gen(RegPoolManager &rm) {
+                auto r1 = rm.alloc<Reg64>();
+                auto r2 = rm.alloc<Reg64>();
+                auto r3 = rm.alloc<Reg64>();
+                auto r4 = rm.alloc<Reg64>();
+                mov(r1, 10);  mov(r2, 20);  mov(r3, 30);  mov(r4, 40);
+                push(r1);  push(r2);  push(r3);  push(r4);
+                xor_(r1, r1);  xor_(r2, r2);  xor_(r3, r3);  xor_(r4, r4);
+                pop(r4);  pop(r3);  pop(r2);  pop(r1);
+                mov(rax, r1);  add(rax, r2);  add(rax, r3);  add(rax, r4);
+                rm.free(r1);  rm.free(r2);  rm.free(r3);  rm.free(r4);
+                ret();
+            }
+        };
+
+        RegPoolManager rm;
+        VolatileSaveRestoreJit jit;
+        jit.gen(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)(10 + 20 + 30 + 40));
     }
 
-    // Verify the register manager's preserved GP list matches the ABI.
+    // Scenario 3: Verify the register manager's preserved GP list matches the ABI.
+    // rbx(3) and r12-r15(12-15) are callee-saved on all x86-64 ABIs.
+    // Win64 additionally preserves rdi(7) and rsi(6); on SysV they are volatile.
     {
         RegPoolManager rm;
         const auto preserved = rm.get_preserved_gps();
-#ifdef _WIN32
-        // Windows: rbx(3), rdi(6), rsi(7), r12-r15(12-15)
         CYBOZU_TEST_ASSERT(
             std::find(preserved.begin(), preserved.end(), 3) != preserved.end());
+        for (int i = 12; i <= 15; ++i)
+            CYBOZU_TEST_ASSERT(
+                std::find(preserved.begin(), preserved.end(), i) != preserved.end());
+#ifdef _WIN32
+        // Win64: rdi(7) and rsi(6) are callee-saved.
         CYBOZU_TEST_ASSERT(
             std::find(preserved.begin(), preserved.end(), 6) != preserved.end());
         CYBOZU_TEST_ASSERT(
             std::find(preserved.begin(), preserved.end(), 7) != preserved.end());
 #else
-        // System V: rbx(3), r12-r15(12-15)
-        CYBOZU_TEST_ASSERT(
-            std::find(preserved.begin(), preserved.end(), 3) != preserved.end());
-        CYBOZU_TEST_ASSERT(
-            std::find(preserved.begin(), preserved.end(), 12) != preserved.end());
-        // rdi(7) and rsi(6) are volatile on System V – must NOT be preserved.
+        // SysV: rdi(7) and rsi(6) are caller-saved — must NOT appear in preserved pool.
         CYBOZU_TEST_ASSERT(
             std::find(preserved.begin(), preserved.end(), 6) == preserved.end());
         CYBOZU_TEST_ASSERT(
@@ -714,6 +721,9 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
         // real call that clobbers volatile registers, verify the sum.
         // Expected result: 100 + 200 + 300 + 400 + 210 (function return).
         void gen_caller_saves_all(RegPoolManager &rm) {
+            // Attach this code generator so emit_call can emit the platform-correct
+            // alignment adjustment and Win64 shadow space into this code stream.
+            rm.set_code_generator(this);
             // Use rbx as a temporary to hold the function return value.
             // rbx is callee-saved, so we must save/restore it ourselves.
             push(rbx);
@@ -728,31 +738,10 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             auto in_use = rm.get_in_use_gps();
             for (int idx : in_use) push(Reg64(idx));
 
-#ifdef _WIN32
-            // Win64 ABI: allocate 32-byte shadow space; also re-align the stack
-            // to 16 bytes at the call instruction.  On entry rsp%16==8 (return
-            // address pushed by caller).  After push(rbx) + in_use.size() pushes
-            // the adjustment needed is:
-            //   total_pushes_from_entry = 1 + in_use.size()
-            //   bytes_pushed = total_pushes_from_entry * 8
-            //   rsp_mod16 = (8 + bytes_pushed) % 16   (8 = initial offset)
-            //   If rsp_mod16 == 8: already aligned before call, just add 32 shadow.
-            //   If rsp_mod16 == 0: need 8-byte pad + 32 shadow = 40 bytes.
-            {
-                size_t total_pushes = 1 + in_use.size(); // rbx + in_use
-                bool needs_pad = (total_pushes % 2) == 0;
-                int adj = needs_pad ? 40 : 32;
-                sub(rsp, adj);
-#endif
-            // Call a real function that clobbers caller-saved registers.
-            mov(rax,
-                reinterpret_cast<uint64_t>(&call_function_that_clobbers_registers));
-            call(rax);
+            // emit_call handles 16-byte alignment and the Win64 shadow space on all
+            // platforms.  1 manual push(rbx) plus in_use.size() register-save pushes.
+            rm.emit_call(&call_function_that_clobbers_registers, 1 + in_use.size());
             mov(rbx, rax);  // stash the return value (210) in rbx
-#ifdef _WIN32
-                add(rsp, adj);
-            }
-#endif
 
             // Generate restore code in reverse order.
             for (auto it = in_use.rbegin(); it != in_use.rend(); ++it)
@@ -1070,6 +1059,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
         OptimalCallerJit() : CodeGenerator(8192) {}
 
         void gen(RegPoolManager &rm) {
+            rm.set_code_generator(this);
             push(rbx);  // rbx is callee-saved; we use it to stash the call result
 
             auto r1 = rm.alloc<Reg64>();
@@ -1097,25 +1087,10 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             auto volatile_regs = rm.get_in_use_volatile_gps();
             for (int idx : volatile_regs) push(Reg64(idx));
 
-#ifdef _WIN32
-            // Win64 ABI: 32-byte shadow space + 16-byte alignment.
-            // On entry rsp%16==8. After push(rbx) + volatile_regs.size() pushes:
-            //   total_pushes_from_entry = 1 + volatile_regs.size()
-            //   needs_pad if (total_pushes_from_entry % 2) == 0
-            {
-                size_t total_pushes = 1 + volatile_regs.size();
-                bool needs_pad = (total_pushes % 2) == 0;
-                int adj = needs_pad ? 40 : 32;
-                sub(rsp, adj);
-#endif
-            mov(rax, reinterpret_cast<uint64_t>(
-                         &call_function_that_clobbers_registers));
-            call(rax);
+            // emit_call handles 16-byte alignment and the Win64 shadow space on all
+            // platforms.  1 manual push(rbx) plus volatile_regs.size() save pushes.
+            rm.emit_call(&call_function_that_clobbers_registers, 1 + volatile_regs.size());
             mov(rbx, rax);  // stash return value (210)
-#ifdef _WIN32
-                add(rsp, adj);
-            }
-#endif
 
             // Restore only volatile registers (in reverse order).
             for (auto it = volatile_regs.rbegin(); it != volatile_regs.rend(); ++it)
@@ -1173,11 +1148,12 @@ CYBOZU_TEST_AUTO(vecVolatilePreserved)
     CYBOZU_TEST_EQUAL(volatile_in_use.size() + preserved_in_use.size(),
                       all_in_use.size());
 
-    // On Linux/macOS all vector registers are caller-saved: no preserved.
-#ifndef _WIN32
-    CYBOZU_TEST_ASSERT(preserved_in_use.empty());
-    CYBOZU_TEST_EQUAL(volatile_in_use.size(), all_in_use.size());
-#endif
+    // On platforms where all vector registers are volatile (e.g. SysV AMD64),
+    // the preserved in-use list must be empty.
+    if (rm.get_preserved_vecs().empty()) {
+        CYBOZU_TEST_ASSERT(preserved_in_use.empty());
+        CYBOZU_TEST_EQUAL(volatile_in_use.size(), all_in_use.size());
+    }
 
     // Every preserved index must be in the preserved pool.
     for (int idx : preserved_in_use) {
@@ -1948,4 +1924,122 @@ CYBOZU_TEST_AUTO(prologueEpilogueJIT)
     PreservedKernel k;
     k.build();
     CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)42);
+}
+
+// =============================================================================
+// Test – emit_call(): ABI-correct outgoing call (alignment / shadow space)
+// =============================================================================
+CYBOZU_TEST_AUTO(emitCall)
+{
+    // Without a CodeGenerator attached, emit_call() must throw.
+    {
+        RegPoolManager rm;
+        CYBOZU_TEST_EXCEPTION(
+            rm.emit_call(reinterpret_cast<uint64_t>(
+                &call_function_that_clobbers_registers)),
+            Xbyak::Error);
+    }
+
+    // End-to-end, odd push count: 1 manual push → no alignment pad needed on SysV
+    // (adj = 0), Win64 emits 32-byte shadow space only (adj = 32).
+    // Both configurations must return 210.
+    {
+        class EmitCallJit : public CodeGenerator {
+        public:
+            EmitCallJit() : CodeGenerator(4096) {}
+
+            // One push(rbx) before the call.
+            void gen_one_push(RegPoolManager &rm) {
+                rm.set_code_generator(this);
+                push(rbx);
+                rm.emit_call(&call_function_that_clobbers_registers,
+                             /*extra_pushes=*/1);
+                // rax = 210; rbx still holds its pushed value (callee-saved).
+                pop(rbx);
+                ret();
+            }
+
+            // Two pushes (rbx, r12) before the call: even count → alignment pad.
+            void gen_two_push(RegPoolManager &rm) {
+                rm.set_code_generator(this);
+                push(rbx);
+                push(r12);
+                rm.emit_call(&call_function_that_clobbers_registers,
+                             /*extra_pushes=*/2);
+                pop(r12);
+                pop(rbx);
+                ret();
+            }
+        };
+
+        {
+            RegPoolManager rm;
+            EmitCallJit jit;
+            jit.gen_one_push(rm);
+            CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)210);
+        }
+        {
+            RegPoolManager rm;
+            EmitCallJit jit;
+            jit.gen_two_push(rm);
+            CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)210);
+        }
+    }
+
+    // Template overload: emit_call(FuncT*, extra_pushes) must compile and run.
+    {
+        class TemplateCallJit : public CodeGenerator {
+        public:
+            TemplateCallJit() : CodeGenerator(4096) {}
+
+            void gen(RegPoolManager &rm) {
+                rm.set_code_generator(this);
+                push(rbx);
+                // Typed function pointer — deduced as int(*)() by the template.
+                rm.emit_call(&call_function_that_clobbers_registers,
+                             /*extra_pushes=*/(size_t)1);
+                pop(rbx);
+                ret();
+            }
+        };
+
+        RegPoolManager rm;
+        TemplateCallJit jit;
+        jit.gen(rm);
+        CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)210);
+    }
+
+    // emit_call() respects managed_push_count_ from emit_prologue(): when
+    // emit_prologue pushes one callee-saved GP, managed_push_count_ becomes 1
+    // (odd), so emit_call with extra_pushes=0 needs no alignment pad on SysV.
+    {
+        struct ManagedCallKernel : public CodeGenerator, public RegPoolManager {
+            ManagedCallKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                // Exhaust the volatile GP pool, promoting one preserved register.
+                std::vector<Reg64> v;
+                for (size_t i = 0, n = get_free_gps().size(); i < n; ++i)
+                    v.push_back(alloc<Reg64>());
+                Reg64 r_pres = alloc<Reg64>();  // promoted from preserved pool
+
+                // emit_prologue pushes r_pres → managed_push_count_ becomes 1.
+                emit_prologue();
+
+                // total_pushes = 1 (odd) → no alignment pad on SysV,
+                // 32-byte shadow space only on Win64.
+                emit_call(&call_function_that_clobbers_registers);
+                // rax = 210 on return.
+
+                for (auto &r : v) RegPoolManager::free(r);
+                RegPoolManager::free(r_pres);
+                emit_epilogue();
+                ret();
+            }
+        };
+
+        ManagedCallKernel k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
+    }
 }
