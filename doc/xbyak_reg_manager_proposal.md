@@ -51,9 +51,9 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 10. End-of-JIT Validation: `assert_all_free()`
 - [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
 - [x] 12. Named-Register `alloc()` Overload
-- [ ] 13. Remove `used_*` Sets
+- [x] 13. Remove `used_*` Sets
 - [x] 14. In-Use Volatile / Preserved Getters
-- [ ] 15. ABI Configuration: Windows x64 vs SysV
+- [x] 15. ABI Configuration: Windows x64 vs SysV *(REJECTED — see §15)*
 - [ ] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [ ] 17. Accept External `Xbyak::util::Cpu` Reference
 - [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
@@ -1627,6 +1627,18 @@ public:
 
 ## 15. ABI Configuration: Windows x64 vs SysV
 
+> **REJECTED — Do not implement.**
+>
+> The `#ifdef _WIN32` guards already present in the header are both correct and
+> sufficient. JIT kernels are always called by the surrounding C++ code that was
+> compiled for the same host ABI, so the ABI of the JIT target and the host
+> binary are always identical — a runtime `Abi` parameter cannot diverge from
+> the compile-time `#ifdef` in any supported use case. Replacing compile-time
+> constants with a runtime enum member adds API surface, an `abi_` data member,
+> a `populate_pools()` refactor, and five `if (abi_ == kWin64)` branches for
+> no practical gain. The `#ifdef` approach is simpler, zero-overhead, and
+> impossible to misconfigure.
+
 ### Motivation
 
 The constructor currently hardcodes the SysV x86-64 ABI register classification into
@@ -2147,9 +2159,9 @@ of `emit_call()` is the acceptance criterion for completing §18.
 | 10 | `assert_all_free()` | 2 new methods (debug-only) | None | No |
 | 11 | Align errors with `XBYAK_THROW` / `Xbyak::Error` | New `ERR_RM_*` enum values + `ConvertErrorToString` strings | None | No |
 | 12 | Named-register `alloc(reg)` overload | 1 new template overload | None | No |
-| 13 | Remove `used_*` sets | 3 methods removed (breaking) | 3 sets removed | No |
+| 13 | Remove `used_*` sets | 4 getters removed (breaking) | 4 sets removed | No |
 | 14 | In-use volatile/preserved getters | 6 new methods | 6 `const` initial masks | No |
-| 15 | ABI configuration (Windows / SysV) | Constructor parameter | `abi_` enum member | No |
+| 15 | ABI configuration (Windows / SysV) | Constructor parameter | `abi_` enum member | No | *(REJECTED)* |
 | 16 | Manager `reset()` | 1 new method | None | No |
 | 17 | External `Cpu` constructor overload | 1 new constructor overload | None | No |
 | 18 | `emit_call()` — ABI-correct outgoing calls | 1 new method (+ template overload) | `managed_push_count_` | Yes (§6) |
@@ -2171,10 +2183,10 @@ of `emit_call()` is the acceptance criterion for completing §18.
 11. §2 (bitmask optimisation — internal only, do last when API is stable)
 12. §12 (named-register alloc — pure convenience, no dependencies, add anytime)
 13. §13 (remove `used_*` — breaking removal, do after §9 is in place so callers have a replacement)
-14. §15 (ABI configuration — must precede §14; `populate_pools(abi)` determines which registers are volatile vs preserved, so §14's `const` initial masks must be captured after this is in place)
-15. §17 (external `Cpu` overload — alongside §15; both converge on the same `init_from_cpu()` helper)
-16. §14 (in-use volatile/preserved getters — comes after §15 so the `const` initial masks correctly reflect ABI-aware pool composition)
-17. §16 (manager `reset()` — add last; clears all additions from §4, §5, §7, §9 and re-invokes `populate_pools(abi_)` from §15)
+14. §15 (ABI configuration) *(REJECTED — see §15)*
+15. §17 (external `Cpu` overload)
+16. §14 (in-use volatile/preserved getters)
+17. §16 (manager `reset()`)
 
 ---
 

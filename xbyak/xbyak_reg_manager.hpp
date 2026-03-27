@@ -249,7 +249,6 @@ public:
     std::vector<int> get_preserved_gps() const {
         return make_index_vector(preserved_gp);
     }
-    std::vector<int> get_used_gps() const { return make_index_vector(used_gp); }
 
     // Returns only in-use registers that are volatile (caller-saved)
     // These MUST be saved by the caller before making a function call
@@ -285,9 +284,6 @@ public:
     }
     std::vector<int> get_preserved_vecs() const {
         return make_index_vector(preserved_vec);
-    }
-    std::vector<int> get_used_vecs() const {
-        return make_index_vector(used_vec);
     }
 
     // Returns only in-use vector registers that are volatile (caller-saved)
@@ -328,9 +324,6 @@ public:
     std::vector<int> get_preserved_opmasks() const {
         return make_index_vector(preserved_opmask);
     }
-    std::vector<int> get_used_opmasks() const {
-        return make_index_vector(used_opmask);
-    }
 
     // Returns in-use opmask registers (all opmasks are volatile/caller-saved)
     // These MUST be saved by the caller before making a function call
@@ -344,9 +337,6 @@ public:
     }
     std::vector<int> get_in_use_tiles() const {
         return make_index_vector(in_use_tile);
-    }
-    std::vector<int> get_used_tiles() const {
-        return make_index_vector(used_tile);
     }
 
     // Returns in-use AMX tile registers (all tiles are volatile/caller-saved)
@@ -938,21 +928,12 @@ public:
 
     // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
     // Stack pointer: rsp
-    inline Reg64 _stack_pointer() {
-        used_gp.insert(4); // rsp is index 4
-        return Reg64(4);
-    }
+    inline Reg64 _stack_pointer() { return Reg64(4); }
     // Base pointer: rbp
-    inline Reg64 _base_pointer() {
-        used_gp.insert(5); // rbp is index 5
-        return Reg64(5);
-    }
+    inline Reg64 _base_pointer() { return Reg64(5); }
     // Opmask k0: special mask register that means "unmasked" (no masking)
     // When k0 is used as a write mask, all elements are written (effectively no masking)
-    inline Opmask _opmask_k0() {
-        used_opmask.insert(0); // k0 is index 0
-        return Opmask(0);
-    }
+    inline Opmask _opmask_k0() { return Opmask(0); }
 
 private:
     // helper method - converts members of set to vector
@@ -1108,11 +1089,9 @@ private:
         if (it != free_gp_regs.end()) {
             in_use_gp.insert(idx);
             free_gp_regs.erase(it);
-            used_gp.insert(idx);
         } else if (pres_it != preserved_gp.end()) {
             in_use_gp.insert(idx);
             preserved_gp.erase(pres_it);
-            used_gp.insert(idx);
             allocated_preserved_gp_.push_back(idx);
         } else {
             XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
@@ -1126,11 +1105,9 @@ private:
         if (it != free_vec_regs.end()) {
             in_use_vec.insert(idx);
             free_vec_regs.erase(it);
-            used_vec.insert(idx);
         } else if (pres_it != preserved_vec.end()) {
             in_use_vec.insert(idx);
             preserved_vec.erase(pres_it);
-            used_vec.insert(idx);
             allocated_preserved_vec_.push_back(idx);
         } else {
             XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
@@ -1144,11 +1121,9 @@ private:
         if (it != free_opmask_regs.end()) {
             in_use_opmask.insert(idx);
             free_opmask_regs.erase(it);
-            used_opmask.insert(idx);
         } else if (pres_it != preserved_opmask.end()) {
             in_use_opmask.insert(idx);
             preserved_opmask.erase(pres_it);
-            used_opmask.insert(idx);
         } else {
             XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
         }
@@ -1189,7 +1164,6 @@ private:
         if (it != free_tile_regs.end()) {
             in_use_tile.insert(idx);
             free_tile_regs.erase(it);
-            used_tile.insert(idx);
         } else {
             XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
         }
@@ -1233,7 +1207,6 @@ private:
     }
 #endif
 
-    std::set<int> used_gp;
     std::set<int> in_use_gp;
     std::set<int> free_gp_regs = base_free_gp();
     std::set<int> preserved_gp = base_preserved_gp();
@@ -1268,7 +1241,6 @@ private:
     }
 #endif
 
-    std::set<int> used_vec;
     std::set<int> in_use_vec;
     std::set<int> free_vec_regs;              // populated in constructor after XCR0[1:2] check
     std::set<int> preserved_vec;              // populated in constructor after XCR0[1:2] check
@@ -1286,7 +1258,6 @@ private:
         return s;
     }
 
-    std::set<int> used_opmask;
     std::set<int> in_use_opmask;
     std::set<int> free_opmask_regs = base_free_opmask();
     std::set<int> preserved_opmask = base_preserved_opmask();
@@ -1308,7 +1279,6 @@ private:
 
     // AMX tile registers (tmm0-tmm7): no preserved tiles, all caller-saved
     // Pool is empty by default; tmm0-tmm7 are added in constructor if AMX detected
-    std::set<int> used_tile;
     std::set<int> in_use_tile;
     std::set<int> free_tile_regs;
 
