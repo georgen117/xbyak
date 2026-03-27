@@ -653,6 +653,64 @@ public:
         emit_call(reinterpret_cast<uint64_t>(func_ptr), extra_pushes);
     }
 
+    // Pushes reg onto the hardware stack, marks it not-in-use, and returns its
+    // index to the free pool so alloc() can reuse it as a scratch register.
+    // Pair each spill() with a matching restore() once the scratch is freed.
+    //
+    // Throws Xbyak::Error if reg is not currently allocated, or if no
+    // CodeGenerator has been provided.
+    void spill(const Reg64 &reg) {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        const int idx = reg.getIdx();
+        if (!in_use_gp.count(idx)) XBYAK_THROW(ERR_RM_SPILL_NOT_IN_USE)
+        cg_->push(Reg64(idx));
+        ++managed_push_count_;
+        in_use_gp.erase(idx);
+        free_gp_regs.insert(idx);
+        spill_stack_gp_.push_back(idx);
+    }
+
+    // Restores the most-recently-spilled GP register (LIFO).
+    // Emits pop, removes it from the free pool, and re-adds it to in-use.
+    // Returns the restored register.
+    //
+    // Throws Xbyak::Error if nothing is spilled, or if no CodeGenerator
+    // has been provided.
+    Reg64 restore() {
+        if (!cg_) XBYAK_THROW_RET(ERR_RM_NO_CG, Reg64(0))
+        if (spill_stack_gp_.empty()) XBYAK_THROW_RET(ERR_RM_SPILL_NOT_IN_USE, Reg64(0))
+        const int idx = spill_stack_gp_.back();
+        spill_stack_gp_.pop_back();
+        cg_->pop(Reg64(idx));
+        --managed_push_count_;
+        free_gp_regs.erase(idx);
+        in_use_gp.insert(idx);
+        return Reg64(idx);
+    }
+
+    // Restores a specific spilled register; reg must be the most-recently-spilled
+    // (top of the spill stack).  Throws if reg is not at the top, the stack is
+    // empty, or no CodeGenerator has been provided.
+    void restore(const Reg64 &reg) {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (spill_stack_gp_.empty() || spill_stack_gp_.back() != reg.getIdx())
+            XBYAK_THROW(ERR_RM_SPILL_NOT_IN_USE)
+        const int idx = spill_stack_gp_.back();
+        spill_stack_gp_.pop_back();
+        cg_->pop(Reg64(idx));
+        --managed_push_count_;
+        free_gp_regs.erase(idx);
+        in_use_gp.insert(idx);
+    }
+
+    // Restores multiple spilled registers in reverse spill order.
+    // Pass the registers in the order they were spilled; the vector is
+    // iterated in reverse so the pops match the push sequence.
+    void restore(const std::vector<Reg64> &spilled_regs) {
+        for (int i = (int)spilled_regs.size() - 1; i >= 0; --i)
+            restore(spilled_regs[i]);
+    }
+
     // Returns the indices of callee-saved GP registers promoted by alloc(),
     // in allocation order.  These are the registers that emit_prologue() will
     // push and emit_epilogue() will pop.
@@ -1057,9 +1115,13 @@ private:
     int prologue_vec_cursor_;
 
     // Running count of push-equivalent 8-byte stack slots emitted by the manager
-    // since function entry (incremented by emit_prologue).  Used by emit_call to
-    // compute 16-byte stack alignment without requiring the caller to track pushes.
+    // since function entry (incremented by emit_prologue and spill, decremented
+    // by restore).  Used by emit_call to compute 16-byte stack alignment.
     size_t managed_push_count_;
+
+    // LIFO stack of GP register indices currently pushed onto the hardware stack
+    // by spill().  restore() pops entries from the back in reverse order.
+    std::vector<int> spill_stack_gp_;
 
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.

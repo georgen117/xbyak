@@ -2043,3 +2043,254 @@ CYBOZU_TEST_AUTO(emitCall)
         CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
     }
 }
+
+// =============================================================================
+// Test – spill() and all restore() variants throw when no CodeGenerator is set
+// =============================================================================
+CYBOZU_TEST_AUTO(spillThrowsNoCG)
+{
+    RegPoolManager rm;
+    auto r = rm.alloc<Reg64>();
+
+    // spill() without a CG must throw.
+    CYBOZU_TEST_EXCEPTION(rm.spill(r), Xbyak::Error);
+    rm.free(r);
+
+    // Detach the CG after a successful spill and verify all restore variants throw.
+    {
+        class TmpJit : public CodeGenerator {
+        public: TmpJit() : CodeGenerator(4096) {}
+        };
+        TmpJit jit;
+        RegPoolManager rm2(&jit);
+        auto r2 = rm2.alloc<Reg64>();
+        rm2.spill(r2);  // succeeds
+
+        rm2.set_code_generator(NULL);
+
+        CYBOZU_TEST_EXCEPTION(rm2.restore(), Xbyak::Error);
+        CYBOZU_TEST_EXCEPTION(rm2.restore(r2), Xbyak::Error);
+        std::vector<Reg64> v{r2};
+        CYBOZU_TEST_EXCEPTION(rm2.restore(v), Xbyak::Error);
+    }
+}
+
+// =============================================================================
+// Test – spill() / restore() state transitions and LIFO order enforcement
+// =============================================================================
+CYBOZU_TEST_AUTO(spillStateTracking)
+{
+    class TrackJit : public CodeGenerator {
+    public: TrackJit() : CodeGenerator(4096) {}
+    };
+    TrackJit jit;
+    RegPoolManager rm(&jit);
+
+    auto r1 = rm.alloc<Reg64>();
+    auto r2 = rm.alloc<Reg64>();
+    const int idx1 = r1.getIdx();
+    const int idx2 = r2.getIdx();
+
+    // Both in_use, neither in the free pool.
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx1));
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx2));
+
+    // Spill r1: leaves in_use, enters free pool.
+    rm.spill(r1);
+    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(idx1));
+    {
+        const auto free = rm.get_free_gps();
+        CYBOZU_TEST_ASSERT(std::find(free.begin(), free.end(), idx1) != free.end());
+    }
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx2));  // r2 unaffected
+
+    // Spilling a not-in-use register must throw.
+    CYBOZU_TEST_EXCEPTION(rm.spill(r1), Xbyak::Error);
+
+    // restore(r2): r2 is not at the top of the spill stack (r1 is) — must throw.
+    CYBOZU_TEST_EXCEPTION(rm.restore(r2), Xbyak::Error);
+
+    // LIFO restore: r1 re-enters in_use, leaves free pool.
+    Reg64 got = rm.restore();
+    CYBOZU_TEST_EQUAL(got.getIdx(), idx1);
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx1));
+    {
+        const auto free = rm.get_free_gps();
+        CYBOZU_TEST_ASSERT(std::find(free.begin(), free.end(), idx1) == free.end());
+    }
+
+    // Restore with empty stack must throw.
+    CYBOZU_TEST_EXCEPTION(rm.restore(), Xbyak::Error);
+
+    // Spill both, verify LIFO is enforced on the targeted overload.
+    rm.spill(r1);  // stack: [idx1]
+    rm.spill(r2);  // stack: [idx1, idx2]
+
+    // idx2 is on top — restore(r1) (not top) must throw.
+    CYBOZU_TEST_EXCEPTION(rm.restore(r1), Xbyak::Error);
+
+    rm.restore(r2);  // pops idx2
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx2));
+    rm.restore(r1);  // pops idx1
+    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx1));
+
+    rm.free(r1);
+    rm.free(r2);
+}
+
+// =============================================================================
+// Test – spill / restore end-to-end: exhaust volatile pool, reuse freed slot,
+//        verify the spilled value survives the scratch allocation
+// =============================================================================
+CYBOZU_TEST_AUTO(spillRestoreJIT)
+{
+    struct SpillKernel : public CodeGenerator, public RegPoolManager {
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        uint64_t build() {
+            // Exhaust the volatile GP pool.
+            std::vector<int> free_idxs = get_free_gps();
+            std::vector<Reg64> v;
+            for (int idx : free_idxs) v.push_back(alloc<Reg64>(idx));
+
+            const int n = (int)v.size();
+            // Load 10, 20, 30, ... into each allocated register.
+            for (int i = 0; i < n; ++i)
+                mov(v[i], (uint64_t)(i + 1) * 10);
+
+            // Spill the last register — its value (n*10) is saved on the stack.
+            Reg64 spilld = v.back();
+            spill(spilld);
+            CYBOZU_TEST_ASSERT(!gp_idx_in_use(spilld.getIdx()));
+
+            // The freed slot is now the only available register; alloc it as scratch.
+            Reg64 scratch = alloc<Reg64>();
+            CYBOZU_TEST_EQUAL(scratch.getIdx(), spilld.getIdx());
+            mov(scratch, (uint64_t)9999);   // overwrite with garbage
+            RegPoolManager::free(scratch);
+
+            // Restore: the original value (n*10) is popped back.
+            Reg64 restored = restore();
+            CYBOZU_TEST_EQUAL(restored.getIdx(), spilld.getIdx());
+            CYBOZU_TEST_ASSERT(gp_idx_in_use(restored.getIdx()));
+
+            // Sum all registers into rax (restored register holds its original value).
+            mov(rax, v[0]);
+            for (int i = 1; i < n; ++i) add(rax, v[i]);
+
+            for (auto &r : v) RegPoolManager::free(r);
+            ret();
+
+            return (uint64_t)10 * n * (n + 1) / 2;
+        }
+    };
+
+    SpillKernel k;
+    const uint64_t expected = k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), expected);
+}
+
+// =============================================================================
+// Test – restore(vector): bulk restore of multiple spilled registers in JIT
+// =============================================================================
+CYBOZU_TEST_AUTO(spillBulkRestoreJIT)
+{
+    struct BulkKernel : public CodeGenerator, public RegPoolManager {
+        BulkKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            auto r1 = alloc<Reg64>();
+            auto r2 = alloc<Reg64>();
+            mov(r1, (uint64_t)100);
+            mov(r2, (uint64_t)200);
+
+            // Spill both; record in spill order.
+            std::vector<Reg64> spilled;
+            spilled.push_back(r1);  spill(r1);
+            spilled.push_back(r2);  spill(r2);
+
+            // Clobber the freed physical registers with scratch work.
+            auto t1 = alloc<Reg64>();  auto t2 = alloc<Reg64>();
+            xor_(t1, t1);  xor_(t2, t2);
+            RegPoolManager::free(t1);  RegPoolManager::free(t2);
+
+            // Bulk restore: iterates in reverse (pops r2 first, then r1).
+            restore(spilled);
+
+            // r1 = 100, r2 = 200 are both restored from the hardware stack.
+            mov(rax, r1);
+            add(rax, r2);
+
+            RegPoolManager::free(r1);  RegPoolManager::free(r2);
+            ret();
+        }
+    };
+
+    BulkKernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)300);
+}
+
+// =============================================================================
+// Test – spill() increments managed_push_count_ so emit_call() computes the
+// right 16-byte stack alignment when spills are live at the call site.
+// =============================================================================
+CYBOZU_TEST_AUTO(spillEmitCallAlignment)
+{
+    // Scenario A: one spill → managed_push_count_=1 (odd).
+    // On SysV the call adds 8 more bytes (return address) → 16-byte aligned;
+    // no sub rsp needed.  Win64 adds only the shadow space.
+    // A misaligned stack would fault inside call_function_that_clobbers_registers.
+    // The return value is the spilled constant (42), which restore() puts back
+    // into r's physical register regardless of whether r is rax or not.
+    {
+        struct KernelA : public CodeGenerator, public RegPoolManager {
+            KernelA() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                auto r = alloc<Reg64>();
+                mov(r, (uint64_t)42);
+                spill(r);                         // managed_push_count_ = 1
+                emit_call(&call_function_that_clobbers_registers);
+                restore();                        // r = 42 (from stack); managed_push_count_ = 0
+                mov(rax, r);                      // rax = 42, regardless of r's index
+                RegPoolManager::free(r);
+                ret();
+            }
+        };
+
+        KernelA k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)42);
+    }
+
+    // Scenario B: two spills → managed_push_count_=2 (even).
+    // emit_call inserts an 8-byte alignment pad on SysV so the stack is
+    // 16-byte aligned at the call instruction.
+    {
+        struct KernelB : public CodeGenerator, public RegPoolManager {
+            KernelB() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                auto r1 = alloc<Reg64>();
+                auto r2 = alloc<Reg64>();
+                mov(r1, (uint64_t)11);
+                mov(r2, (uint64_t)22);
+                spill(r1);                        // managed_push_count_ = 1
+                spill(r2);                        // managed_push_count_ = 2
+                emit_call(&call_function_that_clobbers_registers);
+                restore();                        // r2 = 22 (LIFO); managed_push_count_ = 1
+                restore();                        // r1 = 11; managed_push_count_ = 0
+                mov(rax, r1);
+                add(rax, r2);                     // rax = 33, regardless of r1/r2 indices
+                RegPoolManager::free(r2);
+                RegPoolManager::free(r1);
+                ret();
+            }
+        };
+
+        KernelB k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)33);
+    }
+}
