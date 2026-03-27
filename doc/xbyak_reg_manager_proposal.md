@@ -33,6 +33,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 15. [ABI Configuration: Windows x64 vs SysV](#15-abi-configuration-windows-x64-vs-sysv)
 16. [Manager `reset()` to Complement `CodeGenerator::reset()`](#16-manager-reset-to-complement-codegeneratorreset)
 17. [Accept External `Xbyak::util::Cpu` Reference](#17-accept-external-xbyakutilcpu-reference)
+18. [`emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)](#18-emit_call--abi-correct-outgoing-calls-shadow-space--alignment)
+19. [Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`](#19-stack-integrity-checks)
 ---
 
 ## Implementation Status
@@ -55,6 +57,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [ ] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [ ] 17. Accept External `Xbyak::util::Cpu` Reference
 - [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
+- [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
 
 ---
 
@@ -2150,6 +2153,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 | 16 | Manager `reset()` | 1 new method | None | No |
 | 17 | External `Cpu` constructor overload | 1 new constructor overload | None | No |
 | 18 | `emit_call()` — ABI-correct outgoing calls | 1 new method (+ template overload) | `managed_push_count_` | Yes (§6) |
+| 19 | Stack integrity checks | 4 new methods | None | No |
 
 ### Recommended Implementation Order
 
@@ -2171,6 +2175,60 @@ of `emit_call()` is the acceptance criterion for completing §18.
 15. §17 (external `Cpu` overload — alongside §15; both converge on the same `init_from_cpu()` helper)
 16. §14 (in-use volatile/preserved getters — comes after §15 so the `const` initial masks correctly reflect ABI-aware pool composition)
 17. §16 (manager `reset()` — add last; clears all additions from §4, §5, §7, §9 and re-invokes `populate_pools(abi_)` from §15)
+
+---
+
+## 19. Stack Integrity Checks
+
+### Motivation
+
+`assert_all_free()` (§10) verifies that every register handed out by `alloc()` has been returned with `free()`. The stack has two independent sources of imbalance that it does not detect:
+
+1. **Unrestored spills** — `spill()` pushes a register value onto the hardware stack. If a matching `restore()` is never called, `rsp` is permanently displaced and the `ret` instruction will pop the wrong address.
+2. **Open `StackFrame` objects** — `make_stack_frame(N)` emits `sub rsp, N`. If the returned `StackFrame` is never destroyed (e.g. it outlives its intended scope), `add rsp, N` is never emitted and `rsp` is again incorrect at `ret`.
+
+Both errors produce silent wrong-address returns rather than a compile error or an obvious fault, making them hard to diagnose.
+
+### API
+
+```cpp
+// Returns true if no spill() calls are awaiting a matching restore().
+bool spill_stack_empty() const;
+
+// Debug-build assertion: triggers if any spill() is unmatched.
+// Compiles to nothing in release builds.
+void assert_spill_stack_empty() const;
+
+// Returns true if both the spill stack is empty and no StackFrame is open.
+bool clean_stack() const;
+
+// Debug-build assertion: triggers if either condition above is violated.
+// Compiles to nothing in release builds.
+void assert_clean_stack() const;
+```
+
+### Usage
+
+Call the assertions at the end of JIT kernel construction alongside `assert_all_free()`:
+
+```cpp
+rm.assert_all_free();      // no leaked registers
+rm.assert_clean_stack();   // no unrestored spills, no open StackFrames
+ret();
+```
+
+For programmatic checks (e.g. unit tests):
+
+```cpp
+ASSERT(rm.spill_stack_empty());
+ASSERT(rm.clean_stack());
+```
+
+### Notes
+
+- `clean_stack()` is a strict superset of `spill_stack_empty()`: `clean_stack()` returns `false` whenever `spill_stack_empty()` does, and also when an open `StackFrame` exists. Calling `assert_clean_stack()` is sufficient to catch both problems.
+- No new data members are required. `spill_stack_gp_` (added in §7) and `allocated_stack_space_` (added in §8) already carry the necessary state.
+- Neither check requires a `CodeGenerator` — the state is tracked purely by the manager.
 
 ---
 

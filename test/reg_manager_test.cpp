@@ -2322,27 +2322,26 @@ CYBOZU_TEST_AUTO(stackFrameGPRoundTrip)
             constexpr ptrdiff_t off_b = 8;
             constexpr ptrdiff_t frame_sz = 16;
 
-            {
-                auto frame = make_stack_frame(frame_sz); // emits: sub rsp, 16
+            auto frame = make_stack_frame(frame_sz); // emits: sub rsp, 16
 
-                // Load constants into registers, park them on the frame.
-                auto ra = alloc<Reg64>();
-                mov(ra, (uint64_t)77);
-                frame.put_on_stack(ra, off_a); // emits: mov [rsp+0], ra; frees ra
+            // Load constants into registers, park them on the frame.
+            auto ra = alloc<Reg64>();
+            mov(ra, (uint64_t)77);
+            frame.put_on_stack(ra, off_a); // emits: mov [rsp+0], ra; frees ra
 
-                auto rb = alloc<Reg64>();
-                mov(rb, (uint64_t)33);
-                frame.put_on_stack(rb, off_b); // emits: mov [rsp+8], rb; frees rb
+            auto rb = alloc<Reg64>();
+            mov(rb, (uint64_t)33);
+            frame.put_on_stack(rb, off_b); // emits: mov [rsp+8], rb; frees rb
 
-                // Recover, sum, return.
-                auto ra2 = frame.read_from_stack<Reg64>(off_a); // emits: mov ra2, [rsp+0]
-                auto rb2 = frame.read_from_stack<Reg64>(off_b); // emits: mov rb2, [rsp+8]
-                mov(rax, ra2);
-                add(rax, rb2);
-                free(ra2);
-                free(rb2);
+            // Recover, sum, return.
+            auto ra2 = frame.read_from_stack<Reg64>(off_a); // emits: mov ra2, [rsp+0]
+            auto rb2 = frame.read_from_stack<Reg64>(off_b); // emits: mov rb2, [rsp+8]
+            mov(rax, ra2);
+            add(rax, rb2);
+            free(ra2);
+            free(rb2);
 
-            } // frame dtor emits: add rsp, 16
+            frame.destroy(); // emits: add rsp, 16
             ret();
         }
     };
@@ -2363,27 +2362,26 @@ CYBOZU_TEST_AUTO(stackFrameConstOverload)
         ConstKernel() : CodeGenerator(4096), RegPoolManager(this) {}
 
         void build() {
-            {
-                auto frame = make_stack_frame(16);
+            auto frame = make_stack_frame(16);
 
-                auto r = alloc<Reg64>();
-                mov(r, (uint64_t)55);
+            auto r = alloc<Reg64>();
+            mov(r, (uint64_t)55);
 
-                // Pass as const reference → store-only, no free.
-                const Reg64 &cr = r;
-                frame.put_on_stack(cr, 0);
+            // Pass as const reference → store-only, no free.
+            const Reg64 &cr = r;
+            frame.put_on_stack(cr, 0);
 
-                // r must still be in use; overwrite it to prove we can re-use it.
-                mov(r, (uint64_t)99);
-                frame.put_on_stack(cr, 8); // store updated value
+            // r must still be in use; overwrite it to prove we can re-use it.
+            mov(r, (uint64_t)99);
+            frame.put_on_stack(cr, 8); // store updated value
 
-                // Recover first-stored value (55) and return it.
-                auto r2 = frame.read_from_stack<Reg64>(0);
-                mov(rax, r2);
-                free(r2);
-                free(r);
+            // Recover first-stored value (55) and return it.
+            auto r2 = frame.read_from_stack<Reg64>(0);
+            mov(rax, r2);
+            free(r2);
+            free(r);
 
-            } // frame dtor emits: add rsp, 16
+            frame.destroy(); // emits: add rsp, 16
             ret();
         }
     };
@@ -2418,7 +2416,60 @@ CYBOZU_TEST_AUTO(stackFrameOffsetOOB)
             Xbyak::Error);
 
         k.free(r);
-        // frame dtor emits add rsp, 16
+        frame.destroy(); // emits add rsp, 16; disarms dtor
+    }
+}
+
+// =============================================================================
+// Test – StackFrame::destroy(): explicit destroy, double-destroy no-op, clean_stack
+// =============================================================================
+CYBOZU_TEST_AUTO(stackFrameDestroy)
+{
+    // close() must emit add rsp, restore managed_push_count_, and disarm the dtor.
+    {
+        struct CloseKernel : public CodeGenerator, public RegPoolManager {
+            CloseKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                auto frame = make_stack_frame(16);
+                CYBOZU_TEST_ASSERT(!clean_stack()); // frame open
+
+                frame.destroy();                    // emits add rsp, 16
+                CYBOZU_TEST_ASSERT(clean_stack());  // frame closed
+
+                // Double-destroy is a no-op (no second add rsp emitted).
+                frame.destroy();
+                CYBOZU_TEST_ASSERT(clean_stack());
+
+                xor_(eax, eax);
+                ret();
+            }
+        };
+
+        CloseKernel k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0); // trivial kernel
+    }
+
+    // close() disarms the destructor: only one add rsp must appear in the output.
+    // Verify by checking managed_push_count_ reaches 0 exactly once.
+    {
+        struct CloseDestroyKernel : public CodeGenerator, public RegPoolManager {
+            CloseDestroyKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+            void build() {
+                auto frame = make_stack_frame(8); // managed_push_count_ = 1
+                frame.destroy();                  // managed_push_count_ = 0; dtor disarmed
+                // frame goes out of scope here — dtor must be a no-op
+                CYBOZU_TEST_EQUAL(clean_stack(), true);
+                xor_(eax, eax);
+                ret();
+            }
+        };
+
+        CloseDestroyKernel k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0);
     }
 }
 
@@ -2435,11 +2486,10 @@ CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
             Kernel16() : CodeGenerator(4096), RegPoolManager(this) {}
 
             void build() {
-                {
-                    auto frame = make_stack_frame(16); // managed_push_count_ += 2
-                    emit_call(&call_function_that_clobbers_registers);
-                    // rax = 210 on return
-                } // frame dtor: add rsp, 16; managed_push_count_ -= 2
+                auto frame = make_stack_frame(16); // managed_push_count_ += 2
+                emit_call(&call_function_that_clobbers_registers);
+                // rax = 210 on return
+                frame.destroy(); // add rsp, 16; managed_push_count_ -= 2
                 ret();
             }
         };
@@ -2456,11 +2506,10 @@ CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
             Kernel8() : CodeGenerator(4096), RegPoolManager(this) {}
 
             void build() {
-                {
-                    auto frame = make_stack_frame(8); // managed_push_count_ += 1
-                    emit_call(&call_function_that_clobbers_registers);
-                    // rax = 210 on return
-                } // frame dtor: add rsp, 8; managed_push_count_ -= 1
+                auto frame = make_stack_frame(8); // managed_push_count_ += 1
+                emit_call(&call_function_that_clobbers_registers);
+                // rax = 210 on return
+                frame.destroy(); // add rsp, 8; managed_push_count_ -= 1
                 ret();
             }
         };
@@ -2469,4 +2518,105 @@ CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
         k.build();
         CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
     }
+}
+
+// =============================================================================
+// Test – spill_stack_empty() and assert_spill_stack_empty()
+// =============================================================================
+CYBOZU_TEST_AUTO(spillStackEmpty)
+{
+    // Fresh manager: spill stack is empty.
+    RegPoolManager rm;
+    CYBOZU_TEST_ASSERT(rm.spill_stack_empty());
+    rm.assert_spill_stack_empty();
+
+    // After spill(), stack is non-empty.
+    struct SpillKernel : public CodeGenerator, public RegPoolManager {
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    SpillKernel k;
+    auto r = k.alloc<Reg64>();
+    CYBOZU_TEST_ASSERT(k.spill_stack_empty());
+    k.spill(r);
+    CYBOZU_TEST_ASSERT(!k.spill_stack_empty());
+
+    // After restore(), stack is empty again.
+    k.restore();
+    CYBOZU_TEST_ASSERT(k.spill_stack_empty());
+    k.assert_spill_stack_empty();
+    k.free(r);
+}
+
+// =============================================================================
+// Test – clean_stack() and assert_clean_stack(): spill contribution
+// =============================================================================
+CYBOZU_TEST_AUTO(cleanStackSpill)
+{
+    struct SpillKernel : public CodeGenerator, public RegPoolManager {
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    SpillKernel k;
+
+    // Initially clean.
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+    k.assert_clean_stack();
+
+    auto r = k.alloc<Reg64>();
+    k.spill(r);
+    CYBOZU_TEST_ASSERT(!k.clean_stack()); // spill outstanding
+
+    k.restore();
+    CYBOZU_TEST_ASSERT(k.clean_stack()); // restored
+    k.assert_clean_stack();
+    k.free(r);
+}
+
+// =============================================================================
+// Test – clean_stack() and assert_clean_stack(): StackFrame contribution
+// =============================================================================
+CYBOZU_TEST_AUTO(cleanStackFrame)
+{
+    struct FrameKernel : public CodeGenerator, public RegPoolManager {
+        FrameKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    FrameKernel k;
+
+    // Initially clean.
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+
+    {
+        auto frame = k.make_stack_frame(16);
+        CYBOZU_TEST_ASSERT(!k.clean_stack()); // frame open
+    } // frame destroyed: add rsp emitted
+
+    // Frame closed: clean again.
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+    k.assert_clean_stack();
+}
+
+// =============================================================================
+// Test – clean_stack() detects both open frame and unrestored spill together
+// =============================================================================
+CYBOZU_TEST_AUTO(cleanStackCombined)
+{
+    struct ComboKernel : public CodeGenerator, public RegPoolManager {
+        ComboKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    ComboKernel k;
+
+    auto r = k.alloc<Reg64>();
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+
+    {
+        auto frame = k.make_stack_frame(16);
+        k.spill(r);
+        CYBOZU_TEST_ASSERT(!k.clean_stack()); // both conditions violated
+
+        k.restore();
+        CYBOZU_TEST_ASSERT(!k.clean_stack()); // frame still open
+    } // frame closed
+
+    CYBOZU_TEST_ASSERT(k.clean_stack()); // both resolved
+    k.assert_clean_stack();
+    k.free(r);
 }

@@ -404,6 +404,66 @@ public:
 #endif
     }
 
+    // Returns true if no registers are currently on the spill stack.
+    // Use this to inspect state programmatically.  For a hard stop in debug
+    // builds, use assert_spill_stack_empty() instead.
+    bool spill_stack_empty() const {
+        return spill_stack_gp_.empty();
+    }
+
+    // Checks that every spill()ed register has been matched by a restore().
+    //
+    // Call this at the end of JIT kernel construction alongside assert_all_free()
+    // to confirm there are no dangling spills.  An unrestored spill leaves a
+    // stale value on the hardware stack, making the return address unreachable.
+    //
+    // In debug builds (NDEBUG not defined): prints the indices of unrestored
+    // spilled registers to stderr and triggers an assertion.
+    //
+    // In release builds (NDEBUG defined): compiles to nothing.
+    void assert_spill_stack_empty() const {
+#ifndef NDEBUG
+        if (!spill_stack_gp_.empty()) {
+            fprintf(stderr, "assert_spill_stack_empty: unrestored spills:");
+            for (size_t i = 0; i < spill_stack_gp_.size(); ++i)
+                fprintf(stderr, " %d", spill_stack_gp_[i]);
+            fprintf(stderr, "\n");
+        }
+        assert(spill_stack_gp_.empty() &&
+               "assert_spill_stack_empty: spill() without matching restore()");
+#endif
+    }
+
+    // Returns true if both the spill stack is empty and no StackFrame is open.
+    // Use this to inspect state programmatically.  For a hard stop in debug
+    // builds, use assert_clean_stack() instead.
+    bool clean_stack() const {
+        return spill_stack_gp_.empty() && allocated_stack_space_ == 0;
+    }
+
+    // Checks that the hardware stack is fully balanced: no unrestored spills
+    // and no open StackFrames.
+    //
+    // Call this just before ret() to confirm every spill() has a restore() and
+    // every make_stack_frame() result has been destroyed.  An open frame or
+    // dangling spill corrupts rsp, making the return address unreachable.
+    //
+    // In debug builds (NDEBUG not defined): prints diagnostic information to
+    // stderr and triggers an assertion.
+    //
+    // In release builds (NDEBUG defined): compiles to nothing.
+    void assert_clean_stack() const {
+#ifndef NDEBUG
+        assert_spill_stack_empty();
+        if (allocated_stack_space_ != 0)
+            fprintf(stderr,
+                    "assert_clean_stack: StackFrame not destroyed (%td bytes still allocated)\n",
+                    allocated_stack_space_);
+        assert(clean_stack() &&
+               "assert_clean_stack: unbalanced stack — open StackFrame or unrestored spill");
+#endif
+    }
+
     // Prevents a register from being returned by alloc() without marking it as in-use.
     // Useful for protecting registers that must stay off-limits during code generation,
     // such as ABI argument registers or registers dedicated to a runtime helper.
@@ -548,8 +608,8 @@ public:
 
     // RAII helper owning a stack frame allocated via make_stack_frame().
     // Construction emits: sub rsp, size
-    // Destruction emits:  add rsp, size
-    // Move-only; do not copy.  All nested frames must be destroyed in LIFO order.
+    // Destruction emits:  add rsp, size  (unless destroy() was called first)
+    // Move-only; do not copy.  All nested frames must be closed in LIFO order.
     class StackFrame {
     public:
         StackFrame(RegPoolManager &rm, ptrdiff_t size)
@@ -572,6 +632,27 @@ public:
 
         StackFrame(StackFrame &&other) noexcept : rm_(other.rm_), size_(other.size_) {
             other.rm_ = NULL;
+        }
+
+        // Explicitly closes the frame: emits add rsp, size immediately and
+        // makes the destructor a no-op.  Use this instead of a scope block when
+        // the frame lifetime does not align neatly with C++ scope boundaries,
+        // e.g. when ret() must follow immediately:
+        //
+        //   auto frame = make_stack_frame(N);
+        //   ...
+        //   frame.destroy();  // add rsp, N emitted here
+        //   ret();            // correct: rsp fully restored
+        //
+        // Calling destroy() more than once on the same frame is a no-op.
+        void destroy() {
+            if (!rm_) return;
+            if (rm_->cg_) {
+                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
+                rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
+                rm_->allocated_stack_space_ -= size_;
+            }
+            rm_ = NULL; // disarms destructor
         }
 
         // Store reg at [rsp + offset] and free it from the allocator.
@@ -653,13 +734,20 @@ public:
     };
 
     // Allocates a stack frame of size bytes.  Emits sub rsp, size immediately
-    // and add rsp, size when the returned StackFrame is destroyed.
+    // and add rsp, size when the frame is closed.
     // size must be a positive multiple of 8; multiples of 16 ensure the stack
     // remains 16-byte aligned after the allocation.
-    // The StackFrame MUST be destroyed before ret() is emitted.  Use a block
-    // scope to guarantee correct ordering:
-    //   { auto frame = make_stack_frame(N); ...; } // add rsp, N emitted here
-    //   ret();                                      // ret emitted after
+    //
+    // Close the frame explicitly with destroy() before ret() — preferred:
+    //   auto frame = make_stack_frame(N);
+    //   ...
+    //   frame.destroy();  // add rsp, N emitted here
+    //   ret();
+    //
+    // Alternatively, use a block scope to let the destructor close it:
+    //   { auto frame = make_stack_frame(N); ...; }  // add rsp, N on scope exit
+    //   ret();
+    //
     // Throws Xbyak::Error if no CodeGenerator has been provided.
     StackFrame make_stack_frame(ptrdiff_t size) {
         return StackFrame(*this, size);
