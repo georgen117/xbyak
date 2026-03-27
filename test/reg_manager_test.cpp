@@ -1766,3 +1766,186 @@ CYBOZU_TEST_AUTO(codeGeneratorInheritance)
     k.build();
     CYBOZU_TEST_ASSERT(k.all_free());
 }
+
+// =============================================================================
+// Test – get_allocated_preserved_gps() tracks promotions from preserved pool
+// =============================================================================
+CYBOZU_TEST_AUTO(prologueEpilogueTracking)
+{
+    RegPoolManager rm;
+
+    // Nothing allocated yet.
+    CYBOZU_TEST_ASSERT(rm.get_allocated_preserved_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_allocated_preserved_vecs().empty());
+
+    // Allocate every volatile GP register (preserved pool untouched).
+    std::vector<Reg64> v_regs;
+    std::vector<int> free_idxs = rm.get_free_gps();
+    for (int i = 0; i < (int)free_idxs.size(); ++i)
+        v_regs.push_back(rm.alloc<Reg64>());
+    CYBOZU_TEST_ASSERT(rm.get_allocated_preserved_gps().empty());
+
+    // Promote the first callee-saved GP (rbx = index 3 on both ABIs).
+    Reg64 r_pres1 = rm.alloc<Reg64>();
+    CYBOZU_TEST_EQUAL((int)rm.get_allocated_preserved_gps().size(), 1);
+    CYBOZU_TEST_EQUAL(rm.get_allocated_preserved_gps()[0], r_pres1.getIdx());
+
+    // Promote a second callee-saved GP.
+    Reg64 r_pres2 = rm.alloc<Reg64>();
+    CYBOZU_TEST_EQUAL((int)rm.get_allocated_preserved_gps().size(), 2);
+    CYBOZU_TEST_EQUAL(rm.get_allocated_preserved_gps()[1], r_pres2.getIdx());
+
+    // free() does not remove entries from the tracking list — the registers
+    // were promoted and must still be saved/restored at the ABI boundary.
+    rm.free(r_pres1);
+    rm.free(r_pres2);
+    CYBOZU_TEST_EQUAL((int)rm.get_allocated_preserved_gps().size(), 2);
+
+    for (auto &r : v_regs) rm.free(r);
+}
+
+// =============================================================================
+// Test – emit_prologue() and emit_epilogue() throw when no CodeGenerator is set
+// =============================================================================
+CYBOZU_TEST_AUTO(prologueEpilogueThrowsNoCG)
+{
+    RegPoolManager rm; // no CodeGenerator attached
+
+    // Promote a preserved register so there is something to emit.
+    std::vector<Reg64> v_regs;
+    std::vector<int> free_idxs = rm.get_free_gps();
+    for (int i = 0; i < (int)free_idxs.size(); ++i)
+        v_regs.push_back(rm.alloc<Reg64>());
+    Reg64 r_pres = rm.alloc<Reg64>();
+
+    CYBOZU_TEST_EXCEPTION(rm.emit_prologue(), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.emit_epilogue(), Xbyak::Error);
+
+    for (auto &r : v_regs) rm.free(r);
+    rm.free(r_pres);
+}
+
+// =============================================================================
+// Test – emit_prologue() is idempotent: only newly promoted registers are pushed
+// =============================================================================
+CYBOZU_TEST_AUTO(prologueEpilogueIdempotent)
+{
+    struct IdempotentKernel : public CodeGenerator, public RegPoolManager {
+        IdempotentKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            // First call with no preserved registers allocated — emits nothing.
+            const size_t sz0 = getSize();
+            emit_prologue();
+            CYBOZU_TEST_EQUAL(sz0, getSize());
+
+            // Exhaust the volatile GP pool.
+            std::vector<Reg64> v_regs;
+            std::vector<int> free_idxs = get_free_gps();
+            for (int i = 0; i < (int)free_idxs.size(); ++i)
+                v_regs.push_back(alloc<Reg64>());
+
+            // Promote one callee-saved GP.
+            Reg64 r_pres1 = alloc<Reg64>();
+
+            // Second call — emits exactly one push.
+            const size_t sz1 = getSize();
+            emit_prologue();
+            CYBOZU_TEST_ASSERT(getSize() > sz1);
+
+            // Third call — nothing new, emits nothing.
+            const size_t sz2 = getSize();
+            emit_prologue();
+            CYBOZU_TEST_EQUAL(sz2, getSize());
+
+            // Promote a second callee-saved GP then call again — emits one more push.
+            Reg64 r_pres2 = alloc<Reg64>();
+            const size_t sz3 = getSize();
+            emit_prologue();
+            CYBOZU_TEST_ASSERT(getSize() > sz3);
+
+            // Complete the function so the generated code is valid.
+            xor_(rax, rax);
+            for (auto &r : v_regs) RegPoolManager::free(r);
+            RegPoolManager::free(r_pres1);
+            RegPoolManager::free(r_pres2);
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    IdempotentKernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0);
+}
+
+// =============================================================================
+// Test – emit_prologue()/emit_epilogue() with only volatile registers
+//        (no pushes or pops should be emitted)
+// =============================================================================
+CYBOZU_TEST_AUTO(prologueEpilogueVolatileOnly)
+{
+    struct VolatileKernel : public CodeGenerator, public RegPoolManager {
+        VolatileKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            emit_prologue(); // nothing to push — no preserved regs allocated
+
+            auto r1 = alloc<Reg64>();
+            mov(r1, 99);
+            mov(rax, r1);
+
+            RegPoolManager::free(r1);
+            emit_epilogue(); // nothing to pop
+            ret();
+        }
+    };
+
+    VolatileKernel k;
+    k.build();
+    CYBOZU_TEST_ASSERT(k.get_allocated_preserved_gps().empty());
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)99);
+}
+
+// =============================================================================
+// Test – emit_prologue()/emit_epilogue() end-to-end with a callee-saved GP
+// =============================================================================
+CYBOZU_TEST_AUTO(prologueEpilogueJIT)
+{
+    // Build a JIT kernel that exhausts the volatile GP pool, forces one
+    // callee-saved GP to be allocated, and verifies the save/restore sequence
+    // generated by emit_prologue()/emit_epilogue() produces correct results.
+    struct PreservedKernel : public CodeGenerator, public RegPoolManager {
+        PreservedKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            // Exhaust all volatile GP registers.
+            std::vector<Reg64> v_regs;
+            std::vector<int> free_idxs = get_free_gps();
+            for (int i = 0; i < (int)free_idxs.size(); ++i)
+                v_regs.push_back(alloc<Reg64>());
+
+            // This alloc promotes the first callee-saved GP (rbx on both ABIs).
+            Reg64 r_pres = alloc<Reg64>();
+            CYBOZU_TEST_EQUAL((int)get_allocated_preserved_gps().size(), 1);
+
+            // Emit push for r_pres.
+            emit_prologue();
+
+            // Use r_pres and return its value via rax.
+            mov(r_pres, 42);
+            mov(rax, r_pres); // rax = 42 before pop
+
+            for (auto &r : v_regs) RegPoolManager::free(r);
+            RegPoolManager::free(r_pres);
+
+            // Emit pop for r_pres (restores caller's original value).
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    PreservedKernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)42);
+}

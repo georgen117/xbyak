@@ -101,7 +101,8 @@ public:
     //       MyKernel() : Xbyak::CodeGenerator(4096),
     //                    Xbyak::RegPoolManager(this) {}
     //   };
-    explicit RegPoolManager(Xbyak::CodeGenerator *cg = NULL) : cg_(cg) {
+    explicit RegPoolManager(Xbyak::CodeGenerator *cg = NULL)
+            : prologue_gp_cursor_(0), prologue_vec_cursor_(0), cg_(cg) {
         Xbyak::util::Cpu cpu;
         uint64_t xcr0 = 0;
         if (cpu.has(Xbyak::util::Cpu::tOSXSAVE)) {
@@ -564,6 +565,73 @@ public:
     // either at construction or via set_code_generator().
     bool has_code_generator() const { return cg_ != NULL; }
 
+    // Emits a push instruction for each callee-saved GP register promoted by
+    // alloc() since the last call to emit_prologue().  Call this once near the
+    // top of the JIT function body, before any callee-saved registers are written.
+    //
+    // Safe to call more than once: only registers promoted after the previous
+    // call are pushed on each subsequent invocation.
+    //
+    // On Windows x64, also emits sub rsp + movdqu for any callee-saved XMM
+    // registers (xmm6-xmm15) promoted since the last call.
+    //
+    // Pair with emit_epilogue() just before ret to emit the matching restore
+    // sequence.  Throws Xbyak::Error if no CodeGenerator was provided.
+    void emit_prologue() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        for (int i = prologue_gp_cursor_; i < (int)allocated_preserved_gp_.size(); ++i)
+            cg_->push(Reg64(allocated_preserved_gp_[i]));
+        prologue_gp_cursor_ = (int)allocated_preserved_gp_.size();
+#ifdef _WIN32
+        // Windows x64: xmm6-xmm15 are callee-saved and must be saved to the
+        // stack with movdqu; there is no push instruction for XMM registers.
+        const int new_vecs = (int)allocated_preserved_vec_.size() - prologue_vec_cursor_;
+        if (new_vecs > 0) {
+            cg_->sub(cg_->rsp, new_vecs * 16);
+            for (int i = 0; i < new_vecs; ++i)
+                cg_->movdqu(ptr[cg_->rsp + i * 16],
+                            Xmm(allocated_preserved_vec_[prologue_vec_cursor_ + i]));
+            prologue_vec_cursor_ = (int)allocated_preserved_vec_.size();
+        }
+#endif
+    }
+
+    // Emits the restore sequence that matches emit_prologue():
+    //   - on Windows x64: movdqu to restore callee-saved XMM registers,
+    //     then add rsp to reclaim the space
+    //   - on all platforms: pop for each callee-saved GP in reverse
+    //     allocation order, matching the push sequence from emit_prologue()
+    //
+    // Call this once just before ret.
+    // Throws Xbyak::Error if no CodeGenerator was provided.
+    void emit_epilogue() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+#ifdef _WIN32
+        if (!allocated_preserved_vec_.empty()) {
+            const int n = (int)allocated_preserved_vec_.size();
+            for (int i = 0; i < n; ++i)
+                cg_->movdqu(Xmm(allocated_preserved_vec_[i]), ptr[cg_->rsp + i * 16]);
+            cg_->add(cg_->rsp, n * 16);
+        }
+#endif
+        for (int i = (int)allocated_preserved_gp_.size() - 1; i >= 0; --i)
+            cg_->pop(Reg64(allocated_preserved_gp_[i]));
+    }
+
+    // Returns the indices of callee-saved GP registers promoted by alloc(),
+    // in allocation order.  These are the registers that emit_prologue() will
+    // push and emit_epilogue() will pop.
+    std::vector<int> get_allocated_preserved_gps() const {
+        return allocated_preserved_gp_;
+    }
+
+    // Returns the indices of callee-saved vector registers promoted by alloc().
+    // On Windows x64, xmm6-xmm15 are callee-saved; this list is always empty
+    // on Linux and macOS where all vector registers are caller-saved.
+    std::vector<int> get_allocated_preserved_vecs() const {
+        return allocated_preserved_vec_;
+    }
+
     // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
     // Stack pointer: rsp
     inline Reg64 _stack_pointer() {
@@ -741,6 +809,7 @@ private:
             in_use_gp.insert(idx);
             preserved_gp.erase(pres_it);
             used_gp.insert(idx);
+            allocated_preserved_gp_.push_back(idx);
         } else {
             XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
         }
@@ -758,6 +827,7 @@ private:
             in_use_vec.insert(idx);
             preserved_vec.erase(pres_it);
             used_vec.insert(idx);
+            allocated_preserved_vec_.push_back(idx);
         } else {
             XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
         }
@@ -940,6 +1010,16 @@ private:
 
     // AMX feature support
     bool has_amx_ = false;
+
+    // Callee-saved registers promoted by alloc(), in allocation order.
+    // emit_prologue() pushes these; emit_epilogue() pops them in reverse.
+    std::vector<int> allocated_preserved_gp_;
+    std::vector<int> allocated_preserved_vec_;  // non-empty only on Windows (xmm6-xmm15)
+
+    // Cursors for idempotent emit_prologue(): count of entries already emitted
+    // by previous emit_prologue() calls.
+    int prologue_gp_cursor_;
+    int prologue_vec_cursor_;
 
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.
