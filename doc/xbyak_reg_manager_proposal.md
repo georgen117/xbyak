@@ -35,6 +35,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 17. [Accept External `Xbyak::util::Cpu` Reference](#17-accept-external-xbyakutilcpu-reference)
 18. [`emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)](#18-emit_call--abi-correct-outgoing-calls-shadow-space--alignment)
 19. [Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`](#19-stack-integrity-checks)
+20. [Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`](#20-saverestore-live-volatile-registers-savevolatiles--restorevolatiles)
+21. [Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.](#21-pool-count-queries-free_gp_count-free_vec_count-etc)
 ---
 
 ## Implementation Status
@@ -45,19 +47,31 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
 - [x] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
 - [x] 6. Code Emission Coupling: `set_code_generator()`
-- [x] 7. Register Spill / Restore: `spill()` and `restore()`
-- [x] 8. Stack Frame Management: `StackFrame` RAII Helper
-- [x] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
+- [x] 7. Register Spill / Restore: `spill()` and `restore()` *(REVIEW NOTES — see §7)*
+  - [ ] 7a. Resolve GP-only limitation: extend `spill()` to Vec, or remove in favour of a unified approach
+  - [ ] 7b. Guard against `spill()` being called while a `StackFrame` is active
+- [x] 8. Stack Frame Management: `StackFrame` RAII Helper *(REVIEW NOTES — see §8)*
+  - [ ] 8a. Fix `put_on_stack(RegT &reg)` destructive-free behaviour: remove or rename to make intent obvious
+- [x] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()` *(REVIEW NOTE — see §9)*
+  - [ ] 9a. Add debug assertion: fire if preserved register is promoted by `alloc()` before `emit_prologue()` has been called
 - [x] 10. End-of-JIT Validation: `assert_all_free()`
 - [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
 - [x] 12. Named-Register `alloc()` Overload
 - [x] 13. Remove `used_*` Sets
-- [x] 14. In-Use Volatile / Preserved Getters
+- [x] 14. In-Use Volatile / Preserved Getters *(REVIEW NOTE — see §14)*
+  - [ ] 14a. Remove `get_in_use_volatile_opmasks()` (identical to `get_in_use_opmasks()`)
+  - [ ] 14b. Remove `get_in_use_volatile_tiles()` (identical to `get_in_use_tiles()`)
+  - [ ] 14c. Remove per-family index helpers: `gp_idx_in_use()`, `vec_idx_in_use()`, `opmask_idx_in_use()`, `tile_idx_in_use()`
+  - [ ] 14d. Remove `_stack_pointer()`, `_base_pointer()`, `_opmask_k0()` helpers
 - [x] 15. ABI Configuration: Windows x64 vs SysV *(REJECTED — see §15)*
 - [x] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [ ] 17. Accept External `Xbyak::util::Cpu` Reference
-- [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment)
+- [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment) *(REVIEW NOTES — see §18)*
+  - [ ] 18a. Add debug assertion when `rax` is currently allocated at `emit_call()` invocation
+  - [ ] 18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented
 - [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
+- [ ] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
+- [ ] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.
 
 ---
 
@@ -612,6 +626,24 @@ restore(spilled);  // emits 3 x pop in reverse order
 - Only `Reg64` is spill-able. `Xmm`/`Ymm`/`Zmm` registers require `vmovdqu`/`vmovaps`
   for save/restore and are addressed separately in the `StackFrame` helper (§8).
 
+> **REVIEW NOTE — GP-Only Limitation and `StackFrame` Interaction**
+>
+> 1. `spill()` works only for `Reg64`. SIMD-heavy kernels exhaust ZMM registers before
+>    GP registers. `StackFrame` handles vector saves but with a completely different flow
+>    (alloc frame first, explicit offsets, different ownership semantics). There is no
+>    unified “park this register temporarily” API that spans all register families. A
+>    developer cannot use `spill()` for the register type they most commonly run out of.
+>    Consider extending `spill()` to Vec registers, or removing it in favour of a unified
+>    approach.
+>
+> 2. `spill()` and an active `StackFrame` are silently incompatible. `spill()` emits
+>    `push reg`, decrementing `rsp` by 8. Every open `StackFrame`’s slot addresses
+>    (`[rsp + offset]`) then shift by 8 relative to the values stored at frame
+>    construction time. `check_offset()` cannot detect this — it has no knowledge of
+>    pushes that happen after the frame is opened. The API provides no guard against
+>    interleaving the two. Until this interaction is resolved, users must not call
+>    `spill()` while any `StackFrame` is active.
+
 ---
 
 ## 8. Stack Frame Management: `StackFrame` RAII Helper
@@ -927,6 +959,26 @@ auto z_tmp = frame.read_from_stack<Zmm>(off_zmm_const); // consistent with alloc
   raw size is not already aligned).
 - The `make_stack_frame()` factory should throw (or assert) if `cg_` is `nullptr`.
 
+> **REVIEW NOTE — `put_on_stack(RegT &reg)` Destroys the Register Variable**
+>
+> The non-const overload `put_on_stack(RegT &reg, ptrdiff_t offset)` emits the store
+> **and** calls `rm_.free(reg)`. After the call the developer’s `reg` variable refers to
+> a freed register. When the value is needed back, `read_from_stack<T>(offset)` allocates
+> *whatever next register is free* — which is not guaranteed to be the same index.
+> The stale variable and the newly allocated register share the same C++ name, making the
+> error silent. Either remove the free-on-store entirely and let the caller call `free()`
+> explicitly, or rename it to `put_on_stack_and_free()` so the destructive intent is
+> obvious at the call site.
+
+> **NOTE — Vec-Width Aliasing Is Correctly Handled**
+>
+> `Xmm`, `Ymm`, and `Zmm` all share `reg_family<T>::value == RegFamily::Vec` and all
+> dispatch through `vec_reg(idx)`, which tracks all widths via the single `in_use_vec`
+> set. Calling `alloc<Xmm>(5)` followed by `alloc<Ymm>(5)` correctly throws
+> `ERR_RM_VEC_IN_USE` — the same physical register cannot be allocated twice under
+> different width names. This is the expected behaviour, matching GP aliasing where
+> `eax` and `rax` share index 0 and are mutually exclusive.
+
 ---
 
 ## 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
@@ -1023,6 +1075,17 @@ public:
   This matches how OneDNN kernels already use `postamble()` + label patching.
 - `emit_prologue()` should be idempotent / safe to call multiple times (emit only the
   newly-promoted registers since the last call).
+
+> **REVIEW NOTE — Prologue Timing Cannot Be Enforced**
+>
+> `alloc()` silently promotes a preserved register from `preserved_gp` to `in_use_gp`
+> without emitting any code. If any JIT instruction writes to that register *before*
+> `emit_prologue()` is called, the function is already ABI-incorrect — the caller’s
+> saved value is overwritten with no error or warning. The Notes above document a
+> two-pass workaround, but the fundamental problem — that the API cannot detect or
+> enforce the required ordering — remains. A debug-build assertion that fires if a
+> preserved register is promoted by `alloc()` before `emit_prologue()` has ever been
+> called would surface these errors during development.
 
 ---
 
@@ -1623,6 +1686,30 @@ public:
   will not appear in the result — which is the correct behaviour (its value is no
   longer live).
 
+> **REVIEW NOTE — Redundant Getters and Helpers to Remove**
+>
+> Several methods are redundant by construction and should be removed:
+>
+> - `get_in_use_volatile_opmasks()` is always identical to `get_in_use_opmasks()` —
+>   all opmask registers are volatile on every supported platform. One should be removed.
+> - `get_in_use_volatile_tiles()` is always identical to `get_in_use_tiles()` — same
+>   reasoning. One should be removed.
+> - `gp_idx_in_use(idx)`, `vec_idx_in_use(idx)`, `opmask_idx_in_use(idx)`,
+>   `tile_idx_in_use(idx)` duplicate `reg_in_use(reg)`. A caller who has only an index
+>   can construct `Reg64(idx)` at zero cost. The four per-family index variants add
+>   API surface without adding capability. Remove them in favour of `reg_in_use(reg)`.
+>
+> After §13 removed the `used_*` sets, three special-register helpers now trivially
+> return constant values and carry no semantic weight:
+>
+> - `_stack_pointer()` returns `Reg64(4)`.
+> - `_base_pointer()` returns `Reg64(5)`.
+> - `_opmask_k0()` returns `Opmask(0)`.
+>
+> Any developer using this manager knows these indices. These helpers should be removed.
+> If discoverable names are still desired, `static constexpr int kRspIdx = 4` style
+> constants are preferable to zero-body methods.
+
 ---
 
 ## 15. ABI Configuration: Windows x64 vs SysV
@@ -2141,6 +2228,23 @@ of `emit_call()` is the acceptance criterion for completing §18.
   helper functions and PLT-resolved library symbols whose abs address is known at
   JIT construction time.
 
+> **REVIEW NOTES — `extra_pushes` Is Fragile; `rax` Use Is Unguarded**
+>
+> 1. `extra_pushes` exists because the developer may have manually emitted push
+>    instructions that the manager did not observe. If the count is wrong by 1, the
+>    stack is silently misaligned and the `call` lands at the wrong address. This is
+>    strictly more dangerous than the current manual approach, which makes the alignment
+>    computation visible. The correct fix is to eliminate the need for `extra_pushes`
+>    entirely by routing all push-generating operations through the manager — which is
+>    what `save_volatiles()` (§20) provides. Until that is in place, `extra_pushes`
+>    should be prominently documented as a footgun that is easy to miscalculate.
+>
+> 2. `emit_call()` loads the function address with `mov rax, func_ptr`. If the
+>    developer has allocated rax and has live data in it, this instruction silently
+>    destroys that data. Since rax is volatile the ABI is not violated, but the
+>    developer’s value is gone with no warning. A debug-build assertion when rax is
+>    currently allocated at the point `emit_call()` is invoked would catch this.
+
 ---
 
 ## Summary Table
@@ -2166,6 +2270,8 @@ of `emit_call()` is the acceptance criterion for completing §18.
 | 17 | External `Cpu` constructor overload | 1 new constructor overload | None | No |
 | 18 | `emit_call()` — ABI-correct outgoing calls | 1 new method (+ template overload) | `managed_push_count_` | Yes (§6) |
 | 19 | Stack integrity checks | 4 new methods | None | No |
+| 20 | `save_volatiles()` / `restore_volatiles()` | 2 new methods | `saved_volatile_gp_` vector | Yes |
+| 21 | Pool count queries: `free_gp_count()` etc. | 5 new methods | None | No |
 
 ### Recommended Implementation Order
 
@@ -2187,6 +2293,8 @@ of `emit_call()` is the acceptance criterion for completing §18.
 15. §17 (external `Cpu` overload)
 16. §14 (in-use volatile/preserved getters)
 17. §16 (manager `reset()`)
+18. §20 (`save_volatiles()` / `restore_volatiles()` — depends on §6; eliminates `extra_pushes` footgun in §18)
+19. §21 (pool count queries — no dependencies, add any time)
 
 ---
 
@@ -2305,3 +2413,179 @@ Other candidates considered and their drawbacks:
 A rename is a significant API churn cost with marginal benefit for the primary
 audience. It is worth revisiting only if the manager is ever exposed as a public API
 in a broader library where the user base is less homogeneous.
+
+---
+
+## 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
+
+### Motivation
+
+The most common operation before emitting a `call` instruction is saving all live
+volatile registers so the callee cannot corrupt them. Currently the developer must:
+
+1. Call `get_in_use_volatile_gps()` to get the live volatile list.
+2. Manually emit a `push` for each entry.
+3. Call `emit_call()` with an accurate `extra_pushes` count that includes those pushes.
+4. Manually emit a `pop` for each entry in reverse order.
+
+Steps 2 and 4 are boilerplate repeated in every kernel that makes an external call.
+Step 3 requires an accurate count of pushes the manager did not observe — the primary
+reason `emit_call()`'s `extra_pushes` parameter exists (see §18 review notes). A
+`save_volatiles()` / `restore_volatiles()` pair eliminates all of this and allows
+`emit_call()` to drop `extra_pushes` entirely.
+
+**Prerequisite:** §6 (code emission coupling) must be in place.
+
+### Design
+
+- `save_volatiles()` calls `get_in_use_volatile_gps()`, emits `push` for each live
+  volatile GP in a consistent order, increments `managed_push_count_` by the count,
+  and records the pushed list internally so `restore_volatiles()` knows what to pop
+  and in what order.
+- `restore_volatiles()` emits `pop` for each saved register in reverse order and
+  decrements `managed_push_count_`.
+- Both operations go through the manager, so `managed_push_count_` is always accurate
+  and `emit_call()` no longer needs `extra_pushes`.
+
+### Internal State Changes
+
+```cpp
+// Registers saved by the most recent save_volatiles(), in push order.
+// restore_volatiles() pops them in reverse.
+std::vector<int> saved_volatile_gp_;
+```
+
+### Proposed API
+
+```cpp
+// Push all currently in-use volatile GP registers onto the hardware stack.
+// Increments managed_push_count_ accordingly so emit_call() alignment is correct.
+// Records the pushed registers so restore_volatiles() can reverse the sequence.
+// Throws ERR_RM_NO_CG if no CodeGenerator is attached.
+void save_volatiles();
+
+// Pop the registers saved by the most recent save_volatiles(), in reverse order.
+// Throws if called without a preceding save_volatiles(), or if no CodeGenerator
+// is attached.
+void restore_volatiles();
+```
+
+### Usage Example
+
+```cpp
+class MyKernel : public Xbyak::CodeGenerator, public Xbyak::RegPoolManager {
+public:
+    MyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(this) {
+        emit_prologue();
+
+        auto r_src = alloc<Reg64>();    // volatile: e.g. rdi
+        auto r_cnt = alloc<Reg64>();    // volatile: e.g. rsi
+        auto r_acc = alloc<Reg64>();    // volatile: e.g. rdx
+
+        // --- need to call a C helper ---
+        save_volatiles();               // emits: push rdi; push rsi; push rdx
+                                        //        managed_push_count_ updated automatically
+
+        // emit_call() needs no extra_pushes — the manager knows the full push count.
+        emit_call(&some_c_helper);
+
+        restore_volatiles();            // emits: pop rdx; pop rsi; pop rdi
+
+        // r_src, r_cnt, r_acc are valid again.
+        free(r_src);
+        free(r_cnt);
+        free(r_acc);
+
+        emit_epilogue();
+        ret();
+    }
+};
+```
+
+### Notes
+
+- `save_volatiles()` and `restore_volatiles()` are strictly paired. Calling
+  `restore_volatiles()` without a preceding `save_volatiles()` throws.
+- Only GP volatile registers are saved. `Xmm`/`Ymm`/`Zmm` save/restore requires
+  `StackFrame` (§8) due to the `vmovdqu` instruction requirement.
+- Once `save_volatiles()` is implemented, the `extra_pushes` parameter on `emit_call()`
+  should be deprecated. Any remaining manual pushes outside manager APIs indicate code
+  that should be converted to use `save_volatiles()`.
+- On SysV after `emit_prologue()`, the stack alignment state is already tracked by
+  `managed_push_count_`. The combined `save_volatiles()` + `emit_call()` sequence is
+  always correctly aligned with no extra input from the developer.
+
+---
+
+## 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.
+
+### Motivation
+
+JIT kernel generators frequently need to size themselves based on how many registers
+are available. The only current way to answer "how many free ZMM registers are there?"
+is:
+
+```cpp
+int n = (int)rm.get_free_vecs().size();
+```
+
+This materialises a full `std::vector<int>` — a heap allocation — just to get a count.
+In a JIT loop that sizes itself dynamically (e.g. "use as many ZMMs as available, at
+least 4") this is called on every kernel instantiation. A `free_vec_count()` query
+that returns an `int` directly is both cleaner at the call site and avoids the
+allocation entirely.
+
+### Proposed API
+
+```cpp
+// Returns the number of GP registers currently in the free (volatile) pool.
+int free_gp_count()      const;
+
+// Returns the number of GP registers currently in the preserved (callee-saved) pool.
+int preserved_gp_count() const;
+
+// Returns the number of Vec registers currently in the free pool.
+int free_vec_count()     const;
+
+// Returns the number of Opmask registers currently in the free pool.
+int free_opmask_count()  const;
+
+// Returns the number of Tile registers currently in the free pool.
+int free_tile_count()    const;
+```
+
+With the current `std::set` representation each call is O(1) (`.size()` on a set).
+After §2 (bitmask pools) each call becomes a single `__builtin_popcount()`.
+
+No new data members are required.
+
+### Usage Example
+
+```cpp
+// Dynamically size the kernel based on available ZMM registers.
+const int n_zmm = rm.free_vec_count();
+if (n_zmm < 4) {
+    // Not enough vector registers for the vectorised path — fall back.
+    return generate_scalar_kernel();
+}
+
+// Claim all available ZMM registers.
+std::vector<Zmm> accumulators;
+for (int i = 0; i < n_zmm; ++i)
+    accumulators.push_back(rm.alloc<Zmm>());
+
+// ... kernel body ...
+
+for (auto &z : accumulators) rm.free(z);
+```
+
+### Notes
+
+- These queries return the count at the moment of the call. The count decreases after
+  each `alloc()` and increases after each `free()` — they are snapshots.
+- `free_gp_count()` counts only the volatile (caller-saved) free pool. To include
+  preserved registers that `alloc()` can also draw from, sum
+  `free_gp_count() + preserved_gp_count()`.
+- These methods intentionally do not materialise a vector, unlike `get_free_gps()`.
+  The getter methods remain useful when the caller needs the actual indices, not just
+  the count.
