@@ -140,6 +140,7 @@ public:
             free_vec_regs = base_free_vec();
             preserved_vec = base_preserved_vec();
         }
+        has_vec_base_ = has_vec_base;
 
         // If AVX-512 is available, add zmm16-zmm31 to the free pool
         // Extended vector registers are caller-saved (call-clobbered)
@@ -766,6 +767,67 @@ public:
     // either at construction or via set_code_generator().
     bool has_code_generator() const { return cg_ != NULL; }
 
+    // Resets all allocation tracking to the post-construction baseline.
+    //
+    // This method updates internal bookkeeping only — it emits no machine code.
+    // Any push, sub rsp, or add rsp instructions already written into the code
+    // buffer are unaffected.  This means reset() must always be paired with
+    // CodeGenerator::reset(), which discards the old code buffer:
+    //
+    //   CodeGenerator::reset();     // discard old machine code
+    //   RegPoolManager::reset();    // clear allocation tracking
+    //   // ... build new kernel ...
+    //
+    // Calling reset() without also calling CodeGenerator::reset() leaves the
+    // previously emitted instructions in the buffer.  If that code were executed
+    // with unmatched spills or open frames, rsp would be wrong at ret().
+    //
+    // Preserved: cg_, ISA capability flags (has_apx_, has_avx512_, has_amx_),
+    // and max register indices.
+    // Cleared: all in-use, reserved, and spilled registers; prologue history;
+    // stack tracking.
+    void reset() {
+        in_use_gp.clear();
+        free_gp_regs = base_free_gp();
+        preserved_gp = base_preserved_gp();
+        if (has_apx_) {
+            for (int i = 16; i <= 31; ++i)
+                free_gp_regs.insert(i);
+        }
+        in_use_vec.clear();
+        if (has_vec_base_) {
+            free_vec_regs = base_free_vec();
+            preserved_vec = base_preserved_vec();
+        } else {
+            free_vec_regs.clear();
+            preserved_vec.clear();
+        }
+        if (has_avx512_) {
+            for (int i = 16; i <= 31; ++i)
+                free_vec_regs.insert(i);
+        }
+        in_use_opmask.clear();
+        free_opmask_regs = base_free_opmask();
+        preserved_opmask = base_preserved_opmask();
+        in_use_tile.clear();
+        free_tile_regs.clear();
+        if (has_amx_) {
+            for (int i = 0; i <= 7; ++i)
+                free_tile_regs.insert(i);
+        }
+        reserved_gp.clear();
+        reserved_vec.clear();
+        reserved_opmask.clear();
+        reserved_tile.clear();
+        spill_stack_gp_.clear();
+        allocated_preserved_gp_.clear();
+        allocated_preserved_vec_.clear();
+        prologue_gp_cursor_ = 0;
+        prologue_vec_cursor_ = 0;
+        managed_push_count_ = 0;
+        allocated_stack_space_ = 0;
+    }
+
     // Emits a push instruction for each callee-saved GP register promoted by
     // alloc() since the last call to emit_prologue().  Call this once near the
     // top of the JIT function body, before any callee-saved registers are written.
@@ -1276,6 +1338,9 @@ private:
     bool has_avx512_ = false;
     // 15 without (SSE/AVX/AVX2), 31 with AVX-512
     int max_vec_reg_idx_ = 15;
+    // True when the OS has enabled XMM and YMM state saving (XCR0[1:2] == 3).
+    // Determines whether base_free_vec() / base_preserved_vec() are applied.
+    bool has_vec_base_ = false;
 
     // AMX tile registers (tmm0-tmm7): no preserved tiles, all caller-saved
     // Pool is empty by default; tmm0-tmm7 are added in constructor if AMX detected

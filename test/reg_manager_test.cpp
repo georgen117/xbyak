@@ -2620,3 +2620,162 @@ CYBOZU_TEST_AUTO(cleanStackCombined)
     k.assert_clean_stack();
     k.free(r);
 }
+
+// =============================================================================
+// Test – reset() clears all allocation state and restores the free pool
+// =============================================================================
+CYBOZU_TEST_AUTO(resetClearsAllocation)
+{
+    RegPoolManager rm;
+
+    // Alloc several registers, mark one unavailable, then reset.
+    auto r0 = rm.alloc<Reg64>();
+    auto r1 = rm.alloc<Reg64>();
+    rm.mark_unavailable<Reg64>(3); // rbx
+    CYBOZU_TEST_ASSERT(!rm.all_free());
+
+    const std::vector<int> free_before = rm.get_free_gps();
+
+    rm.reset();
+
+    // All registers freed; pool matches a freshly constructed manager.
+    CYBOZU_TEST_ASSERT(rm.all_free());
+
+    RegPoolManager fresh;
+    CYBOZU_TEST_EQUAL(rm.get_free_gps().size(),      fresh.get_free_gps().size());
+    CYBOZU_TEST_EQUAL(rm.get_preserved_gps().size(), fresh.get_preserved_gps().size());
+    CYBOZU_TEST_EQUAL(rm.get_free_vecs().size(),     fresh.get_free_vecs().size());
+    CYBOZU_TEST_EQUAL(rm.get_preserved_vecs().size(),fresh.get_preserved_vecs().size());
+
+    // Previously reserved register is now allocatable again.
+    CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(3));
+    CYBOZU_TEST_NO_EXCEPTION(auto rbx = rm.alloc<Reg64>(3); rm.free(rbx);)
+
+    // Previously in-use indices are gone from in_use.
+    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(r0.getIdx()));
+    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(r1.getIdx()));
+}
+
+// =============================================================================
+// Test – reset() clears spill and stack-frame tracking
+// =============================================================================
+CYBOZU_TEST_AUTO(resetClearsStackState)
+{
+    // reset() is a tracking-only operation.  It does not emit any machine code,
+    // so it does NOT emit pop / add rsp to undo prior spills or frames.
+    // The correct usage is to pair it with CodeGenerator::reset() so the old
+    // (potentially unbalanced) code buffer is discarded together with the
+    // tracking state.  The resetReEmit test demonstrates that pattern.
+    //
+    // This test verifies the tracking fields are cleared correctly.
+    struct K : public CodeGenerator, public RegPoolManager {
+        K() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    K k;
+
+    auto r = k.alloc<Reg64>();
+    k.spill(r);                        // emits push r; tracking: spill_stack non-empty
+    CYBOZU_TEST_ASSERT(!k.spill_stack_empty());
+
+    // Discard the in-progress code buffer, then reset tracking.
+    // After this pair the manager is ready for a new emission pass.
+    static_cast<CodeGenerator &>(k).reset();
+    static_cast<RegPoolManager &>(k).reset();
+
+    CYBOZU_TEST_ASSERT(k.spill_stack_empty());
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+}
+
+// =============================================================================
+// Test – reset() clears prologue/epilogue history
+// =============================================================================
+CYBOZU_TEST_AUTO(resetClearsPrologueHistory)
+{
+    RegPoolManager rm;
+
+    // Promote a callee-saved register.
+    auto rbx = rm.alloc<Reg64>(3);
+    CYBOZU_TEST_EQUAL(rm.get_allocated_preserved_gps().size(), (size_t)1);
+
+    rm.reset();
+
+    // History wiped; no preserved registers tracked.
+    CYBOZU_TEST_ASSERT(rm.get_allocated_preserved_gps().empty());
+    // reset() implicitly returns all registers to their pools.  Calling free()
+    // on a register that was in-use before reset() is an error — it is no
+    // longer in in_use after the reset.
+    CYBOZU_TEST_EXCEPTION(rm.free(rbx), Xbyak::Error);
+    // After reset, index 3 (rbx) is back in the preserved pool (not the free pool).
+    const auto preserved = rm.get_preserved_gps();
+    const auto free_gps  = rm.get_free_gps();
+    CYBOZU_TEST_ASSERT(std::find(preserved.begin(), preserved.end(), 3) != preserved.end());
+    CYBOZU_TEST_ASSERT(std::find(free_gps.begin(),  free_gps.end(),  3) == free_gps.end());
+    CYBOZU_TEST_NO_EXCEPTION(auto r = rm.alloc<Reg64>(3); rm.free(r);)
+}
+
+// =============================================================================
+// Test – reset() preserves the CodeGenerator pointer and ISA flags
+// =============================================================================
+CYBOZU_TEST_AUTO(resetPreservesConfig)
+{
+    struct K : public CodeGenerator, public RegPoolManager {
+        K() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    K k;
+
+    const bool apx_before  = k.has_apx();
+    const bool avx_before  = k.has_avx512();
+    const bool amx_before  = k.has_amx();
+    const int  max_gp      = k.max_gp_registers();
+
+    static_cast<RegPoolManager &>(k).reset();
+
+    CYBOZU_TEST_ASSERT(k.has_code_generator()); // cg_ preserved
+    CYBOZU_TEST_EQUAL(k.has_apx(),          apx_before);
+    CYBOZU_TEST_EQUAL(k.has_avx512(),       avx_before);
+    CYBOZU_TEST_EQUAL(k.has_amx(),          amx_before);
+    CYBOZU_TEST_EQUAL(k.max_gp_registers(), max_gp);
+}
+
+// =============================================================================
+// Test – re-emit pattern: two kernels emitted sequentially into the same object
+// =============================================================================
+CYBOZU_TEST_AUTO(resetReEmit)
+{
+    struct KernelFamily : public CodeGenerator, public RegPoolManager {
+        KernelFamily() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void emit_a() {
+            CodeGenerator::reset();
+            RegPoolManager::reset();
+            // Kernel A: return 42
+            auto r = alloc<Reg64>();
+            mov(r, (uint64_t)42);
+            mov(rax, r);
+            free(r);
+            ret();
+        }
+
+        void emit_b() {
+            CodeGenerator::reset();
+            RegPoolManager::reset();
+            // Kernel B: return 99
+            auto r = alloc<Reg64>();
+            mov(r, (uint64_t)99);
+            mov(rax, r);
+            free(r);
+            ret();
+        }
+    };
+
+    KernelFamily kf;
+    kf.emit_a();
+    CYBOZU_TEST_EQUAL(call_jit(kf.getCode()), (uint64_t)42);
+
+    kf.emit_b();
+    CYBOZU_TEST_EQUAL(call_jit(kf.getCode()), (uint64_t)99);
+
+    // Can emit A again after B.
+    kf.emit_a();
+    CYBOZU_TEST_EQUAL(call_jit(kf.getCode()), (uint64_t)42);
+}
