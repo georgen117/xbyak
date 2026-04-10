@@ -245,8 +245,8 @@ public:
     std::vector<int> get_free_gps() const {
         return make_index_vector(free_gp_regs);
     }
-    std::vector<int> get_in_use_gps() const {
-        return make_index_vector(in_use_gp);
+    std::vector<int> get_live_gps() const {
+        return make_index_vector(live_gp_);
     }
     std::vector<int> get_preserved_gps() const {
         return make_index_vector(preserved_gp);
@@ -254,10 +254,10 @@ public:
 
     // Returns only in-use registers that are volatile (caller-saved)
     // These MUST be saved by the caller before making a function call
-    std::vector<int> get_in_use_volatile_gps() const {
+    std::vector<int> get_live_volatile_gps() const {
         std::vector<int> result;
         const auto& base_free = base_free_gp();
-        for (int idx : in_use_gp) {
+        for (int idx : live_gp_) {
             if (base_free.count(idx) > 0) {
                 result.push_back(idx);
             }
@@ -267,10 +267,10 @@ public:
 
     // Returns only in-use registers that are preserved (callee-saved)
     // These will be saved by the callee if it uses them
-    std::vector<int> get_in_use_preserved_gps() const {
+    std::vector<int> get_live_preserved_gps() const {
         std::vector<int> result;
         const auto& base_preserved = base_preserved_gp();
-        for (int idx : in_use_gp) {
+        for (int idx : live_gp_) {
             if (base_preserved.count(idx) > 0) {
                 result.push_back(idx);
             }
@@ -281,8 +281,8 @@ public:
     std::vector<int> get_free_vecs() const {
         return make_index_vector(free_vec_regs);
     }
-    std::vector<int> get_in_use_vecs() const {
-        return make_index_vector(in_use_vec);
+    std::vector<int> get_live_vecs() const {
+        return make_index_vector(live_vec_);
     }
     std::vector<int> get_preserved_vecs() const {
         return make_index_vector(preserved_vec);
@@ -293,10 +293,10 @@ public:
     // IMPORTANT for cross-platform code: On Windows, xmm6-xmm15 are preserved (callee-saved),
     // but on Linux/macOS ALL vector registers are volatile (caller-saved).
     // Use this method to write portable code that avoids unnecessary saves on Windows.
-    std::vector<int> get_in_use_volatile_vecs() const {
+    std::vector<int> get_live_volatile_vecs() const {
         std::vector<int> result;
         const auto& base_free = base_free_vec();
-        for (int idx : in_use_vec) {
+        for (int idx : live_vec_) {
             if (base_free.count(idx) > 0) {
                 result.push_back(idx);
             }
@@ -306,10 +306,10 @@ public:
 
     // Returns only in-use vector registers that are preserved (callee-saved)
     // These will be saved by the callee if it uses them
-    std::vector<int> get_in_use_preserved_vecs() const {
+    std::vector<int> get_live_preserved_vecs() const {
         std::vector<int> result;
         const auto& base_preserved = base_preserved_vec();
-        for (int idx : in_use_vec) {
+        for (int idx : live_vec_) {
             if (base_preserved.count(idx) > 0) {
                 result.push_back(idx);
             }
@@ -320,8 +320,8 @@ public:
     std::vector<int> get_free_opmasks() const {
         return make_index_vector(free_opmask_regs);
     }
-    std::vector<int> get_in_use_opmasks() const {
-        return make_index_vector(in_use_opmask);
+    std::vector<int> get_live_opmasks() const {
+        return make_index_vector(live_opmask_);
     }
     std::vector<int> get_preserved_opmasks() const {
         return make_index_vector(preserved_opmask);
@@ -330,8 +330,8 @@ public:
     std::vector<int> get_free_tiles() const {
         return make_index_vector(free_tile_regs);
     }
-    std::vector<int> get_in_use_tiles() const {
-        return make_index_vector(in_use_tile);
+    std::vector<int> get_live_tiles() const {
+        return make_index_vector(live_tile_);
     }
 
     // Returns true if every register allocated with alloc() has been returned with free().
@@ -340,8 +340,8 @@ public:
     // Use this to inspect allocation state programmatically. For a hard stop in debug
     // builds, use assert_all_free() instead.
     bool all_free() const {
-        return in_use_gp.empty() && in_use_vec.empty()
-            && in_use_opmask.empty() && in_use_tile.empty();
+        return live_gp_.empty() && live_vec_.empty()
+            && live_opmask_.empty() && live_tile_.empty();
     }
 
     // Checks that every register allocated with alloc() has been returned with free().
@@ -358,24 +358,24 @@ public:
     // In release builds (NDEBUG defined): compiles to nothing — no check, no overhead.
     void assert_all_free() const {
 #ifndef NDEBUG
-        if (!in_use_gp.empty()) {
+        if (!live_gp_.empty()) {
             fprintf(stderr, "assert_all_free: GP registers still allocated:");
-            for (int idx : in_use_gp) fprintf(stderr, " %d", idx);
+            for (int idx : live_gp_) fprintf(stderr, " %d", idx);
             fprintf(stderr, "\n");
         }
-        if (!in_use_vec.empty()) {
+        if (!live_vec_.empty()) {
             fprintf(stderr, "assert_all_free: Vec registers still allocated:");
-            for (int idx : in_use_vec) fprintf(stderr, " %d", idx);
+            for (int idx : live_vec_) fprintf(stderr, " %d", idx);
             fprintf(stderr, "\n");
         }
-        if (!in_use_opmask.empty()) {
+        if (!live_opmask_.empty()) {
             fprintf(stderr, "assert_all_free: Opmask registers still allocated:");
-            for (int idx : in_use_opmask) fprintf(stderr, " %d", idx);
+            for (int idx : live_opmask_) fprintf(stderr, " %d", idx);
             fprintf(stderr, "\n");
         }
-        if (!in_use_tile.empty()) {
+        if (!live_tile_.empty()) {
             fprintf(stderr, "assert_all_free: Tile registers still allocated:");
-            for (int idx : in_use_tile) fprintf(stderr, " %d", idx);
+            for (int idx : live_tile_) fprintf(stderr, " %d", idx);
             fprintf(stderr, "\n");
         }
         assert(all_free() && "assert_all_free: registers are still allocated — missing free() call(s)");
@@ -448,7 +448,7 @@ public:
     //
     // The register must not be currently allocated. Reserving an already-in-use register,
     // or calling mark_unavailable() twice on the same register, throws Xbyak::Error.
-    // Reserved registers are not visible to get_in_use_gps() / get_in_use_vecs() etc.
+    // Reserved registers are not visible to get_live_gps() / get_live_vecs() etc.
     // Call mark_available() to return the register to the normal allocation pool.
     //
     // Named-register and index-based overloads are both available:
@@ -512,7 +512,7 @@ public:
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
         const bool in_free = free_gp_regs.count(idx) != 0;
         const bool in_preserved = preserved_gp.count(idx) != 0;
-        const bool in_use = in_use_gp.count(idx) != 0;
+        const bool in_use = live_gp_.count(idx) != 0;
         if (in_free || in_preserved || in_use)
             XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         free_gp_regs.insert(idx);
@@ -760,14 +760,14 @@ public:
     // Cleared: all in-use, reserved, and spilled registers; prologue history;
     // stack tracking.
     void reset() {
-        in_use_gp.clear();
+        live_gp_.clear();
         free_gp_regs = base_free_gp();
         preserved_gp = base_preserved_gp();
         if (has_apx_) {
             for (int i = 16; i <= 31; ++i)
                 free_gp_regs.insert(i);
         }
-        in_use_vec.clear();
+        live_vec_.clear();
         if (has_vec_base_) {
             free_vec_regs = base_free_vec();
             preserved_vec = base_preserved_vec();
@@ -779,10 +779,10 @@ public:
             for (int i = 16; i <= 31; ++i)
                 free_vec_regs.insert(i);
         }
-        in_use_opmask.clear();
+        live_opmask_.clear();
         free_opmask_regs = base_free_opmask();
         preserved_opmask = base_preserved_opmask();
-        in_use_tile.clear();
+        live_tile_.clear();
         free_tile_regs.clear();
         if (has_amx_) {
             for (int i = 0; i <= 7; ++i)
@@ -898,10 +898,10 @@ public:
     void spill(const Reg64 &reg) {
         if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
         const int idx = reg.getIdx();
-        if (!in_use_gp.count(idx)) XBYAK_THROW(ERR_RM_SPILL_NOT_IN_USE)
+        if (!live_gp_.count(idx)) XBYAK_THROW(ERR_RM_SPILL_NOT_IN_USE)
         cg_->push(Reg64(idx));
         ++managed_push_count_;
-        in_use_gp.erase(idx);
+        live_gp_.erase(idx);
         free_gp_regs.insert(idx);
         spill_stack_gp_.push_back(idx);
     }
@@ -920,7 +920,7 @@ public:
         cg_->pop(Reg64(idx));
         --managed_push_count_;
         free_gp_regs.erase(idx);
-        in_use_gp.insert(idx);
+        live_gp_.insert(idx);
         return Reg64(idx);
     }
 
@@ -936,7 +936,7 @@ public:
         cg_->pop(Reg64(idx));
         --managed_push_count_;
         free_gp_regs.erase(idx);
-        in_use_gp.insert(idx);
+        live_gp_.insert(idx);
     }
 
     // Restores multiple spilled registers in reverse spill order.
@@ -984,7 +984,7 @@ private:
     void reserve_reg_gp(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (in_use_gp.count(idx))   XBYAK_THROW(ERR_RM_GP_IN_USE)
+        if (live_gp_.count(idx))   XBYAK_THROW(ERR_RM_GP_IN_USE)
         if (reserved_gp.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         // Remove from whichever pool currently holds it.
         if (!free_gp_regs.erase(idx) && !preserved_gp.erase(idx))
@@ -1008,7 +1008,7 @@ private:
     void reserve_reg_vec(int idx) {
         if (idx < 0 || idx > max_vec_reg_idx_)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (in_use_vec.count(idx))   XBYAK_THROW(ERR_RM_VEC_IN_USE)
+        if (live_vec_.count(idx))   XBYAK_THROW(ERR_RM_VEC_IN_USE)
         if (reserved_vec.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         if (!free_vec_regs.erase(idx) && !preserved_vec.erase(idx))
             XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
@@ -1029,7 +1029,7 @@ private:
     void reserve_reg_opmask(int idx) {
         if (idx < 0 || idx > 7)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (in_use_opmask.count(idx))   XBYAK_THROW(ERR_RM_OPMASK_IN_USE)
+        if (live_opmask_.count(idx))   XBYAK_THROW(ERR_RM_OPMASK_IN_USE)
         if (reserved_opmask.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         if (!free_opmask_regs.erase(idx) && !preserved_opmask.erase(idx))
             XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
@@ -1048,7 +1048,7 @@ private:
     void reserve_reg_tile(int idx) {
         if (idx < 0 || idx > 7)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (in_use_tile.count(idx))    XBYAK_THROW(ERR_RM_TILE_IN_USE)
+        if (live_tile_.count(idx))    XBYAK_THROW(ERR_RM_TILE_IN_USE)
         if (reserved_tile.count(idx))  XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         if (!free_tile_regs.erase(idx))
             XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
@@ -1077,19 +1077,19 @@ private:
             case RegFamily::GP:
                 if (idx < 0 || idx > max_gp_reg_idx_)
                     XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
-                return in_use_gp.find(idx) != in_use_gp.end();
+                return live_gp_.find(idx) != live_gp_.end();
             case RegFamily::Vec:
                 if (idx < 0 || idx > max_vec_reg_idx_)
                     XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
-                return in_use_vec.find(idx) != in_use_vec.end();
+                return live_vec_.find(idx) != live_vec_.end();
             case RegFamily::Opmask:
                 if (idx < 0 || idx > 7)
                     XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
-                return in_use_opmask.find(idx) != in_use_opmask.end();
+                return live_opmask_.find(idx) != live_opmask_.end();
             case RegFamily::Tile:
                 if (idx < 0 || idx > 7)
                     XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
-                return in_use_tile.find(idx) != in_use_tile.end();
+                return live_tile_.find(idx) != live_tile_.end();
             default: XBYAK_THROW_RET(ERR_INTERNAL, false)
         }
     }
@@ -1122,10 +1122,10 @@ private:
         auto it = free_gp_regs.find(idx);
         auto pres_it = preserved_gp.find(idx);
         if (it != free_gp_regs.end()) {
-            in_use_gp.insert(idx);
+            live_gp_.insert(idx);
             free_gp_regs.erase(it);
         } else if (pres_it != preserved_gp.end()) {
-            in_use_gp.insert(idx);
+            live_gp_.insert(idx);
             preserved_gp.erase(pres_it);
             allocated_preserved_gp_.push_back(idx);
         } else {
@@ -1138,10 +1138,10 @@ private:
         auto it = free_vec_regs.find(idx);
         auto pres_it = preserved_vec.find(idx);
         if (it != free_vec_regs.end()) {
-            in_use_vec.insert(idx);
+            live_vec_.insert(idx);
             free_vec_regs.erase(it);
         } else if (pres_it != preserved_vec.end()) {
-            in_use_vec.insert(idx);
+            live_vec_.insert(idx);
             preserved_vec.erase(pres_it);
             allocated_preserved_vec_.push_back(idx);
         } else {
@@ -1154,10 +1154,10 @@ private:
         auto it = free_opmask_regs.find(idx);
         auto pres_it = preserved_opmask.find(idx);
         if (it != free_opmask_regs.end()) {
-            in_use_opmask.insert(idx);
+            live_opmask_.insert(idx);
             free_opmask_regs.erase(it);
         } else if (pres_it != preserved_opmask.end()) {
-            in_use_opmask.insert(idx);
+            live_opmask_.insert(idx);
             preserved_opmask.erase(pres_it);
         } else {
             XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
@@ -1168,28 +1168,28 @@ private:
     void release_gp(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = in_use_gp.find(idx);
-        if (it == in_use_gp.end())
+        auto it = live_gp_.find(idx);
+        if (it == live_gp_.end())
             XBYAK_THROW(ERR_RM_GP_NOT_IN_USE)
-        in_use_gp.erase(it);
+        live_gp_.erase(it);
         free_gp_regs.insert(idx);
     }
     void release_vec(int idx) {
         if (idx < 0 || idx > max_vec_reg_idx_)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = in_use_vec.find(idx);
-        if (it == in_use_vec.end())
+        auto it = live_vec_.find(idx);
+        if (it == live_vec_.end())
             XBYAK_THROW(ERR_RM_VEC_NOT_IN_USE)
-        in_use_vec.erase(it);
+        live_vec_.erase(it);
         free_vec_regs.insert(idx);
     }
     void release_opmask(int idx) {
         if (idx < 0 || idx > 7)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = in_use_opmask.find(idx);
-        if (it == in_use_opmask.end())
+        auto it = live_opmask_.find(idx);
+        if (it == live_opmask_.end())
             XBYAK_THROW(ERR_RM_OPMASK_NOT_IN_USE)
-        in_use_opmask.erase(it);
+        live_opmask_.erase(it);
         free_opmask_regs.insert(idx);
     }
     void tile_reg(int idx) {
@@ -1197,7 +1197,7 @@ private:
             XBYAK_THROW(ERR_RM_TILE_IN_USE)
         auto it = free_tile_regs.find(idx);
         if (it != free_tile_regs.end()) {
-            in_use_tile.insert(idx);
+            live_tile_.insert(idx);
             free_tile_regs.erase(it);
         } else {
             XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
@@ -1206,10 +1206,10 @@ private:
     void release_tile(int idx) {
         if (idx < 0 || idx > 7)
             XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = in_use_tile.find(idx);
-        if (it == in_use_tile.end())
+        auto it = live_tile_.find(idx);
+        if (it == live_tile_.end())
             XBYAK_THROW(ERR_RM_TILE_NOT_IN_USE)
-        in_use_tile.erase(it);
+        live_tile_.erase(it);
         free_tile_regs.insert(idx);
     }
 
@@ -1242,7 +1242,7 @@ private:
     }
 #endif
 
-    std::set<int> in_use_gp;
+    std::set<int> live_gp_;
     std::set<int> free_gp_regs = base_free_gp();
     std::set<int> preserved_gp = base_preserved_gp();
 
@@ -1276,7 +1276,7 @@ private:
     }
 #endif
 
-    std::set<int> in_use_vec;
+    std::set<int> live_vec_;
     std::set<int> free_vec_regs;              // populated in constructor after XCR0[1:2] check
     std::set<int> preserved_vec;              // populated in constructor after XCR0[1:2] check
 
@@ -1293,7 +1293,7 @@ private:
         return s;
     }
 
-    std::set<int> in_use_opmask;
+    std::set<int> live_opmask_;
     std::set<int> free_opmask_regs = base_free_opmask();
     std::set<int> preserved_opmask = base_preserved_opmask();
 
@@ -1317,7 +1317,7 @@ private:
 
     // AMX tile registers (tmm0-tmm7): no preserved tiles, all caller-saved
     // Pool is empty by default; tmm0-tmm7 are added in constructor if AMX detected
-    std::set<int> in_use_tile;
+    std::set<int> live_tile_;
     std::set<int> free_tile_regs;
 
     // AMX feature support

@@ -22,7 +22,7 @@
  *   functionCallConvention  – ABI convention: parameter passing + non-volatile
  *                             register preservation across a JIT call
  *   realisticKernel         – code-generation using manager for register strategy
- *   dynamicSaveRestore      – dynamic push/pop using get_in_use_gps() to
+ *   dynamicSaveRestore      – dynamic push/pop using get_live_gps() to
  *                             save/restore across a real call
  *   amxSupport              – has_amx() / max_tile_registers() reflect AMX capability
  *   amxTileRegisters        – alloc / free of Tmm (tmm0-tmm7)
@@ -30,9 +30,9 @@
  *   mixedAllocationWithAMX  – mix of GP / Vec / Opmask / AMX in one manager
  *   amxScopedRegisters      – RAII makeScoped auto-free for Tmm
  *   amxRegInUse             – reg_in_use helpers for Tmm
- *   inUseVolatilePreservedGPs – get_in_use_volatile/preserved_gps() correctness
+ *   inUseVolatilePreservedGPs – get_live_volatile/preserved_gps() correctness
  *   volatileGPCallerSave    – JIT caller-saves only volatile GPs around a call
- *   vecVolatilePreserved    – get_in_use_volatile/preserved_vecs() correctness
+ *   vecVolatilePreserved    – get_live_volatile/preserved_vecs() correctness
  *   comprehensiveSaveRestore – multi-family volatile/preserved queries agree with totals
  *
  * Build:
@@ -114,13 +114,13 @@ CYBOZU_TEST_AUTO(basicAllocation)
     auto r2 = rm.alloc<Reg64>();
     auto r3 = rm.alloc<Reg32>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_gps().size(), 3);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(), 3);
 
     rm.free(r1);
     rm.free(r2);
     rm.free(r3);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
 }
 
 // =============================================================================
@@ -197,7 +197,7 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
 
                 rm.free(reg_tmm0);
                 rm.free(reg_tmm1);
-                CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+                CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
             }
 
             // Allocating an already-in-use register by name must throw — the
@@ -212,9 +212,9 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
             rm.free(reg_xmm2); rm.free(reg_ymm3); rm.free(reg_zmm4);
             rm.free(reg_k1);   rm.free(reg_k2);
 
-            CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
-            CYBOZU_TEST_ASSERT(rm.get_in_use_vecs().empty());
-            CYBOZU_TEST_ASSERT(rm.get_in_use_opmasks().empty());
+            CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+            CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
+            CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
         }
     };
     NamedAllocTest t;
@@ -231,11 +231,11 @@ CYBOZU_TEST_AUTO(scopedRegisters)
     {
         auto scoped1 = rm.makeScoped(rm.alloc<Reg64>());
         auto scoped2 = rm.makeScoped(rm.alloc<Reg64>());
-        CYBOZU_TEST_EQUAL((int)rm.get_in_use_gps().size(), 2);
+        CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(), 2);
         // scoped1 and scoped2 are freed here by their destructors.
     }
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
 }
 
 // =============================================================================
@@ -251,7 +251,7 @@ CYBOZU_TEST_AUTO(vectorRegisters)
     auto ymm4 = rm.alloc<Ymm>();
     auto zmm5 = rm.alloc<Zmm>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_vecs().size(), 5);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(), 5);
 
     rm.free(xmm1);
     rm.free(xmm2);
@@ -259,7 +259,7 @@ CYBOZU_TEST_AUTO(vectorRegisters)
     rm.free(ymm4);
     rm.free(zmm5);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
 }
 
 // =============================================================================
@@ -272,7 +272,7 @@ CYBOZU_TEST_AUTO(opmaskRegisters)
     auto k1 = rm.alloc<Opmask>();
     auto k2 = rm.alloc<Opmask>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_opmasks().size(), 2);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 2);
 
     // k0 is reserved ("unmasked" sentinel) – allocated indices must be >= 1.
     CYBOZU_TEST_ASSERT(k1.getIdx() >= 1);
@@ -282,7 +282,7 @@ CYBOZU_TEST_AUTO(opmaskRegisters)
     rm.free(k1);
     rm.free(k2);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_opmasks().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
 }
 
 // =============================================================================
@@ -348,7 +348,7 @@ CYBOZU_TEST_AUTO(registerExhaustion)
     CYBOZU_TEST_EQUAL((int)allocated.size(), rm.max_gp_registers() - 2);
 
     for (auto &r : allocated) rm.free(r);
-    CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
 }
 
 // =============================================================================
@@ -366,17 +366,17 @@ CYBOZU_TEST_AUTO(mixedAllocation)
     auto zmm = rm.alloc<Zmm>();
     auto k   = rm.alloc<Opmask>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_gps().size(),     3);
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_vecs().size(),    3);
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_opmasks().size(), 1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(),     3);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(),    3);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
 
     rm.free(r64);  rm.free(r32);  rm.free(r16);
     rm.free(xmm);  rm.free(ymm);  rm.free(zmm);
     rm.free(k);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
-    CYBOZU_TEST_ASSERT(rm.get_in_use_vecs().empty());
-    CYBOZU_TEST_ASSERT(rm.get_in_use_opmasks().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
 }
 
 // =============================================================================
@@ -741,7 +741,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
         DynamicJit() : CodeGenerator(8192) {}
 
         // Allocate four registers, initialise them.
-        // Use get_in_use_gps() to generate push/pop code, then make a
+        // Use get_live_gps() to generate push/pop code, then make a
         // real call that clobbers volatile registers, verify the sum.
         // Expected result: 100 + 200 + 300 + 400 + 210 (function return).
         void gen_caller_saves_all(RegPoolManager &rm) {
@@ -759,7 +759,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             mov(r1, 100);  mov(r2, 200);  mov(r3, 300);  mov(r4, 400);
 
             // Ask the manager which registers are live — generate save code.
-            auto in_use = rm.get_in_use_gps();
+            auto in_use = rm.get_live_gps();
             for (int idx : in_use) push(Reg64(idx));
 
             // emit_call handles 16-byte alignment and the Win64 shadow space on all
@@ -782,7 +782,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             ret();
         }
 
-        // Use get_in_use_gps() to decide which registers to push/pop.
+        // Use get_live_gps() to decide which registers to push/pop.
         // Expected result: 111 + 222 + 333 + 444 = 1110.
         void gen_loop_based_save_restore(RegPoolManager &rm) {
             std::vector<Reg64> regs;
@@ -794,7 +794,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
 
             // Save every currently in-use GP register.
             std::vector<int> saved;
-            for (int idx : rm.get_in_use_gps()) {
+            for (int idx : rm.get_live_gps()) {
                 if (true) {
                     push(Reg64(idx));
                     saved.push_back(idx);
@@ -847,12 +847,12 @@ CYBOZU_TEST_AUTO(amxSupport)
         // AMX present: 8 tile registers (tmm0-tmm7), free pool starts full.
         CYBOZU_TEST_EQUAL(rm.max_tile_registers(), 8);
         CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
-        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+        CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
     } else {
         // No AMX: pool is empty and max is 0.
         CYBOZU_TEST_EQUAL(rm.max_tile_registers(), 0);
         CYBOZU_TEST_ASSERT(rm.get_free_tiles().empty());
-        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+        CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
     }
 }
 
@@ -874,7 +874,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
     auto t1 = rm.alloc<Tmm>();
     auto t2 = rm.alloc<Tmm>(2);  // allocate specific tile
 
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_tiles().size(), 3);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_tiles().size(), 3);
     CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 5);  // 8 - 3
 
     // Indices must be within the valid AMX range.
@@ -889,7 +889,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
     rm.free(t1);
     rm.free(t2);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
     CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
 
     // Freeing a tile that is not in use must throw.
@@ -921,7 +921,7 @@ CYBOZU_TEST_AUTO(amxTileExhaustion)
     }
 
     for (auto &t : allocated) rm.free(t);
-    CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
 }
 
 // =============================================================================
@@ -935,28 +935,28 @@ CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
     auto xmm = rm.alloc<Xmm>();
     auto k   = rm.alloc<Opmask>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_gps().size(),     1);
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_vecs().size(),    1);
-    CYBOZU_TEST_EQUAL((int)rm.get_in_use_opmasks().size(), 1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(),     1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(),    1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
 
     if (rm.has_amx()) {
         auto t0 = rm.alloc<Tmm>();
         auto t1 = rm.alloc<Tmm>();
-        CYBOZU_TEST_EQUAL((int)rm.get_in_use_tiles().size(), 2);
+        CYBOZU_TEST_EQUAL((int)rm.get_live_tiles().size(), 2);
         rm.free(t0);
         rm.free(t1);
-        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+        CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
     } else {
-        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+        CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
     }
 
     rm.free(r64);
     rm.free(xmm);
     rm.free(k);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_gps().empty());
-    CYBOZU_TEST_ASSERT(rm.get_in_use_vecs().empty());
-    CYBOZU_TEST_ASSERT(rm.get_in_use_opmasks().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
 }
 
 // =============================================================================
@@ -968,18 +968,18 @@ CYBOZU_TEST_AUTO(amxScopedRegisters)
 
     if (!rm.has_amx()) {
         // Nothing to scope without AMX.
-        CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+        CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
         return;
     }
 
     {
         auto s0 = rm.makeScoped(rm.alloc<Tmm>());
         auto s1 = rm.makeScoped(rm.alloc<Tmm>());
-        CYBOZU_TEST_EQUAL((int)rm.get_in_use_tiles().size(), 2);
+        CYBOZU_TEST_EQUAL((int)rm.get_live_tiles().size(), 2);
         // s0 and s1 are freed here by their destructors.
     }
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_tiles().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_tiles().empty());
     CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
 }
 
@@ -1020,9 +1020,9 @@ CYBOZU_TEST_AUTO(inUseVolatilePreservedGPs)
     for (size_t i = 0; i < std::min(size_t(2), preserved_list.size()); ++i)
         preserved_regs.push_back(rm.alloc<Reg64>(preserved_list[i]));
 
-    auto in_use_all      = rm.get_in_use_gps();
-    auto in_use_volatile = rm.get_in_use_volatile_gps();
-    auto in_use_preserved = rm.get_in_use_preserved_gps();
+    auto in_use_all      = rm.get_live_gps();
+    auto in_use_volatile = rm.get_live_volatile_gps();
+    auto in_use_preserved = rm.get_live_preserved_gps();
 
     // Volatile + preserved must equal total in-use.
     CYBOZU_TEST_EQUAL(in_use_volatile.size() + in_use_preserved.size(),
@@ -1049,8 +1049,8 @@ CYBOZU_TEST_AUTO(inUseVolatilePreservedGPs)
     for (auto &r : preserved_regs) rm.free(r);
 
     // After full cleanup both queries must be empty.
-    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_gps().empty());
-    CYBOZU_TEST_ASSERT(rm.get_in_use_preserved_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_volatile_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_preserved_gps().empty());
 }
 
 // =============================================================================
@@ -1061,7 +1061,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
     // Generates a function that:
     //   1. Allocates a mix of volatile and preserved GP registers.
     //   2. Initialises them.
-    //   3. Uses get_in_use_volatile_gps() to save ONLY volatile registers
+    //   3. Uses get_live_volatile_gps() to save ONLY volatile registers
     //      before a real function call (optimal — no unnecessary push/pop).
     //   4. Calls call_function_that_clobbers_registers() (returns 210).
     //   5. Restores only the volatile registers.
@@ -1096,7 +1096,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             if (have_preserved) mov(r4, 400);
 
             // Save ONLY volatile in-use registers.
-            auto volatile_regs = rm.get_in_use_volatile_gps();
+            auto volatile_regs = rm.get_live_volatile_gps();
             for (int idx : volatile_regs) push(Reg64(idx));
 
             // emit_call handles 16-byte alignment and the Win64 shadow space on all
@@ -1152,9 +1152,9 @@ CYBOZU_TEST_AUTO(vecVolatilePreserved)
     for (size_t i = 0; i < std::min(size_t(2), preserved_vec_list.size()); ++i)
         preserved_vecs.push_back(rm.alloc<Xmm>(preserved_vec_list[i]));
 
-    auto all_in_use       = rm.get_in_use_vecs();
-    auto volatile_in_use  = rm.get_in_use_volatile_vecs();
-    auto preserved_in_use = rm.get_in_use_preserved_vecs();
+    auto all_in_use       = rm.get_live_vecs();
+    auto volatile_in_use  = rm.get_live_volatile_vecs();
+    auto preserved_in_use = rm.get_live_preserved_vecs();
 
     // Volatile + preserved must equal total.
     CYBOZU_TEST_EQUAL(volatile_in_use.size() + preserved_in_use.size(),
@@ -1177,8 +1177,8 @@ CYBOZU_TEST_AUTO(vecVolatilePreserved)
     rm.free(xr1);  rm.free(xr2);  rm.free(yr3);
     for (auto &v : preserved_vecs) rm.free(v);
 
-    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_vecs().empty());
-    CYBOZU_TEST_ASSERT(rm.get_in_use_preserved_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_volatile_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_preserved_vecs().empty());
 }
 
 // =============================================================================
@@ -1219,16 +1219,16 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
     auto k2 = rm.alloc<Opmask>();
 
     // Query all families
-    auto gp_volatile   = rm.get_in_use_volatile_gps();
-    auto gp_preserved  = rm.get_in_use_preserved_gps();
-    auto vec_volatile  = rm.get_in_use_volatile_vecs();
-    auto vec_preserved = rm.get_in_use_preserved_vecs();
+    auto gp_volatile   = rm.get_live_volatile_gps();
+    auto gp_preserved  = rm.get_live_preserved_gps();
+    auto vec_volatile  = rm.get_live_volatile_vecs();
+    auto vec_preserved = rm.get_live_preserved_vecs();
 
     // Within each family: volatile + preserved == total in-use.
     CYBOZU_TEST_EQUAL(gp_volatile.size()  + gp_preserved.size(),
-                      rm.get_in_use_gps().size());
+                      rm.get_live_gps().size());
     CYBOZU_TEST_EQUAL(vec_volatile.size() + vec_preserved.size(),
-                      rm.get_in_use_vecs().size());
+                      rm.get_live_vecs().size());
 
     // If a preserved GP was allocated it must appear in gp_preserved.
     if (have_gp_preserved) {
@@ -1654,7 +1654,7 @@ CYBOZU_TEST_AUTO(codeGeneratorComposition)
     // Register allocation still works normally after coupling.
     auto r1 = k.rm_.alloc<Reg64>();
     auto r2 = k.rm_.alloc<Reg64>();
-    CYBOZU_TEST_EQUAL((int)k.rm_.get_in_use_gps().size(), 2);
+    CYBOZU_TEST_EQUAL((int)k.rm_.get_live_gps().size(), 2);
     k.rm_.free(r1);
     k.rm_.free(r2);
     CYBOZU_TEST_ASSERT(k.rm_.all_free());
@@ -1677,7 +1677,7 @@ CYBOZU_TEST_AUTO(codeGeneratorInheritance)
             CYBOZU_TEST_ASSERT(has_code_generator());
             auto r1 = alloc<Reg64>();
             auto r2 = alloc<Reg64>();
-            CYBOZU_TEST_EQUAL((int)get_in_use_gps().size(), 2);
+            CYBOZU_TEST_EQUAL((int)get_live_gps().size(), 2);
             RegPoolManager::free(r1);
             RegPoolManager::free(r2);
             ret();

@@ -72,8 +72,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
   - [ ] 18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented
 - [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
 - [ ] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
-- [ ] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.
-- [ ] 22. Rename `in_use` to `live` in Getter Names
+- [x] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc. *(REJECTED — see §21)*
+- [x] 22. Rename `in_use` to `live` in Getter Names
 
 ---
 
@@ -2282,7 +2282,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 | 18 | `emit_call()` — ABI-correct outgoing calls | 1 new method (+ template overload) | `managed_push_count_` | Yes (§6) |
 | 19 | Stack integrity checks | 4 new methods | None | No |
 | 20 | `save_volatiles()` / `restore_volatiles()` | 2 new methods | `saved_volatile_gp_` vector | Yes |
-| 21 | Pool count queries: `free_gp_count()` etc. | 5 new methods | None | No |
+| 21 | Pool count queries: `free_gp_count()` etc. | 5 new methods | None | No | *(REJECTED)*
 | 22 | Rename `in_use` → `live` in getter names | API rename | None | No |
 
 ### Recommended Implementation Order
@@ -2306,7 +2306,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 16. §14 (in-use volatile/preserved getters)
 17. §16 (manager `reset()`)
 18. §20 (`save_volatiles()` / `restore_volatiles()` — depends on §6; eliminates `extra_pushes` footgun in §18)
-19. §21 (pool count queries — no dependencies, add any time)
+19. §21 (pool count queries) *(REJECTED — see §21)*
 20. §22 (rename `in_use` → `live` — breaking API rename; do after §14 getters are stabilised)
 
 ---
@@ -2532,6 +2532,22 @@ public:
 
 ## 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.
 
+> **REJECTED — Do not implement.**
+>
+> The only scenario where these methods provide value over the existing
+> `get_free_vecs().size()` approach is a branch decision where a count is needed
+> *without* immediately allocating — avoiding the transient `std::vector` heap
+> allocation. In practice this is not a meaningful concern: JIT kernel constructors
+> are called infrequently, and the allocation is O(n) on a set of at most 32
+> elements. More importantly, the pattern that actually appears in real kernels is
+> "check count, then allocate all available registers", which requires calling
+> `get_free_vecs()` anyway to obtain the indices — making the count-only query
+> redundant in the same call sequence. Adding five new methods (`free_gp_count()`,
+> `preserved_gp_count()`, `free_vec_count()`, `free_opmask_count()`,
+> `free_tile_count()`) for this marginal benefit is not justified. Callers should
+> use `(int)rm.get_free_vecs().size()` and equivalents directly.
+> This section is kept for reference only.
+
 ### Motivation
 
 JIT kernel generators frequently need to size themselves based on how many registers
@@ -2605,7 +2621,7 @@ for (auto &z : accumulators) rm.free(z);
 
 ---
 
-## 22. Rename `in_use` to `live` in Getter Names
+## 22. Rename `in_use` to `live` in Getter Names ✅ IMPLEMENTED
 
 ### Motivation
 
