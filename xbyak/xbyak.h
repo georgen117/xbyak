@@ -280,6 +280,7 @@ enum {
 	ERR_RM_SPILL_NOT_IN_USE,
 	ERR_RM_NO_CG,
 	ERR_RM_STACK_FRAME_OFFSET_OOB,
+	ERR_RM_RESTORE_WITHOUT_SAVE,
 	ERR_INTERNAL // Put it at last.
 };
 
@@ -365,6 +366,7 @@ inline const char *ConvertErrorToString(int err)
 		"reg manager: spill called on a register not in use",
 		"reg manager: operation requires a CodeGenerator",
 		"reg manager: stack frame offset out of bounds",
+		"reg manager: restore_volatiles called without a preceding save_volatiles",
 		"internal error"
 	};
 	assert(ERR_INTERNAL + 1 == sizeof(errTbl) / sizeof(*errTbl));

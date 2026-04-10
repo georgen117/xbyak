@@ -53,8 +53,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
   - [ ] 7b. Guard against `spill()` being called while a `StackFrame` is active
 - [x] 8. Stack Frame Management: `StackFrame` RAII Helper *(REVIEW NOTES — see §8)*
   - [ ] 8a. Fix `put_on_stack(RegT &reg)` destructive-free behaviour: remove or rename to make intent obvious
-- [x] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()` *(REVIEW NOTE — see §9)*
-  - [ ] 9a. Add debug assertion: fire if preserved register is promoted by `alloc()` before `emit_prologue()` has been called
+- [x] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
+  - ~~9a. Add debug assertion: fire if preserved register is promoted by `alloc()` before `emit_prologue()` has been called~~ *(REJECTED — see §9)*
 - [x] 10. End-of-JIT Validation: `assert_all_free()`
 - [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
 - [x] 12. Named-Register `alloc()` Overload
@@ -68,10 +68,10 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [ ] 17. Accept External `Xbyak::util::Cpu` Reference
 - [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment) *(REVIEW NOTES — see §18)*
-  - [ ] 18a. Add debug assertion when `rax` is currently allocated at `emit_call()` invocation
-  - [ ] 18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented
+  - [x] 18a. Add debug assertion when `rax` is currently allocated at `emit_call()` invocation
+  - ~~18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented~~ *(REJECTED — see §18)*
 - [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
-- [ ] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
+- [x] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
 - [x] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc. *(REJECTED — see §21)*
 - [x] 22. Rename `in_use` to `live` in Getter Names
 
@@ -637,7 +637,7 @@ restore(spilled);  // emits 3 x pop in reverse order
 - Only `Reg64` is spill-able. `Xmm`/`Ymm`/`Zmm` registers require `vmovdqu`/`vmovaps`
   for save/restore and are addressed separately in the `StackFrame` helper (§8).
 
-> **REVIEW NOTE — GP-Only Limitation and `StackFrame` Interaction**
+> **REVIEW NOTE §7a / §7b — GP-Only Limitation and `StackFrame` Interaction**
 >
 > 1. `spill()` works only for `Reg64`. SIMD-heavy kernels exhaust ZMM registers before
 >    GP registers. `StackFrame` handles vector saves but with a completely different flow
@@ -970,7 +970,7 @@ auto z_tmp = frame.read_from_stack<Zmm>(off_zmm_const); // consistent with alloc
   raw size is not already aligned).
 - The `make_stack_frame()` factory should throw (or assert) if `cg_` is `nullptr`.
 
-> **REVIEW NOTE — `put_on_stack(RegT &reg)` Destroys the Register Variable**
+> **REVIEW NOTE §8a — `put_on_stack(RegT &reg)` Destroys the Register Variable**
 >
 > The non-const overload `put_on_stack(RegT &reg, ptrdiff_t offset)` emits the store
 > **and** calls `rm_.free(reg)`. After the call the developer’s `reg` variable refers to
@@ -1087,7 +1087,7 @@ public:
 - `emit_prologue()` should be idempotent / safe to call multiple times (emit only the
   newly-promoted registers since the last call).
 
-> **REVIEW NOTE — Prologue Timing Cannot Be Enforced**
+> **REVIEW NOTE §9a — Prologue Timing Cannot Be Enforced**
 >
 > `alloc()` silently promotes a preserved register from `preserved_gp` to `in_use_gp`
 > without emitting any code. If any JIT instruction writes to that register *before*
@@ -1097,6 +1097,12 @@ public:
 > enforce the required ordering — remains. A debug-build assertion that fires if a
 > preserved register is promoted by `alloc()` before `emit_prologue()` has ever been
 > called would surface these errors during development.
+>
+> **§9a — REJECTED:** The assertion fires on promotion, not on the first code write to
+> the register. It cannot distinguish the correct pattern (alloc-then-emit_prologue)
+> from the buggy pattern (alloc-write-then-emit_prologue), so it enforces a stylistic
+> rule without protecting against the actual bug. The natural alloc-all-then-emit_prologue
+> pattern is valid and is broken by this assertion.
 
 ---
 
@@ -1697,7 +1703,7 @@ public:
   will not appear in the result — which is the correct behaviour (its value is no
   longer live).
 
-> **REVIEW NOTE — Redundant Getters and Helpers to Remove**
+> **REVIEW NOTE §14a / §14b / §14c / §14d — Redundant Getters and Helpers to Remove**
 >
 > Several methods are redundant by construction and should be removed:
 >
@@ -2239,22 +2245,26 @@ of `emit_call()` is the acceptance criterion for completing §18.
   helper functions and PLT-resolved library symbols whose abs address is known at
   JIT construction time.
 
-> **REVIEW NOTES — `extra_pushes` Is Fragile; `rax` Use Is Unguarded**
+> **REVIEW NOTES §18a / §18b — `extra_pushes` Is Fragile; `rax` Use Is Unguarded**
 >
-> 1. `extra_pushes` exists because the developer may have manually emitted push
+> 1. `emit_call()` loads the function address with `mov rax, func_ptr`. If the
+>    developer has allocated rax and has live data in it, this instruction silently
+>    destroys that data. Since rax is volatile the ABI is not violated, but the
+>    developer’s value is gone with no warning. A debug-build assertion when rax is
+>    currently allocated at the point `emit_call()` is invoked would catch this.
+>
+> 2. `extra_pushes` exists because the developer may have manually emitted push
 >    instructions that the manager did not observe. If the count is wrong by 1, the
 >    stack is silently misaligned and the `call` lands at the wrong address. This is
 >    strictly more dangerous than the current manual approach, which makes the alignment
 >    computation visible. The correct fix is to eliminate the need for `extra_pushes`
 >    entirely by routing all push-generating operations through the manager — which is
->    what `save_volatiles()` (§20) provides. Until that is in place, `extra_pushes`
->    should be prominently documented as a footgun that is easy to miscalculate.
->
-> 2. `emit_call()` loads the function address with `mov rax, func_ptr`. If the
->    developer has allocated rax and has live data in it, this instruction silently
->    destroys that data. Since rax is volatile the ABI is not violated, but the
->    developer’s value is gone with no warning. A debug-build assertion when rax is
->    currently allocated at the point `emit_call()` is invoked would catch this.
+>    what `save_volatiles()` (§20) provides.
+>    **§18b — REJECTED:**
+>    `extra_pushes` cannot be deprecated because raw `CodeGenerator::push()` calls are
+>    always invisible to the manager. `extra_pushes` is a permanent escape hatch. Normal
+>    usage should route all pushes through `spill()`, `emit_prologue()`, or `save_volatiles()`
+>    and pass `extra_pushes=0`. The `extra_pushes` doc comment has been updated to reflect this.
 
 ---
 
@@ -2621,7 +2631,7 @@ for (auto &z : accumulators) rm.free(z);
 
 ---
 
-## 22. Rename `in_use` to `live` in Getter Names ✅ IMPLEMENTED
+## 22. Rename `in_use` to `live` in Getter Names (IMPLEMENTED)
 
 ### Motivation
 

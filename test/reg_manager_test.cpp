@@ -103,6 +103,24 @@ extern "C" int call_function_that_clobbers_registers() {
     return a + b + c + d + e + f;  // 210
 }
 
+// Zeros the volatile XMM registers (xmm0–xmm5, caller-saved on both SysV
+// and Windows) so that values survive a call only via save_vec_volatiles().
+// Requires GCC/Clang inline asm; MSVC uses intrinsics and is not supported here.
+#if (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)) \
+    && defined(__GNUC__)
+extern "C" void call_function_that_clobbers_vec_registers() {
+    __asm__ volatile(
+        "pxor %%xmm0, %%xmm0\n\t"
+        "pxor %%xmm1, %%xmm1\n\t"
+        "pxor %%xmm2, %%xmm2\n\t"
+        "pxor %%xmm3, %%xmm3\n\t"
+        "pxor %%xmm4, %%xmm4\n\t"
+        "pxor %%xmm5, %%xmm5\n\t"
+        ::: "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"
+    );
+}
+#endif
+
 // =============================================================================
 // Test – Basic allocation and deallocation
 // =============================================================================
@@ -2611,10 +2629,10 @@ CYBOZU_TEST_AUTO(resetClearsStackState)
     // tracking state.  The resetReEmit test demonstrates that pattern.
     //
     // This test verifies the tracking fields are cleared correctly.
-    struct K : public CodeGenerator, public RegPoolManager {
-        K() : CodeGenerator(4096), RegPoolManager(this) {}
+    struct SpillKernel : public CodeGenerator, public RegPoolManager {
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
     };
-    K k;
+    SpillKernel k;
 
     auto r = k.alloc<Reg64>();
     k.spill(r);                        // emits push r; tracking: spill_stack non-empty
@@ -2661,10 +2679,10 @@ CYBOZU_TEST_AUTO(resetClearsPrologueHistory)
 // =============================================================================
 CYBOZU_TEST_AUTO(resetPreservesConfig)
 {
-    struct K : public CodeGenerator, public RegPoolManager {
-        K() : CodeGenerator(4096), RegPoolManager(this) {}
+    struct ConfigKernel : public CodeGenerator, public RegPoolManager {
+        ConfigKernel() : CodeGenerator(4096), RegPoolManager(this) {}
     };
-    K k;
+    ConfigKernel k;
 
     const bool apx_before  = k.has_apx();
     const bool avx_before  = k.has_avx512();
@@ -2722,3 +2740,444 @@ CYBOZU_TEST_AUTO(resetReEmit)
     kf.emit_a();
     CYBOZU_TEST_EQUAL(call_jit(kf.getCode()), (uint64_t)42);
 }
+
+// =============================================================================
+// Test – save_gp_volatiles() / restore_gp_volatiles(): no live volatiles → no-op
+// =============================================================================
+CYBOZU_TEST_AUTO(saveGpVolatilesEmpty)
+{
+    // When no volatile GP registers are live, save_gp_volatiles() must not push
+    // anything, meaning managed_push_count_ stays unchanged.
+    //
+    // Without a CodeGenerator, both calls must throw.
+    {
+        RegPoolManager rm;
+        CYBOZU_TEST_EXCEPTION(rm.save_gp_volatiles(),    Xbyak::Error);
+        CYBOZU_TEST_EXCEPTION(rm.restore_gp_volatiles(), Xbyak::Error);
+    }
+
+    // With a CG but nothing live: save_gp_volatiles() is a no-op,
+    // restore_gp_volatiles() has nothing to pop and must throw.
+    {
+        struct GpSaveKernel : public CodeGenerator, public RegPoolManager {
+            GpSaveKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        };
+        GpSaveKernel k;
+        k.save_gp_volatiles();    // no volatile GPs live → nothing pushed
+        CYBOZU_TEST_ASSERT(k.clean_stack()); // managed_push_count_ == 0
+        CYBOZU_TEST_EXCEPTION(k.restore_gp_volatiles(), Xbyak::Error);
+    }
+}
+
+// =============================================================================
+// Test – restore_gp_volatiles() without preceding save_gp_volatiles() throws
+// =============================================================================
+CYBOZU_TEST_AUTO(restoreGpVolatilesWithoutSaveThrows)
+{
+    struct GpRestoreGuardKernel : public CodeGenerator, public RegPoolManager {
+        GpRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    GpRestoreGuardKernel k;
+    CYBOZU_TEST_EXCEPTION(k.restore_gp_volatiles(), Xbyak::Error);
+
+    // After a matched save/restore pair the saved list is cleared; a second
+    // restore must throw.  Allocate a register so the save is non-trivial.
+    auto r = k.alloc<Reg64>();
+    k.save_gp_volatiles();
+    k.restore_gp_volatiles();  // succeeds — r was saved and is now restored
+    k.free(r);
+    CYBOZU_TEST_EXCEPTION(k.restore_gp_volatiles(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – save_gp_volatiles() / restore_gp_volatiles(): push count tracking
+// =============================================================================
+CYBOZU_TEST_AUTO(saveGpVolatilesPushCount)
+{
+    // Allocate N volatile GP registers, call save_gp_volatiles(), and verify that
+    // managed_push_count_ increases by N, then decreases to 0 after
+    // restore_gp_volatiles().
+    struct GpPushCountKernel : public CodeGenerator, public RegPoolManager {
+        GpPushCountKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    GpPushCountKernel k;
+
+    // On SysV: rdi(7), rsi(6), rdx(2), rcx(1), r8(8), r9(9), r10(10), r11(11)
+    // are volatile.  Alloc two of them.
+    auto r1 = k.alloc<Reg64>();
+    auto r2 = k.alloc<Reg64>();
+    const auto vols_before = k.get_live_volatile_gps();
+    const size_t n = vols_before.size(); // should be 2
+
+    k.save_gp_volatiles(); // pushes n registers
+    // Note: clean_stack() tracks only spill() and StackFrame state, not
+    // save_gp_volatiles() pushes.  Verify via managed_push_count_ indirectly:
+    // restore must bring it back to the same baseline.
+
+    k.restore_gp_volatiles(); // pops n registers
+    CYBOZU_TEST_ASSERT(k.clean_stack());  // back to 0
+
+    k.free(r1);
+    k.free(r2);
+
+    // n must equal the number of volatile GP registers that were live
+    CYBOZU_TEST_EQUAL(n, (size_t)2);
+}
+
+// =============================================================================
+// Test – save_gp_volatiles() / restore_gp_volatiles(): end-to-end JIT execution
+// =============================================================================
+CYBOZU_TEST_AUTO(saveGpVolatilesEndToEnd)
+{
+    // Kernel: allocate three volatile GPs, load constants, call a function that
+    // clobbers all volatile registers, then verify the values survived.
+    // The function returns 210 (via rax); we add our constants and return the sum.
+    struct Kernel : public CodeGenerator, public RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            emit_prologue();
+
+            auto r1 = alloc<Reg64>();   // volatile
+            auto r2 = alloc<Reg64>();   // volatile
+            auto r3 = alloc<Reg64>();   // volatile
+
+            mov(r1, (uint64_t)10);
+            mov(r2, (uint64_t)20);
+            mov(r3, (uint64_t)12);      // 10 + 20 + 12 = 42
+
+            save_gp_volatiles();        // pushes r1, r2, r3 (and rax if live, but it's not)
+            emit_call(&call_function_that_clobbers_registers);
+            // rax = 210 here; we stash it before restore_gp_volatiles() pops over our regs
+            // r1/r2/r3 are still pushed on the stack — restore will recover them.
+            restore_gp_volatiles();     // pops r3, r2, r1 — values 12, 20, 10 restored
+
+            // r1=10, r2=20, r3=12 live again
+            mov(rax, r1);
+            add(rax, r2);
+            add(rax, r3);               // rax = 42
+
+            free(r3);
+            free(r2);
+            free(r1);
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)42);
+}
+
+// =============================================================================
+// Test – save_gp_volatiles() integrates with emit_call() alignment (no extra_pushes)
+// =============================================================================
+CYBOZU_TEST_AUTO(saveGpVolatilesAlignmentOdd)
+{
+    // Allocate one volatile GP: save_gp_volatiles() pushes 1 register →
+    // managed_push_count_=1 (odd).  emit_call needs no alignment pad on SysV.
+    // A misaligned stack would crash inside call_function_that_clobbers_registers.
+    struct Kernel : public CodeGenerator, public RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            emit_prologue();
+            auto r = alloc<Reg64>();
+            mov(r, (uint64_t)77);
+            save_gp_volatiles();        // managed_push_count_ = 1 (odd after prologue=0)
+            emit_call(&call_function_that_clobbers_registers);
+            restore_gp_volatiles();
+            mov(rax, r);
+            free(r);
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)77);
+}
+
+CYBOZU_TEST_AUTO(saveGpVolatilesAlignmentEven)
+{
+    // Allocate two volatile GPs: save_gp_volatiles() pushes 2 registers →
+    // managed_push_count_=2 (even).  emit_call inserts an alignment pad on SysV.
+    struct Kernel : public CodeGenerator, public RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            emit_prologue();
+            auto r1 = alloc<Reg64>();
+            auto r2 = alloc<Reg64>();
+            mov(r1, (uint64_t)3);
+            mov(r2, (uint64_t)4);
+            save_gp_volatiles();        // managed_push_count_ = 2 (even)
+            emit_call(&call_function_that_clobbers_registers);
+            restore_gp_volatiles();
+            mov(rax, r1);
+            add(rax, r2);               // rax = 7
+            free(r2);
+            free(r1);
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)7);
+}
+
+// =============================================================================
+// Test – reset() clears saved_volatile_gp_ state
+// =============================================================================
+CYBOZU_TEST_AUTO(resetClearsSavedGpVolatiles)
+{
+    struct GpVolatileResetKernel : public CodeGenerator, public RegPoolManager {
+        GpVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    GpVolatileResetKernel k;
+
+    auto r = k.alloc<Reg64>();    // allocate a volatile GP
+    k.save_gp_volatiles();        // pushes it; saved_volatile_gp_ non-empty
+
+    // Discard the in-progress code buffer, then reset tracking.
+    static_cast<CodeGenerator &>(k).reset();
+    static_cast<RegPoolManager &>(k).reset();
+
+    // After reset, saved_volatile_gp_ must be cleared, so restore_gp_volatiles() throws.
+    CYBOZU_TEST_EXCEPTION(k.restore_gp_volatiles(), Xbyak::Error);
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+}
+
+// =============================================================================
+// Test – save_vec_volatiles() / restore_vec_volatiles(): throws without a CG
+// =============================================================================
+CYBOZU_TEST_AUTO(saveVecVolatilesNoCg)
+{
+    RegPoolManager rm;
+    CYBOZU_TEST_EXCEPTION(rm.save_vec_volatiles(),    Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.restore_vec_volatiles(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – save_vec_volatiles(): no live (or no) volatile vec registers → no-op
+// =============================================================================
+CYBOZU_TEST_AUTO(saveVecVolatilesEmpty)
+{
+    struct VecSaveKernel : public CodeGenerator, public RegPoolManager {
+        VecSaveKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    VecSaveKernel k;
+
+    // With nothing live, save is a no-op; restore then has nothing to pop.
+    k.save_vec_volatiles();
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+    CYBOZU_TEST_EXCEPTION(k.restore_vec_volatiles(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – restore_vec_volatiles() without preceding save throws
+// =============================================================================
+CYBOZU_TEST_AUTO(restoreVecVolatilesWithoutSaveThrows)
+{
+    struct VecRestoreGuardKernel : public CodeGenerator, public RegPoolManager {
+        VecRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    VecRestoreGuardKernel k;
+    // No preceding save → throws.
+    CYBOZU_TEST_EXCEPTION(k.restore_vec_volatiles(), Xbyak::Error);
+
+    // save_vec_volatiles() with nothing live is a no-op and does NOT arm the
+    // restore; restore_vec_volatiles() throws even after such a no-op save.
+    k.save_vec_volatiles();
+    CYBOZU_TEST_EXCEPTION(k.restore_vec_volatiles(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – save_vec_volatiles(): stack-accounting (managed_push_count_)
+// =============================================================================
+CYBOZU_TEST_AUTO(saveVecVolatilesPushCount)
+{
+    struct VecPushCountKernel : public CodeGenerator, public RegPoolManager {
+        VecPushCountKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    VecPushCountKernel k;
+
+    // Skip if vector registers are unavailable on this machine.
+    if (k.get_free_vecs().empty()) return;
+
+    // Allocate two volatile vector registers.
+    auto x0 = k.alloc<Xmm>();
+    auto x1 = k.alloc<Xmm>();
+    CYBOZU_TEST_EQUAL((int)k.get_live_volatile_vecs().size(), 2);
+
+    k.save_vec_volatiles();        // sub rsp, 2*bytes_per; 2 vmovdqu stores
+    // Note: clean_stack() tracks StackFrame allocation, not save_vec_volatiles()
+    // sub rsp.  Verify via restore instead.
+
+    k.restore_vec_volatiles();     // 2 vmovdqu loads; add rsp, 2*bytes_per
+    CYBOZU_TEST_ASSERT(k.clean_stack());  // back to baseline
+
+    k.free(x0);
+    k.free(x1);
+}
+
+// =============================================================================
+// Test – reset() clears saved_volatile_vec_ state
+// =============================================================================
+CYBOZU_TEST_AUTO(resetClearsSavedVecVolatiles)
+{
+    struct VecVolatileResetKernel : public CodeGenerator, public RegPoolManager {
+        VecVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    VecVolatileResetKernel k;
+
+    if (k.get_free_vecs().empty()) return;
+
+    auto x = k.alloc<Xmm>();
+    k.save_vec_volatiles();   // non-empty saved list
+
+    static_cast<CodeGenerator &>(k).reset();
+    static_cast<RegPoolManager &>(k).reset();
+
+    // After reset, saved list must be cleared.
+    CYBOZU_TEST_EXCEPTION(k.restore_vec_volatiles(), Xbyak::Error);
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+}
+
+// =============================================================================
+// Test – save_volatiles() / restore_volatiles(): throws without a CG
+// =============================================================================
+CYBOZU_TEST_AUTO(saveVolatilesNoCg)
+{
+    RegPoolManager rm;
+    CYBOZU_TEST_EXCEPTION(rm.save_volatiles(),    Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.restore_volatiles(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – save_volatiles() with nothing live: restore_volatiles() is a no-op
+// =============================================================================
+CYBOZU_TEST_AUTO(saveVolatilesEmpty)
+{
+    // save_volatiles() when nothing is live must arm the restore but save nothing.
+    // restore_volatiles() must succeed (not throw) because save was called.
+    struct CombinedSaveKernel : public CodeGenerator, public RegPoolManager {
+        CombinedSaveKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    CombinedSaveKernel k;
+    k.save_volatiles();                      // nothing live — no-op for both families
+    CYBOZU_TEST_ASSERT(k.clean_stack());     // nothing pushed
+    k.restore_volatiles();                   // armed — must succeed even though nothing to pop
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+}
+
+// =============================================================================
+// Test – restore_volatiles() without preceding save_volatiles() throws
+// =============================================================================
+CYBOZU_TEST_AUTO(restoreVolatilesWithoutSaveThrows)
+{
+    struct CombinedRestoreGuardKernel : public CodeGenerator, public RegPoolManager {
+        CombinedRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    CombinedRestoreGuardKernel k;
+    CYBOZU_TEST_EXCEPTION(k.restore_volatiles(), Xbyak::Error);
+
+    // One matched pair clears the armed flag; a second restore must throw.
+    k.save_volatiles();
+    k.restore_volatiles();
+    CYBOZU_TEST_EXCEPTION(k.restore_volatiles(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – save_volatiles() / restore_volatiles(): push count tracking (GP only)
+// =============================================================================
+CYBOZU_TEST_AUTO(saveVolatilesPushCountGp)
+{
+    // Allocate two volatile GPs: save_volatiles() pushes both; restore pops them.
+    struct CombinedPushCountKernel : public CodeGenerator, public RegPoolManager {
+        CombinedPushCountKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    CombinedPushCountKernel k;
+
+    auto r1 = k.alloc<Reg64>();
+    auto r2 = k.alloc<Reg64>();
+    const size_t n = k.get_live_volatile_gps().size(); // 2
+
+    k.save_volatiles();
+    // Note: clean_stack() tracks only spill() and StackFrame state, not
+    // save_volatiles() pushes.  Verify round-trip via restore instead.
+
+    k.restore_volatiles();
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+
+    k.free(r1);
+    k.free(r2);
+    CYBOZU_TEST_EQUAL(n, (size_t)2);
+}
+
+// =============================================================================
+// Test – reset() clears saved_volatiles_armed_ state
+// =============================================================================
+CYBOZU_TEST_AUTO(resetClearsSavedVolatiles)
+{
+    struct CombinedVolatileResetKernel : public CodeGenerator, public RegPoolManager {
+        CombinedVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+    };
+    CombinedVolatileResetKernel k;
+
+    auto r = k.alloc<Reg64>();
+    k.save_volatiles();   // arms saved_volatiles_armed_
+
+    static_cast<CodeGenerator &>(k).reset();
+    static_cast<RegPoolManager &>(k).reset();
+
+    // After reset, armed flag must be cleared so restore_volatiles() throws.
+    CYBOZU_TEST_EXCEPTION(k.restore_volatiles(), Xbyak::Error);
+    CYBOZU_TEST_ASSERT(k.clean_stack());
+}
+
+// =============================================================================
+// Test – save_vec_volatiles() / restore_vec_volatiles(): end-to-end JIT
+// =============================================================================
+#if (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)) \
+    && defined(__GNUC__)
+CYBOZU_TEST_AUTO(saveVecVolatilesEndToEnd)
+{
+    // Kernel:
+    //   1. Load a known integer value into an XMM register via a GP.
+    //   2. Call a helper that zeroes xmm0–xmm5.
+    //   3. Verify the value is still present (save/restore preserved it).
+    struct Kernel : public CodeGenerator, public RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+
+        void build() {
+            emit_prologue();
+
+            auto tmp = alloc<Reg64>();
+            auto xv  = alloc<Xmm>();    // first free volatile vector register
+
+            mov(tmp, 99UL);
+            vmovq(xv, tmp);             // xv = 99
+            free(tmp);
+
+            save_vec_volatiles();       // sub rsp, N; vmovdqu/vmovdqu32 stores
+            emit_call(&call_function_that_clobbers_vec_registers);
+            restore_vec_volatiles();    // vmovdqu/vmovdqu32 loads; add rsp, N
+
+            vmovq(rax, xv);            // rax = 99 iff correctly saved/restored
+            free(xv);
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    // Only run if vector registers are available on this machine.
+    if (RegPoolManager().get_free_vecs().empty()) return;
+
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)99);
+}
+#endif

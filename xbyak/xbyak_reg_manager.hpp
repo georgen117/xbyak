@@ -793,6 +793,10 @@ public:
         reserved_opmask.clear();
         reserved_tile.clear();
         spill_stack_gp_.clear();
+        saved_volatile_gp_.clear();
+        saved_volatile_vec_.clear();
+        saved_volatile_vec_bytes_ = 0;
+        saved_volatiles_armed_ = false;
         allocated_preserved_gp_.clear();
         allocated_preserved_vec_.clear();
         prologue_gp_cursor_ = 0;
@@ -861,14 +865,33 @@ public:
     // space requirement automatically.
     //
     // func_ptr     — address of the target function.
-    // extra_pushes — number of manual push instructions emitted since JIT
-    //                function entry that the manager has not tracked (e.g.
-    //                push(rbx) to stash a return value, or one push per
-    //                volatile register saved in a caller-save loop).  Default 0.
+    // extra_pushes — escape hatch for push instructions emitted directly via
+    //                CodeGenerator that the manager has not tracked (e.g. a raw
+    //                push(rbx) to stash a return value).  Default 0.
+    //                Normal usage should route all pushes through spill(),
+    //                emit_prologue(), or save_volatiles(), in which case
+    //                extra_pushes is always 0.
+    //
+    // Return-value note: emit_call() uses rax internally (mov rax, func_ptr;
+    //                call rax).  If rax is currently allocated, its value will
+    //                be destroyed.  Use save_volatiles() before the call and
+    //                stash the return value (mov preserved_reg, rax) before
+    //                calling restore_volatiles().
+    //
+    // In debug builds (NDEBUG not defined): asserts that rax is not currently
+    //                allocated and prints a diagnostic to stderr if it is.
     //
     // Throws Xbyak::Error if no CodeGenerator has been provided.
     void emit_call(uint64_t func_ptr, size_t extra_pushes = 0) {
         if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+#ifndef NDEBUG
+        if (live_gp_.count(0)) {
+            fprintf(stderr,
+                    "emit_call: rax (index 0) is currently allocated — its value will be "
+                    "destroyed by the call. Save it with save_volatiles() before calling.\n");
+            assert(!live_gp_.count(0) && "emit_call: rax is live and will be clobbered");
+        }
+#endif
         const size_t total_pushes = managed_push_count_ + extra_pushes;
         const bool needs_pad = (total_pushes % 2) == 0;
 #ifdef _WIN32
@@ -959,6 +982,131 @@ public:
     // on Linux and macOS where all vector registers are caller-saved.
     std::vector<int> get_allocated_preserved_vecs() const {
         return allocated_preserved_vec_;
+    }
+
+    // Pushes every currently live volatile GP register onto the hardware stack,
+    // in index order, and records them so restore_gp_volatiles() can reverse the
+    // sequence.  managed_push_count_ is incremented accordingly, keeping
+    // emit_call() alignment correct with no extra bookkeeping on your part.
+    //
+    // Pair each call with exactly one restore_gp_volatiles().  Nested calls are
+    // not supported.
+    //
+    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    void save_gp_volatiles() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        saved_volatile_gp_.clear();
+        const std::vector<int> vols = get_live_volatile_gps();
+        for (int idx : vols) {
+            cg_->push(Reg64(idx));
+            ++managed_push_count_;
+            saved_volatile_gp_.push_back(idx);
+        }
+    }
+
+    // Pops the registers saved by the most recent save_gp_volatiles() in reverse
+    // order, restoring their values.  managed_push_count_ is decremented to
+    // match.
+    //
+    // Throws Xbyak::Error if called without a preceding save_gp_volatiles(),
+    // or if no CodeGenerator has been provided.
+    void restore_gp_volatiles() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (saved_volatile_gp_.empty()) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
+        for (int i = (int)saved_volatile_gp_.size() - 1; i >= 0; --i) {
+            cg_->pop(Reg64(saved_volatile_gp_[i]));
+            --managed_push_count_;
+        }
+        saved_volatile_gp_.clear();
+    }
+
+    // Saves every currently live volatile vector register to the stack using
+    // vmovdqu/vmovdqu32 and records them so restore_vec_volatiles() can reverse
+    // the sequence.  managed_push_count_ is updated accordingly, keeping
+    // emit_call() alignment correct with no extra bookkeeping on your part.
+    //
+    // On Windows (x64): only xmm0–xmm5 are volatile; xmm6–xmm15 are
+    // callee-saved and handled by emit_prologue()/emit_epilogue().
+    // On Linux/macOS: all vector registers are volatile.
+    //
+    // When AVX-512 is available, each register is saved at ZMM width (64
+    // bytes), preserving the full 512-bit state.  Otherwise each register is
+    // saved at YMM width (32 bytes), preserving both the XMM and upper-XMM
+    // (YMM) state.
+    //
+    // Pair each call with exactly one restore_vec_volatiles().  Nested calls
+    // are not supported.
+    //
+    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    void save_vec_volatiles() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        saved_volatile_vec_.clear();
+        const std::vector<int> vols = get_live_volatile_vecs();
+        if (vols.empty()) return;
+        const int bytes_per = has_avx512_ ? 64 : 32;
+        const int total     = (int)vols.size() * bytes_per;
+        cg_->sub(cg_->rsp, total);
+        managed_push_count_ += total / 8;
+        for (int i = 0; i < (int)vols.size(); ++i) {
+            if (has_avx512_)
+                cg_->vmovdqu32(cg_->ptr[cg_->rsp + i * 64], Zmm(vols[i]));
+            else
+                cg_->vmovdqu(cg_->ptr[cg_->rsp + i * 32], Ymm(vols[i]));
+        }
+        saved_volatile_vec_ = vols;
+        saved_volatile_vec_bytes_ = total;
+    }
+
+    // Restores the vector registers saved by the most recent save_vec_volatiles()
+    // in the same slot order and reclaims the stack space.  managed_push_count_
+    // is decremented to match.
+    //
+    // Throws Xbyak::Error if called without a preceding save_vec_volatiles(),
+    // or if no CodeGenerator has been provided.
+    void restore_vec_volatiles() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (saved_volatile_vec_.empty()) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
+        const int bytes_per = has_avx512_ ? 64 : 32;
+        for (int i = 0; i < (int)saved_volatile_vec_.size(); ++i) {
+            if (has_avx512_)
+                cg_->vmovdqu32(Zmm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * 64]);
+            else
+                cg_->vmovdqu(Ymm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * 32]);
+        }
+        cg_->add(cg_->rsp, saved_volatile_vec_bytes_);
+        managed_push_count_ -= saved_volatile_vec_bytes_ / 8;
+        saved_volatile_vec_.clear();
+        saved_volatile_vec_bytes_ = 0;
+    }
+
+    // Saves all currently live volatile GP and vector registers in one call.
+    // Calls save_gp_volatiles() followed by save_vec_volatiles() and arms the
+    // paired restore.  Pair with restore_volatiles().
+    //
+    // Unlike the individual save_gp_volatiles() / save_vec_volatiles(), the
+    // matching restore_volatiles() does not throw when nothing was saved (i.e.
+    // all volatile registers happen to be free at the call site).
+    //
+    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    void save_volatiles() {
+        save_gp_volatiles();
+        save_vec_volatiles();
+        saved_volatiles_armed_ = true;
+    }
+
+    // Restores all registers saved by the most recent save_volatiles().
+    // Restores vector registers first (they were pushed via sub rsp last),
+    // then GP registers, maintaining correct LIFO stack order.
+    //
+    // Safe to call when save_volatiles() saved nothing.  Throws Xbyak::Error
+    // if called without a preceding save_volatiles(), or if no CodeGenerator
+    // has been provided.
+    void restore_volatiles() {
+        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (!saved_volatiles_armed_) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
+        saved_volatiles_armed_ = false;
+        if (!saved_volatile_vec_.empty()) restore_vec_volatiles();
+        if (!saved_volatile_gp_.empty())  restore_gp_volatiles();
     }
 
     // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
@@ -1344,6 +1492,19 @@ private:
     // LIFO stack of GP register indices currently pushed onto the hardware stack
     // by spill().  restore() pops entries from the back in reverse order.
     std::vector<int> spill_stack_gp_;
+
+    // GP register indices pushed by the most recent save_gp_volatiles(), in push
+    // order.  restore_gp_volatiles() pops them in reverse.
+    std::vector<int> saved_volatile_gp_;
+
+    // Vector register indices stored by the most recent save_vec_volatiles(),
+    // in save order.  restore_vec_volatiles() reloads from the same slots.
+    std::vector<int> saved_volatile_vec_;
+    int saved_volatile_vec_bytes_ = 0;
+
+    // Armed by save_volatiles() (combined); cleared by restore_volatiles() (combined).
+    // Distinguishes a correct restore_volatiles() call from one with no preceding save.
+    bool saved_volatiles_armed_ = false;
 
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.
