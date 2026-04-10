@@ -16,6 +16,7 @@
 #ifndef CPU_X64_XBYAK_REG_MANAGER_HPP
 #define CPU_X64_XBYAK_REG_MANAGER_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <set>
 #include <vector>
@@ -326,24 +327,10 @@ public:
         return make_index_vector(preserved_opmask);
     }
 
-    // Returns in-use opmask registers (all opmasks are volatile/caller-saved)
-    // These MUST be saved by the caller before making a function call
-    // Note: All opmask registers are caller-saved on both Windows and Linux
-    std::vector<int> get_in_use_volatile_opmasks() const {
-        return make_index_vector(in_use_opmask);
-    }
-
     std::vector<int> get_free_tiles() const {
         return make_index_vector(free_tile_regs);
     }
     std::vector<int> get_in_use_tiles() const {
-        return make_index_vector(in_use_tile);
-    }
-
-    // Returns in-use AMX tile registers (all tiles are volatile/caller-saved)
-    // These MUST be saved by the caller before making a function call
-    // Note: All AMX tile registers are caller-saved on both Windows and Linux
-    std::vector<int> get_in_use_volatile_tiles() const {
         return make_index_vector(in_use_tile);
     }
 
@@ -535,20 +522,6 @@ public:
     template <class RegT>
     bool reg_in_use(const RegT &reg) const {
         return reg_in_use_idx(reg.getIdx(), reg_family<RegT>::value);
-    }
-
-    // helper functions - returns true if an index in a given family is in use
-    bool gp_idx_in_use(int reg_idx) const {
-        return reg_in_use_idx(reg_idx, RegFamily::GP);
-    }
-    bool vec_idx_in_use(int reg_idx) const {
-        return reg_in_use_idx(reg_idx, RegFamily::Vec);
-    }
-    bool opmask_idx_in_use(int reg_idx) const {
-        return reg_in_use_idx(reg_idx, RegFamily::Opmask);
-    }
-    bool tile_idx_in_use(int reg_idx) const {
-        return reg_in_use_idx(reg_idx, RegFamily::Tile);
     }
 
     // scoped register handling with RAII

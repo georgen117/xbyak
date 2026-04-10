@@ -37,12 +37,13 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 19. [Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`](#19-stack-integrity-checks)
 20. [Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`](#20-saverestore-live-volatile-registers-savevolatiles--restorevolatiles)
 21. [Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.](#21-pool-count-queries-free_gp_count-free_vec_count-etc)
+22. [Rename `in_use` to `live` in Getter Names](#22-rename-in_use-to-live-in-getter-names)
 ---
 
 ## Implementation Status
 
 - [x] 1. Bug Fix: XCR0 Operator Precedence
-- [ ] 2. Performance: Replace `std::set` with Bitmask Pools
+- [x] 2. Performance: Replace `std::set` with Bitmask Pools *(REJECTED — see §2)*
 - [x] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
 - [x] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
 - [x] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
@@ -59,9 +60,9 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 12. Named-Register `alloc()` Overload
 - [x] 13. Remove `used_*` Sets
 - [x] 14. In-Use Volatile / Preserved Getters *(REVIEW NOTE — see §14)*
-  - [ ] 14a. Remove `get_in_use_volatile_opmasks()` (identical to `get_in_use_opmasks()`)
-  - [ ] 14b. Remove `get_in_use_volatile_tiles()` (identical to `get_in_use_tiles()`)
-  - [ ] 14c. Remove per-family index helpers: `gp_idx_in_use()`, `vec_idx_in_use()`, `opmask_idx_in_use()`, `tile_idx_in_use()`
+  - [x] 14a. Remove `get_in_use_volatile_opmasks()` (identical to `get_in_use_opmasks()`)
+  - [x] 14b. Remove `get_in_use_volatile_tiles()` (identical to `get_in_use_tiles()`)
+  - [x] 14c. Remove per-family index helpers: `gp_idx_in_use()`, `vec_idx_in_use()`, `opmask_idx_in_use()`, `tile_idx_in_use()`
   - [ ] 14d. Remove `_stack_pointer()`, `_base_pointer()`, `_opmask_k0()` helpers
 - [x] 15. ABI Configuration: Windows x64 vs SysV *(REJECTED — see §15)*
 - [x] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
@@ -72,6 +73,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
 - [ ] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
 - [ ] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.
+- [ ] 22. Rename `in_use` to `live` in Getter Names
 
 ---
 
@@ -113,6 +115,15 @@ No API change. No new data members.
 ---
 
 ## 2. Performance: Replace `std::set` with Bitmask Pools
+
+> **REJECTED — Do not implement.**
+>
+> For small, fixed pool sizes (n ≤ 32) O(1) and O(log n) are practically
+> indistinguishable in wall-clock time. Replacing `std::set` with bitmasks would also
+> introduce non-standard compiler built-ins (`__builtin_ctz`, `_BitScanForward`),
+> reducing portability. Retaining `std::set`-based containers keeps the implementation
+> maximally compatible with standard C++. This optimisation may be revisited in the
+> future if profiling identifies the pools as a genuine bottleneck.
 
 ### Motivation
 
@@ -2252,7 +2263,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 | # | Change | API Impact | New Data Members | Requires §6 |
 |---|---|---|---|---|
 | 1 | XCR0 precedence fix | None (bug fix) | None | No |
-| 2 | Bitmask pools | None (internal) | `uint32_t` bitmasks | No |
+| 2 | Bitmask pools | None (internal) | `uint32_t` bitmasks | No | *(REJECTED)*
 | 3 | `add_to_vec/opmask_pool()` | 4 new methods | None | No |
 | 4 | `mark_unavailable/available()` | 4 new methods | 3 `reserved_*` sets | No |
 | 5 | `pin()` / `alloc_pinned()` | 6 new methods | 3 `pinned_*` sets | No |
@@ -2272,6 +2283,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 | 19 | Stack integrity checks | 4 new methods | None | No |
 | 20 | `save_volatiles()` / `restore_volatiles()` | 2 new methods | `saved_volatile_gp_` vector | Yes |
 | 21 | Pool count queries: `free_gp_count()` etc. | 5 new methods | None | No |
+| 22 | Rename `in_use` → `live` in getter names | API rename | None | No |
 
 ### Recommended Implementation Order
 
@@ -2286,7 +2298,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 9. §18 (`emit_call()` — builds directly on §6 + §9; removes all `#ifdef _WIN32` shadow-space blocks from tests once implemented)
 10. §7 (spill/restore — builds on §9 for alignment accounting; add `assert_spill_stack_empty()` companion here)
 11. §8 (StackFrame — builds on §7 and §9)
-11. §2 (bitmask optimisation — internal only, do last when API is stable)
+11. §2 (bitmask optimisation — internal only, do last when API is stable) *(REJECTED — see §2)*
 12. §12 (named-register alloc — pure convenience, no dependencies, add anytime)
 13. §13 (remove `used_*` — breaking removal, do after §9 is in place so callers have a replacement)
 14. §15 (ABI configuration) *(REJECTED — see §15)*
@@ -2295,6 +2307,7 @@ of `emit_call()` is the acceptance criterion for completing §18.
 17. §16 (manager `reset()`)
 18. §20 (`save_volatiles()` / `restore_volatiles()` — depends on §6; eliminates `extra_pushes` footgun in §18)
 19. §21 (pool count queries — no dependencies, add any time)
+20. §22 (rename `in_use` → `live` — breaking API rename; do after §14 getters are stabilised)
 
 ---
 
@@ -2589,3 +2602,98 @@ for (auto &z : accumulators) rm.free(z);
 - These methods intentionally do not materialise a vector, unlike `get_free_gps()`.
   The getter methods remain useful when the caller needs the actual indices, not just
   the count.
+
+---
+
+## 22. Rename `in_use` to `live` in Getter Names
+
+### Motivation
+
+The current getter family uses the phrase `in_use` to describe registers that are
+currently allocated (i.e. handed out by `alloc()` and not yet returned via `free()`):
+
+```cpp
+get_in_use_gps()
+get_in_use_volatile_gps()
+get_in_use_preserved_gps()
+get_in_use_vecs()
+get_in_use_volatile_vecs()
+get_in_use_opmasks()
+get_in_use_volatile_opmasks()   // (slated for removal — §14a)
+get_in_use_tiles()
+get_in_use_volatile_tiles()     // (slated for removal — §14b)
+```
+
+`in_use` is correct but verbose. In compiler and register-allocator literature the
+standard term for a register that holds a value needed by future instructions is
+**live**. A register is *live* at a program point if its current value may be read
+before the next write. For the register manager, "currently allocated" and "live" are
+equivalent: `alloc()` marks a register live; `free()` marks it dead.
+
+Adopting `live` produces shorter, idiomatic names that align with standard terminology:
+
+| Current name | Proposed name |
+|---|---|
+| `get_in_use_gps()` | `get_live_gps()` |
+| `get_in_use_volatile_gps()` | `get_live_volatile_gps()` |
+| `get_in_use_preserved_gps()` | `get_live_preserved_gps()` |
+| `get_in_use_vecs()` | `get_live_vecs()` |
+| `get_in_use_volatile_vecs()` | `get_live_volatile_vecs()` |
+| `get_in_use_opmasks()` | `get_live_opmasks()` |
+| `get_in_use_tiles()` | `get_live_tiles()` |
+
+The methods slated for removal in §14 (`get_in_use_volatile_opmasks()`,
+`get_in_use_volatile_tiles()`, and the per-family index helpers) need not be renamed —
+they should be removed directly.
+
+### Proposed API
+
+No new methods are added. Existing `get_in_use_*` methods are renamed to
+`get_live_*`. The signatures are otherwise unchanged:
+
+```cpp
+// Renamed from get_in_use_gps()
+std::vector<int> get_live_gps() const;
+
+// Renamed from get_in_use_volatile_gps()
+std::vector<int> get_live_volatile_gps() const;
+
+// Renamed from get_in_use_preserved_gps()
+std::vector<int> get_live_preserved_gps() const;
+
+// Renamed from get_in_use_vecs()
+std::vector<int> get_live_vecs() const;
+
+// Renamed from get_in_use_volatile_vecs()
+std::vector<int> get_live_volatile_vecs() const;
+
+// Renamed from get_in_use_opmasks()
+std::vector<int> get_live_opmasks() const;
+
+// Renamed from get_in_use_tiles()
+std::vector<int> get_live_tiles() const;
+```
+
+### Internal State Changes
+
+None. The underlying data members (`in_use_gp_`, `in_use_vec_`, etc.) should also be
+renamed to `live_gp_`, `live_vec_`, etc. for consistency in the same commit.
+
+### Usage Example
+
+```cpp
+// Before:
+auto live = rm.get_in_use_volatile_gps();
+
+// After:
+auto live = rm.get_live_volatile_gps();
+```
+
+### Notes
+
+- The rename is orthogonal to all other sections — it does not change behaviour,
+  data members, or control flow.
+- Perform the rename after §14 cleanups are complete so that only the methods that
+  will survive long-term are renamed.
+- Rename the internal data members (`in_use_gp_`, etc.) to `live_gp_`, etc. in the
+  same commit for consistency.

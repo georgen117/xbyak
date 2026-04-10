@@ -15,27 +15,25 @@
  *   addToPool               – _stack_pointer / _base_pointer / add_to_gp_pool
  *   registerExhaustion      – allocating more regs than available throws
  *   mixedAllocation         – mix of GP / Vec / Opmask in one manager
- *   regInUse                – reg_in_use / gp_idx_in_use helpers
+ *   regInUseAllFamilies     – reg_in_use round-trip for every register family
  *   gpRegisterAliasing      – Reg64/Reg32/Reg16 share a physical register index
  *   vectorRegisterAliasing  – Xmm/Ymm/Zmm share a physical register index
  *   registerContentsViaJIT  – write + read register values through JIT execution
  *   functionCallConvention  – ABI convention: parameter passing + non-volatile
  *                             register preservation across a JIT call
  *   realisticKernel         – code-generation using manager for register strategy
- *   dynamicSaveRestore      – dynamic push/pop using get_in_use_gps() +
- *                             gp_idx_in_use() to save/restore across a real call
+ *   dynamicSaveRestore      – dynamic push/pop using get_in_use_gps() to
+ *                             save/restore across a real call
  *   amxSupport              – has_amx() / max_tile_registers() reflect AMX capability
  *   amxTileRegisters        – alloc / free of Tmm (tmm0-tmm7)
  *   amxTileExhaustion       – allocating more tiles than available throws
  *   mixedAllocationWithAMX  – mix of GP / Vec / Opmask / AMX in one manager
  *   amxScopedRegisters      – RAII makeScoped auto-free for Tmm
- *   amxRegInUse             – tile_idx_in_use / reg_in_use helpers for Tmm
+ *   amxRegInUse             – reg_in_use helpers for Tmm
  *   inUseVolatilePreservedGPs – get_in_use_volatile/preserved_gps() correctness
  *   volatileGPCallerSave    – JIT caller-saves only volatile GPs around a call
  *   vecVolatilePreserved    – get_in_use_volatile/preserved_vecs() correctness
- *   opmaskVolatile          – get_in_use_volatile_opmasks(): all opmasks are volatile
  *   comprehensiveSaveRestore – multi-family volatile/preserved queries agree with totals
- *   amxVolatileTiles        – get_in_use_volatile_tiles(): all tiles are volatile
  *
  * Build:
  *   # via CMake (from xbyak/test/build/):
@@ -164,8 +162,6 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
             auto reg_r10 = rm.alloc(r10);   // r10: caller-saved
             CYBOZU_TEST_EQUAL(reg_rdx.getIdx(), rdx.getIdx());
             CYBOZU_TEST_EQUAL(reg_r10.getIdx(), r10.getIdx());
-            CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(rdx.getIdx()));
-            CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(r10.getIdx()));
 
             // GP Reg32 and Reg16 — r8d and r9w are distinct physical registers.
             auto reg_r8d = rm.alloc(r8d);
@@ -180,17 +176,12 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
             CYBOZU_TEST_EQUAL(reg_xmm2.getIdx(), xmm2.getIdx());
             CYBOZU_TEST_EQUAL(reg_ymm3.getIdx(), ymm3.getIdx());
             CYBOZU_TEST_EQUAL(reg_zmm4.getIdx(), zmm4.getIdx());
-            CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(xmm2.getIdx()));
-            CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(ymm3.getIdx()));
-            CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(zmm4.getIdx()));
 
             // Opmask — k1 and k2.
             auto reg_k1 = rm.alloc(k1);
             auto reg_k2 = rm.alloc(k2);
             CYBOZU_TEST_EQUAL(reg_k1.getIdx(), k1.getIdx());
             CYBOZU_TEST_EQUAL(reg_k2.getIdx(), k2.getIdx());
-            CYBOZU_TEST_ASSERT(rm.opmask_idx_in_use(k1.getIdx()));
-            CYBOZU_TEST_ASSERT(rm.opmask_idx_in_use(k2.getIdx()));
 
             // AMX Tile — tmm0 and tmm1 (skipped if AMX is not available).
             // tmm0-tmm7 are const Tmm members of CodeGenerator, so they work
@@ -200,8 +191,6 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
                 auto reg_tmm1 = rm.alloc(tmm1);
                 CYBOZU_TEST_EQUAL(reg_tmm0.getIdx(), tmm0.getIdx());
                 CYBOZU_TEST_EQUAL(reg_tmm1.getIdx(), tmm1.getIdx());
-                CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tmm0.getIdx()));
-                CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tmm1.getIdx()));
 
                 // Duplicate alloc by name must throw for tiles too.
                 CYBOZU_TEST_EXCEPTION(rm.alloc(tmm0), Xbyak::Error);
@@ -391,20 +380,57 @@ CYBOZU_TEST_AUTO(mixedAllocation)
 }
 
 // =============================================================================
-// Test – reg_in_use / gp_idx_in_use helpers
+// Test – reg_in_use round-trip for every register family
 // =============================================================================
-CYBOZU_TEST_AUTO(regInUse)
+CYBOZU_TEST_AUTO(regInUseAllFamilies)
 {
     RegPoolManager rm;
-    auto r1 = rm.alloc<Reg64>();
 
-    CYBOZU_TEST_ASSERT(rm.reg_in_use(r1));
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(r1.getIdx()));
+    // GP (Reg64)
+    auto gp = rm.alloc<Reg64>();
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(gp));
+    rm.free(gp);
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(gp));
 
-    rm.free(r1);
+    // GP aliases: Reg32 and Reg16 share the same physical index.
+    auto gp32 = rm.alloc<Reg32>();
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(gp32));
+    rm.free(gp32);
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(gp32));
 
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(r1));
-    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(r1.getIdx()));
+    // Vec (Xmm / Ymm / Zmm) — only exercised when the OS has enabled vector state
+    if (rm.has_avx512() || !rm.get_free_vecs().empty()) {
+        auto xmm = rm.alloc<Xmm>();
+        CYBOZU_TEST_ASSERT(rm.reg_in_use(xmm));
+        rm.free(xmm);
+        CYBOZU_TEST_ASSERT(!rm.reg_in_use(xmm));
+
+        auto ymm = rm.alloc<Ymm>();
+        CYBOZU_TEST_ASSERT(rm.reg_in_use(ymm));
+        rm.free(ymm);
+        CYBOZU_TEST_ASSERT(!rm.reg_in_use(ymm));
+
+        auto zmm = rm.alloc<Zmm>();
+        CYBOZU_TEST_ASSERT(rm.reg_in_use(zmm));
+        rm.free(zmm);
+        CYBOZU_TEST_ASSERT(!rm.reg_in_use(zmm));
+    }
+
+    // Opmask (k1-k7)
+    if (!rm.get_free_opmasks().empty()) {
+        auto k = rm.alloc<Opmask>();
+        CYBOZU_TEST_ASSERT(rm.reg_in_use(k));
+        rm.free(k);
+        CYBOZU_TEST_ASSERT(!rm.reg_in_use(k));
+    }
+
+    // AMX Tile (tmm0-tmm7) — only exercised when AMX is available
+    if (rm.has_amx()) {
+        auto tmm = rm.alloc<Tmm>();
+        CYBOZU_TEST_ASSERT(rm.reg_in_use(tmm));
+        rm.free(tmm);
+        CYBOZU_TEST_ASSERT(!rm.reg_in_use(tmm));
+    }
 }
 
 // =============================================================================
@@ -417,7 +443,6 @@ CYBOZU_TEST_AUTO(gpRegisterAliasing)
     // Allocate RAX (Reg64 index 0).
     auto rax_reg = rm.alloc<Reg64>(0);
     CYBOZU_TEST_EQUAL(rax_reg.getIdx(), 0);
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(0));
 
     // EAX (Reg32(0)) shares the same physical register – must throw.
     CYBOZU_TEST_EXCEPTION(rm.alloc<Reg32>(0), Xbyak::Error);
@@ -443,7 +468,6 @@ CYBOZU_TEST_AUTO(vectorRegisterAliasing)
 
     auto xmm0 = rm.alloc<Xmm>(0);
     CYBOZU_TEST_EQUAL(xmm0.getIdx(), 0);
-    CYBOZU_TEST_ASSERT(rm.vec_idx_in_use(0));
 
     // YMM0 and ZMM0 share the same physical register – both must throw.
     CYBOZU_TEST_EXCEPTION(rm.alloc<Ymm>(0), Xbyak::Error);
@@ -758,7 +782,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             ret();
         }
 
-        // Use gp_idx_in_use() in a loop to decide which registers to push/pop.
+        // Use get_in_use_gps() to decide which registers to push/pop.
         // Expected result: 111 + 222 + 333 + 444 = 1110.
         void gen_loop_based_save_restore(RegPoolManager &rm) {
             std::vector<Reg64> regs;
@@ -768,10 +792,10 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
                 mov(r, (i + 1) * 111);
             }
 
-            // Loop over all possible GP indices and save every in-use one.
+            // Save every currently in-use GP register.
             std::vector<int> saved;
-            for (int idx = 0; idx < 16; ++idx) {
-                if (rm.gp_idx_in_use(idx)) {
+            for (int idx : rm.get_in_use_gps()) {
+                if (true) {
                     push(Reg64(idx));
                     saved.push_back(idx);
                 }
@@ -802,7 +826,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
                           (uint64_t)(100 + 200 + 300 + 400 + 210));
     }
 
-    // Scenario 2: loop-based save/restore using gp_idx_in_use().
+    // Scenario 2: loop-based save/restore using reg_in_use().
     {
         RegPoolManager rm;
         DynamicJit jit;
@@ -960,34 +984,22 @@ CYBOZU_TEST_AUTO(amxScopedRegisters)
 }
 
 // =============================================================================
-// Test – AMX reg_in_use and tile_idx_in_use helpers
+// Test – reg_in_use helpers for Tmm
 // =============================================================================
 CYBOZU_TEST_AUTO(amxRegInUse)
 {
     RegPoolManager rm;
 
-    if (!rm.has_amx()) {
-        // tile_idx_in_use on valid indices must return false.
-        CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(0));
-        CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(7));
-        // Out-of-range must throw regardless of AMX availability.
-        CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), Xbyak::Error);
-        return;
-    }
+    if (!rm.has_amx()) return;
 
     auto t3 = rm.alloc<Tmm>(3);
 
     CYBOZU_TEST_ASSERT(rm.reg_in_use(t3));
-    CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(3));
-    CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(4));
-
-    // Out-of-range index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.tile_idx_in_use(8), Xbyak::Error);
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(Tmm(4)));
 
     rm.free(t3);
 
     CYBOZU_TEST_ASSERT(!rm.reg_in_use(t3));
-    CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(3));
 }
 
 // =============================================================================
@@ -1170,29 +1182,6 @@ CYBOZU_TEST_AUTO(vecVolatilePreserved)
 }
 
 // =============================================================================
-// Test – Opmask volatile query (all opmasks are caller-saved)
-// =============================================================================
-CYBOZU_TEST_AUTO(opmaskVolatile)
-{
-    RegPoolManager rm;
-
-    auto k1 = rm.alloc<Opmask>();
-    auto k2 = rm.alloc<Opmask>();
-    auto k3 = rm.alloc<Opmask>();
-
-    auto all_in_use      = rm.get_in_use_opmasks();
-    auto volatile_in_use = rm.get_in_use_volatile_opmasks();
-
-    // All opmasks are volatile on both Windows and Linux.
-    CYBOZU_TEST_EQUAL(all_in_use.size(), volatile_in_use.size());
-    CYBOZU_TEST_ASSERT(all_in_use == volatile_in_use);
-
-    rm.free(k1);  rm.free(k2);  rm.free(k3);
-
-    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_opmasks().empty());
-}
-
-// =============================================================================
 // Test – Comprehensive multi-family volatile / preserved queries
 // =============================================================================
 CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
@@ -1234,14 +1223,12 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
     auto gp_preserved  = rm.get_in_use_preserved_gps();
     auto vec_volatile  = rm.get_in_use_volatile_vecs();
     auto vec_preserved = rm.get_in_use_preserved_vecs();
-    auto om_volatile   = rm.get_in_use_volatile_opmasks();
 
     // Within each family: volatile + preserved == total in-use.
     CYBOZU_TEST_EQUAL(gp_volatile.size()  + gp_preserved.size(),
                       rm.get_in_use_gps().size());
     CYBOZU_TEST_EQUAL(vec_volatile.size() + vec_preserved.size(),
                       rm.get_in_use_vecs().size());
-    CYBOZU_TEST_EQUAL(om_volatile.size(), rm.get_in_use_opmasks().size());
 
     // If a preserved GP was allocated it must appear in gp_preserved.
     if (have_gp_preserved) {
@@ -1265,40 +1252,6 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
 }
 
 // =============================================================================
-// Test – AMX volatile tile query (all tiles are caller-saved)
-// =============================================================================
-CYBOZU_TEST_AUTO(amxVolatileTiles)
-{
-    RegPoolManager rm;
-
-    if (!rm.has_amx()) {
-        // Without AMX the in-use set is always empty.
-        CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_tiles().empty());
-        return;
-    }
-
-    auto t1 = rm.alloc<Tmm>();
-    auto t2 = rm.alloc<Tmm>();
-    auto t3 = rm.alloc<Tmm>();
-
-    auto all_in_use      = rm.get_in_use_tiles();
-    auto volatile_in_use = rm.get_in_use_volatile_tiles();
-
-    // All AMX tile registers are caller-saved on both Windows and Linux.
-    CYBOZU_TEST_EQUAL(all_in_use.size(), volatile_in_use.size());
-    CYBOZU_TEST_ASSERT(all_in_use == volatile_in_use);
-    CYBOZU_TEST_EQUAL(volatile_in_use.size(), size_t(3));
-
-    // Freeing one tile must be reflected immediately.
-    rm.free(t3);
-    CYBOZU_TEST_EQUAL(rm.get_in_use_volatile_tiles().size(), size_t(2));
-
-    rm.free(t1);
-    rm.free(t2);
-    CYBOZU_TEST_ASSERT(rm.get_in_use_volatile_tiles().empty());
-}
-
-// =============================================================================
 // Test – mark_unavailable / mark_available / is_reserved: GP registers
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailableGP)
@@ -1311,12 +1264,10 @@ CYBOZU_TEST_AUTO(markUnavailableGP)
 
     // Initially not reserved and not in-use.
     CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(idx));
-    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(idx));
 
     // After mark_unavailable, the register should be reserved and not allocatable.
     rm.mark_unavailable<Reg64>(idx);
     CYBOZU_TEST_ASSERT(rm.is_reserved<Reg64>(idx));
-    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(idx));
 
     // Reserved registers must not appear in the free GP pool.
     {
@@ -1406,7 +1357,6 @@ CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
 
     rm.mark_unavailable<Xmm>(vec_idx);
     CYBOZU_TEST_ASSERT(rm.is_reserved<Xmm>(vec_idx));
-    CYBOZU_TEST_ASSERT(!rm.vec_idx_in_use(vec_idx));
 
     // The reserved vector register must not appear in the free pool.
     {
@@ -1433,7 +1383,6 @@ CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
 
     rm.mark_unavailable<Opmask>(opmask_idx);
     CYBOZU_TEST_ASSERT(rm.is_reserved<Opmask>(opmask_idx));
-    CYBOZU_TEST_ASSERT(!rm.opmask_idx_in_use(opmask_idx));
 
     // alloc by index must throw for reserved opmask.
     CYBOZU_TEST_EXCEPTION(rm.alloc<Opmask>(opmask_idx), Xbyak::Error);
@@ -1461,7 +1410,6 @@ CYBOZU_TEST_AUTO(markUnavailableTile)
 
     rm.mark_unavailable<Tmm>(tile_idx);
     CYBOZU_TEST_ASSERT(rm.is_reserved<Tmm>(tile_idx));
-    CYBOZU_TEST_ASSERT(!rm.tile_idx_in_use(tile_idx));
 
     // Reserved tile must not appear in the free tile pool.
     {
@@ -1489,7 +1437,6 @@ CYBOZU_TEST_AUTO(markUnavailableTile)
     // Alloc must succeed after mark_available.
     auto t = rm.alloc<Tmm>(tile_idx);
     CYBOZU_TEST_EQUAL(t.getIdx(), tile_idx);
-    CYBOZU_TEST_ASSERT(rm.tile_idx_in_use(tile_idx));
 
     // Reserving an in-use tile must throw.
     CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::Error);
@@ -1546,7 +1493,6 @@ CYBOZU_TEST_AUTO(markUnavailableInUseThrows)
     RegPoolManager rm;
 
     auto r = rm.alloc<Reg64>(9);  // r9 is caller-saved
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(9));
 
     // Trying to reserve an already-allocated register must throw.
     CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(9), Xbyak::Error);
@@ -2092,17 +2038,14 @@ CYBOZU_TEST_AUTO(spillStateTracking)
     const int idx2 = r2.getIdx();
 
     // Both in_use, neither in the free pool.
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx1));
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx2));
-
     // Spill r1: leaves in_use, enters free pool.
     rm.spill(r1);
-    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(idx1));
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(Reg64(idx1)));
     {
         const auto free = rm.get_free_gps();
         CYBOZU_TEST_ASSERT(std::find(free.begin(), free.end(), idx1) != free.end());
     }
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx2));  // r2 unaffected
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(Reg64(idx2)));  // r2 unaffected
 
     // Spilling a not-in-use register must throw.
     CYBOZU_TEST_EXCEPTION(rm.spill(r1), Xbyak::Error);
@@ -2113,7 +2056,7 @@ CYBOZU_TEST_AUTO(spillStateTracking)
     // LIFO restore: r1 re-enters in_use, leaves free pool.
     Reg64 got = rm.restore();
     CYBOZU_TEST_EQUAL(got.getIdx(), idx1);
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx1));
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(Reg64(idx1)));
     {
         const auto free = rm.get_free_gps();
         CYBOZU_TEST_ASSERT(std::find(free.begin(), free.end(), idx1) == free.end());
@@ -2130,9 +2073,9 @@ CYBOZU_TEST_AUTO(spillStateTracking)
     CYBOZU_TEST_EXCEPTION(rm.restore(r1), Xbyak::Error);
 
     rm.restore(r2);  // pops idx2
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx2));
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(Reg64(idx2)));
     rm.restore(r1);  // pops idx1
-    CYBOZU_TEST_ASSERT(rm.gp_idx_in_use(idx1));
+    CYBOZU_TEST_ASSERT(rm.reg_in_use(Reg64(idx1)));
 
     rm.free(r1);
     rm.free(r2);
@@ -2161,7 +2104,7 @@ CYBOZU_TEST_AUTO(spillRestoreJIT)
             // Spill the last register — its value (n*10) is saved on the stack.
             Reg64 spilld = v.back();
             spill(spilld);
-            CYBOZU_TEST_ASSERT(!gp_idx_in_use(spilld.getIdx()));
+            CYBOZU_TEST_ASSERT(!reg_in_use(spilld));
 
             // The freed slot is now the only available register; alloc it as scratch.
             Reg64 scratch = alloc<Reg64>();
@@ -2172,7 +2115,7 @@ CYBOZU_TEST_AUTO(spillRestoreJIT)
             // Restore: the original value (n*10) is popped back.
             Reg64 restored = restore();
             CYBOZU_TEST_EQUAL(restored.getIdx(), spilld.getIdx());
-            CYBOZU_TEST_ASSERT(gp_idx_in_use(restored.getIdx()));
+            CYBOZU_TEST_ASSERT(reg_in_use(restored));
 
             // Sum all registers into rax (restored register holds its original value).
             mov(rax, v[0]);
@@ -2652,8 +2595,8 @@ CYBOZU_TEST_AUTO(resetClearsAllocation)
     CYBOZU_TEST_NO_EXCEPTION(auto rbx = rm.alloc<Reg64>(3); rm.free(rbx);)
 
     // Previously in-use indices are gone from in_use.
-    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(r0.getIdx()));
-    CYBOZU_TEST_ASSERT(!rm.gp_idx_in_use(r1.getIdx()));
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(r0));
+    CYBOZU_TEST_ASSERT(!rm.reg_in_use(r1));
 }
 
 // =============================================================================
