@@ -53,6 +53,9 @@
 
 using namespace Xbyak;
 
+// CPU feature object — constructed once, shared across all tests.
+static const Xbyak::util::Cpu g_cpu;
+
 // =============================================================================
 // JIT helper utilities (used by Tests 13-16)
 // =============================================================================
@@ -126,7 +129,7 @@ extern "C" void call_function_that_clobbers_vec_registers() {
 // =============================================================================
 CYBOZU_TEST_AUTO(basicAllocation)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto r1 = rm.alloc<Reg64>();
     auto r2 = rm.alloc<Reg64>();
@@ -146,7 +149,7 @@ CYBOZU_TEST_AUTO(basicAllocation)
 // =============================================================================
 CYBOZU_TEST_AUTO(specificAllocation)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto r10 = rm.alloc<Reg64>(10);
     auto r11 = rm.alloc<Reg64>(11);
@@ -173,7 +176,7 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
     // and writes rm.alloc(rdx) instead of rm.alloc<Reg64>(2).
     struct NamedAllocTest : Xbyak::CodeGenerator {
         void run() {
-            RegPoolManager rm;
+            RegPoolManager rm(g_cpu);
 
             // GP Reg64 — names match assembly register notation exactly.
             auto reg_rdx = rm.alloc(rdx);   // rdx: caller-saved on both ABIs
@@ -244,7 +247,7 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
 // =============================================================================
 CYBOZU_TEST_AUTO(scopedRegisters)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     {
         auto scoped1 = rm.makeScoped(rm.alloc<Reg64>());
@@ -261,7 +264,7 @@ CYBOZU_TEST_AUTO(scopedRegisters)
 // =============================================================================
 CYBOZU_TEST_AUTO(vectorRegisters)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto xmm1 = rm.alloc<Xmm>();
     auto xmm2 = rm.alloc<Xmm>();
@@ -285,7 +288,7 @@ CYBOZU_TEST_AUTO(vectorRegisters)
 // =============================================================================
 CYBOZU_TEST_AUTO(opmaskRegisters)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto k1 = rm.alloc<Opmask>();
     auto k2 = rm.alloc<Opmask>();
@@ -308,7 +311,7 @@ CYBOZU_TEST_AUTO(opmaskRegisters)
 // =============================================================================
 CYBOZU_TEST_AUTO(apxSupport)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Without APX: 16 GP registers (r0-r15).
     // With APX:    32 GP registers (r0-r31).
@@ -325,7 +328,7 @@ CYBOZU_TEST_AUTO(apxSupport)
 // =============================================================================
 CYBOZU_TEST_AUTO(addToPool)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // _stack_pointer() == rsp (index 4).
     auto rsp_reg = rm._stack_pointer();
@@ -350,7 +353,7 @@ CYBOZU_TEST_AUTO(addToPool)
 // =============================================================================
 CYBOZU_TEST_AUTO(registerExhaustion)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     std::vector<Reg64> allocated;
 
     // Allocate until the pool is dry.
@@ -374,7 +377,7 @@ CYBOZU_TEST_AUTO(registerExhaustion)
 // =============================================================================
 CYBOZU_TEST_AUTO(mixedAllocation)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto r64 = rm.alloc<Reg64>();
     auto r32 = rm.alloc<Reg32>();
@@ -402,7 +405,7 @@ CYBOZU_TEST_AUTO(mixedAllocation)
 // =============================================================================
 CYBOZU_TEST_AUTO(regInUseAllFamilies)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // GP (Reg64)
     auto gp = rm.alloc<Reg64>();
@@ -456,7 +459,7 @@ CYBOZU_TEST_AUTO(regInUseAllFamilies)
 // =============================================================================
 CYBOZU_TEST_AUTO(gpRegisterAliasing)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Allocate RAX (Reg64 index 0).
     auto rax_reg = rm.alloc<Reg64>(0);
@@ -482,7 +485,7 @@ CYBOZU_TEST_AUTO(gpRegisterAliasing)
 // =============================================================================
 CYBOZU_TEST_AUTO(vectorRegisterAliasing)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto xmm0 = rm.alloc<Xmm>(0);
     CYBOZU_TEST_EQUAL(xmm0.getIdx(), 0);
@@ -506,7 +509,7 @@ CYBOZU_TEST_AUTO(vectorRegisterAliasing)
 // =============================================================================
 CYBOZU_TEST_AUTO(registerContentsViaJIT)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // 64-bit GP register write/read.
     {
@@ -632,7 +635,7 @@ CYBOZU_TEST_AUTO(functionCallConvention)
             }
         };
 
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         VolatileSaveRestoreJit jit;
         jit.gen(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)(10 + 20 + 30 + 40));
@@ -642,7 +645,7 @@ CYBOZU_TEST_AUTO(functionCallConvention)
     // rbx(3) and r12-r15(12-15) are callee-saved on all x86-64 ABIs.
     // Win64 additionally preserves rdi(7) and rsi(6); on SysV they are volatile.
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         const auto preserved = rm.get_preserved_gps();
         CYBOZU_TEST_ASSERT(
             std::find(preserved.begin(), preserved.end(), 3) != preserved.end());
@@ -736,13 +739,13 @@ CYBOZU_TEST_AUTO(realisticKernel)
     };
 
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         RealisticKernel jit;
         jit.gen_kernel_with_manager(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)(42 + 100));
     }
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         RealisticKernel jit;
         jit.gen_multi_phase_kernel(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)(100 + 60));
@@ -837,7 +840,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
 
     // Scenario 1: caller saves all live registers around a real function call.
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         DynamicJit jit;
         jit.gen_caller_saves_all(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()),
@@ -846,7 +849,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
 
     // Scenario 2: loop-based save/restore using reg_in_use().
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         DynamicJit jit;
         jit.gen_loop_based_save_restore(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()),
@@ -859,7 +862,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxSupport)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     if (rm.has_amx()) {
         // AMX present: 8 tile registers (tmm0-tmm7), free pool starts full.
@@ -879,7 +882,7 @@ CYBOZU_TEST_AUTO(amxSupport)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxTileRegisters)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     if (!rm.has_amx()) {
         // Without AMX hardware alloc must throw immediately.
@@ -919,7 +922,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxTileExhaustion)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     std::vector<Tmm> allocated;
 
     // Allocate until exhausted; expect an exception when the pool is empty.
@@ -947,7 +950,7 @@ CYBOZU_TEST_AUTO(amxTileExhaustion)
 // =============================================================================
 CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto r64 = rm.alloc<Reg64>();
     auto xmm = rm.alloc<Xmm>();
@@ -982,7 +985,7 @@ CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxScopedRegisters)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     if (!rm.has_amx()) {
         // Nothing to scope without AMX.
@@ -1006,7 +1009,7 @@ CYBOZU_TEST_AUTO(amxScopedRegisters)
 // =============================================================================
 CYBOZU_TEST_AUTO(amxRegInUse)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     if (!rm.has_amx()) return;
 
@@ -1025,7 +1028,7 @@ CYBOZU_TEST_AUTO(amxRegInUse)
 // =============================================================================
 CYBOZU_TEST_AUTO(inUseVolatilePreservedGPs)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Allocate three registers from the volatile (free) pool.
     auto v1 = rm.alloc<Reg64>();
@@ -1140,7 +1143,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
         }
     };
 
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     OptimalCallerJit jit;
     jit.gen(rm);
 
@@ -1157,7 +1160,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
 // =============================================================================
 CYBOZU_TEST_AUTO(vecVolatilePreserved)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Allocate some vector registers from the free (volatile) pool.
     auto xr1 = rm.alloc<Xmm>();
@@ -1204,7 +1207,7 @@ CYBOZU_TEST_AUTO(vecVolatilePreserved)
 // =============================================================================
 CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // GP registers
     auto r1 = rm.alloc<Reg64>();
@@ -1274,7 +1277,7 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailableGP)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Pick a known volatile GP register (rdi = 7 on SysV, or r8 = 8 on both ABIs).
     // r8 (idx=8) is caller-saved on both Windows and Linux, so it starts in free_gp_regs.
@@ -1329,7 +1332,7 @@ CYBOZU_TEST_AUTO(markUnavailableGP)
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailablePreservedGP)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // rbx = 3 is callee-saved on both ABIs.
     const int idx = 3;  // rbx
@@ -1366,7 +1369,7 @@ CYBOZU_TEST_AUTO(markUnavailablePreservedGP)
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // ---- Vec ----
     // xmm0 (idx=0) is caller-saved on both ABIs.
@@ -1420,7 +1423,7 @@ CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailableTile)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     if (!rm.has_amx()) return; // tile pool is empty without AMX hardware
 
     const int tile_idx = 0; // tmm0 is caller-saved
@@ -1469,7 +1472,7 @@ CYBOZU_TEST_AUTO(markUnavailableNamedReg)
 {
     struct NamedTest : Xbyak::CodeGenerator {
         void run() {
-            RegPoolManager rm;
+            RegPoolManager rm(g_cpu);
 
             // mark_unavailable(rdi) — named overload
             rm.mark_unavailable(rdi);
@@ -1508,7 +1511,7 @@ CYBOZU_TEST_AUTO(markUnavailableNamedReg)
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailableInUseThrows)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto r = rm.alloc<Reg64>(9);  // r9 is caller-saved
 
@@ -1523,7 +1526,7 @@ CYBOZU_TEST_AUTO(markUnavailableInUseThrows)
 // =============================================================================
 CYBOZU_TEST_AUTO(markUnavailableOutOfRange)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(200), Xbyak::Error);
     CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Xmm>(200), Xbyak::Error);
@@ -1541,7 +1544,7 @@ CYBOZU_TEST_AUTO(markUnavailableOutOfRange)
 // =============================================================================
 CYBOZU_TEST_AUTO(allFreeGP)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Fresh manager: nothing allocated.
     CYBOZU_TEST_ASSERT(rm.all_free());
@@ -1562,7 +1565,7 @@ CYBOZU_TEST_AUTO(allFreeGP)
 // =============================================================================
 CYBOZU_TEST_AUTO(allFreeMultiFamily)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     auto r0 = rm.alloc<Reg64>();
     auto r1 = rm.alloc<Reg64>();
@@ -1589,7 +1592,7 @@ CYBOZU_TEST_AUTO(allFreeMultiFamily)
 // =============================================================================
 CYBOZU_TEST_AUTO(allFreeWithReserved)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Reserved registers are not in-use, so all_free() must still return true.
     rm.mark_unavailable<Reg64>(8);
@@ -1607,7 +1610,7 @@ CYBOZU_TEST_AUTO(allFreeWithReserved)
 // =============================================================================
 CYBOZU_TEST_AUTO(allFreeTile)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     if (!rm.has_amx()) return;
 
     auto t = rm.alloc<Tmm>(0);
@@ -1623,11 +1626,11 @@ CYBOZU_TEST_AUTO(allFreeTile)
 // =============================================================================
 CYBOZU_TEST_AUTO(setCodeGeneratorDefault)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     CYBOZU_TEST_ASSERT(!rm.has_code_generator());
 
     // Explicitly passing NULL behaves the same as the default constructor.
-    RegPoolManager rm2(NULL);
+    RegPoolManager rm2(g_cpu);
     CYBOZU_TEST_ASSERT(!rm2.has_code_generator());
 }
 
@@ -1637,7 +1640,7 @@ CYBOZU_TEST_AUTO(setCodeGeneratorDefault)
 CYBOZU_TEST_AUTO(setCodeGeneratorLateInject)
 {
     Xbyak::CodeGenerator cg(4096);
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     CYBOZU_TEST_ASSERT(!rm.has_code_generator());
 
@@ -1660,10 +1663,10 @@ CYBOZU_TEST_AUTO(codeGeneratorComposition)
 {
     // The recommended pattern for JIT kernels that do not want to inherit from
     // RegPoolManager directly.  The CodeGenerator base is fully constructed before
-    // rm_(this) runs, so the pointer is valid when the manager stores it.
+    // rm_(g_cpu, this) runs, so the pointer is valid when the manager stores it.
     struct MyKernel : public Xbyak::CodeGenerator {
         Xbyak::RegPoolManager rm_;
-        MyKernel() : Xbyak::CodeGenerator(4096), rm_(this) {}
+        MyKernel() : Xbyak::CodeGenerator(4096), rm_(g_cpu, this) {}
     };
 
     MyKernel k;
@@ -1684,10 +1687,10 @@ CYBOZU_TEST_AUTO(codeGeneratorComposition)
 CYBOZU_TEST_AUTO(codeGeneratorInheritance)
 {
     // CodeGenerator must appear first in the base-class list so it is fully
-    // constructed before RegPoolManager(this) runs.
+    // constructed before RegPoolManager(g_cpu, this) runs.
     struct MyKernel : public Xbyak::CodeGenerator, public Xbyak::RegPoolManager {
         MyKernel()
-            : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(this) {}
+            : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
 
         void build() {
             // Register-manager methods are called without a prefix because they
@@ -1712,7 +1715,7 @@ CYBOZU_TEST_AUTO(codeGeneratorInheritance)
 // =============================================================================
 CYBOZU_TEST_AUTO(prologueEpilogueTracking)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Nothing allocated yet.
     CYBOZU_TEST_ASSERT(rm.get_allocated_preserved_gps().empty());
@@ -1749,7 +1752,7 @@ CYBOZU_TEST_AUTO(prologueEpilogueTracking)
 // =============================================================================
 CYBOZU_TEST_AUTO(prologueEpilogueThrowsNoCG)
 {
-    RegPoolManager rm; // no CodeGenerator attached
+    RegPoolManager rm(g_cpu); // no CodeGenerator attached
 
     // Promote a preserved register so there is something to emit.
     std::vector<Reg64> v_regs;
@@ -1771,7 +1774,7 @@ CYBOZU_TEST_AUTO(prologueEpilogueThrowsNoCG)
 CYBOZU_TEST_AUTO(prologueEpilogueIdempotent)
 {
     struct IdempotentKernel : public CodeGenerator, public RegPoolManager {
-        IdempotentKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        IdempotentKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             // First call with no preserved registers allocated — emits nothing.
@@ -1826,7 +1829,7 @@ CYBOZU_TEST_AUTO(prologueEpilogueIdempotent)
 CYBOZU_TEST_AUTO(prologueEpilogueVolatileOnly)
 {
     struct VolatileKernel : public CodeGenerator, public RegPoolManager {
-        VolatileKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        VolatileKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             emit_prologue(); // nothing to push — no preserved regs allocated
@@ -1856,7 +1859,7 @@ CYBOZU_TEST_AUTO(prologueEpilogueJIT)
     // callee-saved GP to be allocated, and verifies the save/restore sequence
     // generated by emit_prologue()/emit_epilogue() produces correct results.
     struct PreservedKernel : public CodeGenerator, public RegPoolManager {
-        PreservedKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        PreservedKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             // Exhaust all volatile GP registers.
@@ -1897,7 +1900,7 @@ CYBOZU_TEST_AUTO(emitCall)
 {
     // Without a CodeGenerator attached, emit_call() must throw.
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         CYBOZU_TEST_EXCEPTION(
             rm.emit_call(reinterpret_cast<uint64_t>(
                 &call_function_that_clobbers_registers)),
@@ -1937,13 +1940,13 @@ CYBOZU_TEST_AUTO(emitCall)
         };
 
         {
-            RegPoolManager rm;
+            RegPoolManager rm(g_cpu);
             EmitCallJit jit;
             jit.gen_one_push(rm);
             CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)210);
         }
         {
-            RegPoolManager rm;
+            RegPoolManager rm(g_cpu);
             EmitCallJit jit;
             jit.gen_two_push(rm);
             CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)210);
@@ -1967,7 +1970,7 @@ CYBOZU_TEST_AUTO(emitCall)
             }
         };
 
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         TemplateCallJit jit;
         jit.gen(rm);
         CYBOZU_TEST_EQUAL(call_jit(jit.getCode()), (uint64_t)210);
@@ -1978,7 +1981,7 @@ CYBOZU_TEST_AUTO(emitCall)
     // (odd), so emit_call with extra_pushes=0 needs no alignment pad on SysV.
     {
         struct ManagedCallKernel : public CodeGenerator, public RegPoolManager {
-            ManagedCallKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+            ManagedCallKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 // Exhaust the volatile GP pool, promoting one preserved register.
@@ -2013,7 +2016,7 @@ CYBOZU_TEST_AUTO(emitCall)
 // =============================================================================
 CYBOZU_TEST_AUTO(spillThrowsNoCG)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     auto r = rm.alloc<Reg64>();
 
     // spill() without a CG must throw.
@@ -2026,7 +2029,7 @@ CYBOZU_TEST_AUTO(spillThrowsNoCG)
         public: TmpJit() : CodeGenerator(4096) {}
         };
         TmpJit jit;
-        RegPoolManager rm2(&jit);
+        RegPoolManager rm2(g_cpu, &jit);
         auto r2 = rm2.alloc<Reg64>();
         rm2.spill(r2);  // succeeds
 
@@ -2048,7 +2051,7 @@ CYBOZU_TEST_AUTO(spillStateTracking)
     public: TrackJit() : CodeGenerator(4096) {}
     };
     TrackJit jit;
-    RegPoolManager rm(&jit);
+    RegPoolManager rm(g_cpu, &jit);
 
     auto r1 = rm.alloc<Reg64>();
     auto r2 = rm.alloc<Reg64>();
@@ -2106,7 +2109,7 @@ CYBOZU_TEST_AUTO(spillStateTracking)
 CYBOZU_TEST_AUTO(spillRestoreJIT)
 {
     struct SpillKernel : public CodeGenerator, public RegPoolManager {
-        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         uint64_t build() {
             // Exhaust the volatile GP pool.
@@ -2157,7 +2160,7 @@ CYBOZU_TEST_AUTO(spillRestoreJIT)
 CYBOZU_TEST_AUTO(spillBulkRestoreJIT)
 {
     struct BulkKernel : public CodeGenerator, public RegPoolManager {
-        BulkKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        BulkKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             auto r1 = alloc<Reg64>();
@@ -2206,7 +2209,7 @@ CYBOZU_TEST_AUTO(spillEmitCallAlignment)
     // into r's physical register regardless of whether r is rax or not.
     {
         struct KernelA : public CodeGenerator, public RegPoolManager {
-            KernelA() : CodeGenerator(4096), RegPoolManager(this) {}
+            KernelA() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 auto r = alloc<Reg64>();
@@ -2230,7 +2233,7 @@ CYBOZU_TEST_AUTO(spillEmitCallAlignment)
     // 16-byte aligned at the call instruction.
     {
         struct KernelB : public CodeGenerator, public RegPoolManager {
-            KernelB() : CodeGenerator(4096), RegPoolManager(this) {}
+            KernelB() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 auto r1 = alloc<Reg64>();
@@ -2261,7 +2264,7 @@ CYBOZU_TEST_AUTO(spillEmitCallAlignment)
 // =============================================================================
 CYBOZU_TEST_AUTO(stackFrameThrowsNoCG)
 {
-    RegPoolManager rm; // no CG attached
+    RegPoolManager rm(g_cpu); // no CG attached
     auto r = rm.alloc<Reg64>();
     CYBOZU_TEST_EXCEPTION(rm.make_stack_frame(16), Xbyak::Error);
     rm.free(r);
@@ -2275,7 +2278,7 @@ CYBOZU_TEST_AUTO(stackFrameGPRoundTrip)
     // Store two 64-bit constants in a 16-byte stack frame, recover them
     // with read_from_stack, and verify the final sum.
     struct FrameKernel : public CodeGenerator, public RegPoolManager {
-        FrameKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        FrameKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             // Frame layout: [rsp+0] = a (8 bytes), [rsp+8] = b (8 bytes)
@@ -2320,7 +2323,7 @@ CYBOZU_TEST_AUTO(stackFrameConstOverload)
     // put_on_stack(const RegT &, offset) stores without freeing; the register
     // must remain in the in-use set.
     struct ConstKernel : public CodeGenerator, public RegPoolManager {
-        ConstKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        ConstKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             auto frame = make_stack_frame(16);
@@ -2358,7 +2361,7 @@ CYBOZU_TEST_AUTO(stackFrameConstOverload)
 CYBOZU_TEST_AUTO(stackFrameOffsetOOB)
 {
     struct OOBKernel : public CodeGenerator, public RegPoolManager {
-        OOBKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        OOBKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
 
     OOBKernel k;
@@ -2389,7 +2392,7 @@ CYBOZU_TEST_AUTO(stackFrameDestroy)
     // close() must emit add rsp, restore managed_push_count_, and disarm the dtor.
     {
         struct CloseKernel : public CodeGenerator, public RegPoolManager {
-            CloseKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+            CloseKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 auto frame = make_stack_frame(16);
@@ -2416,7 +2419,7 @@ CYBOZU_TEST_AUTO(stackFrameDestroy)
     // Verify by checking managed_push_count_ reaches 0 exactly once.
     {
         struct CloseDestroyKernel : public CodeGenerator, public RegPoolManager {
-            CloseDestroyKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+            CloseDestroyKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 auto frame = make_stack_frame(8); // managed_push_count_ = 1
@@ -2444,7 +2447,7 @@ CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
     // A misaligned stack would fault inside call_function_that_clobbers_registers.
     {
         struct Kernel16 : public CodeGenerator, public RegPoolManager {
-            Kernel16() : CodeGenerator(4096), RegPoolManager(this) {}
+            Kernel16() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 auto frame = make_stack_frame(16); // managed_push_count_ += 2
@@ -2464,7 +2467,7 @@ CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
     // no alignment pad; still must return 210 without faulting.
     {
         struct Kernel8 : public CodeGenerator, public RegPoolManager {
-            Kernel8() : CodeGenerator(4096), RegPoolManager(this) {}
+            Kernel8() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
             void build() {
                 auto frame = make_stack_frame(8); // managed_push_count_ += 1
@@ -2487,13 +2490,13 @@ CYBOZU_TEST_AUTO(stackFrameEmitCallAlignment)
 CYBOZU_TEST_AUTO(spillStackEmpty)
 {
     // Fresh manager: spill stack is empty.
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     CYBOZU_TEST_ASSERT(rm.spill_stack_empty());
     rm.assert_spill_stack_empty();
 
     // After spill(), stack is non-empty.
     struct SpillKernel : public CodeGenerator, public RegPoolManager {
-        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     SpillKernel k;
     auto r = k.alloc<Reg64>();
@@ -2514,7 +2517,7 @@ CYBOZU_TEST_AUTO(spillStackEmpty)
 CYBOZU_TEST_AUTO(cleanStackSpill)
 {
     struct SpillKernel : public CodeGenerator, public RegPoolManager {
-        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     SpillKernel k;
 
@@ -2538,7 +2541,7 @@ CYBOZU_TEST_AUTO(cleanStackSpill)
 CYBOZU_TEST_AUTO(cleanStackFrame)
 {
     struct FrameKernel : public CodeGenerator, public RegPoolManager {
-        FrameKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        FrameKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     FrameKernel k;
 
@@ -2561,7 +2564,7 @@ CYBOZU_TEST_AUTO(cleanStackFrame)
 CYBOZU_TEST_AUTO(cleanStackCombined)
 {
     struct ComboKernel : public CodeGenerator, public RegPoolManager {
-        ComboKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        ComboKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     ComboKernel k;
 
@@ -2587,7 +2590,7 @@ CYBOZU_TEST_AUTO(cleanStackCombined)
 // =============================================================================
 CYBOZU_TEST_AUTO(resetClearsAllocation)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Alloc several registers, mark one unavailable, then reset.
     auto r0 = rm.alloc<Reg64>();
@@ -2602,7 +2605,7 @@ CYBOZU_TEST_AUTO(resetClearsAllocation)
     // All registers freed; pool matches a freshly constructed manager.
     CYBOZU_TEST_ASSERT(rm.all_free());
 
-    RegPoolManager fresh;
+    RegPoolManager fresh(g_cpu);
     CYBOZU_TEST_EQUAL(rm.get_free_gps().size(),      fresh.get_free_gps().size());
     CYBOZU_TEST_EQUAL(rm.get_preserved_gps().size(), fresh.get_preserved_gps().size());
     CYBOZU_TEST_EQUAL(rm.get_free_vecs().size(),     fresh.get_free_vecs().size());
@@ -2630,7 +2633,7 @@ CYBOZU_TEST_AUTO(resetClearsStackState)
     //
     // This test verifies the tracking fields are cleared correctly.
     struct SpillKernel : public CodeGenerator, public RegPoolManager {
-        SpillKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        SpillKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     SpillKernel k;
 
@@ -2652,7 +2655,7 @@ CYBOZU_TEST_AUTO(resetClearsStackState)
 // =============================================================================
 CYBOZU_TEST_AUTO(resetClearsPrologueHistory)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
 
     // Promote a callee-saved register.
     auto rbx = rm.alloc<Reg64>(3);
@@ -2680,7 +2683,7 @@ CYBOZU_TEST_AUTO(resetClearsPrologueHistory)
 CYBOZU_TEST_AUTO(resetPreservesConfig)
 {
     struct ConfigKernel : public CodeGenerator, public RegPoolManager {
-        ConfigKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        ConfigKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     ConfigKernel k;
 
@@ -2704,7 +2707,7 @@ CYBOZU_TEST_AUTO(resetPreservesConfig)
 CYBOZU_TEST_AUTO(resetReEmit)
 {
     struct KernelFamily : public CodeGenerator, public RegPoolManager {
-        KernelFamily() : CodeGenerator(4096), RegPoolManager(this) {}
+        KernelFamily() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void emit_a() {
             CodeGenerator::reset();
@@ -2751,7 +2754,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesEmpty)
     //
     // Without a CodeGenerator, both calls must throw.
     {
-        RegPoolManager rm;
+        RegPoolManager rm(g_cpu);
         CYBOZU_TEST_EXCEPTION(rm.save_gp_volatiles(),    Xbyak::Error);
         CYBOZU_TEST_EXCEPTION(rm.restore_gp_volatiles(), Xbyak::Error);
     }
@@ -2760,7 +2763,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesEmpty)
     // restore_gp_volatiles() has nothing to pop and must throw.
     {
         struct GpSaveKernel : public CodeGenerator, public RegPoolManager {
-            GpSaveKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+            GpSaveKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         };
         GpSaveKernel k;
         k.save_gp_volatiles();    // no volatile GPs live → nothing pushed
@@ -2775,7 +2778,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesEmpty)
 CYBOZU_TEST_AUTO(restoreGpVolatilesWithoutSaveThrows)
 {
     struct GpRestoreGuardKernel : public CodeGenerator, public RegPoolManager {
-        GpRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        GpRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     GpRestoreGuardKernel k;
     CYBOZU_TEST_EXCEPTION(k.restore_gp_volatiles(), Xbyak::Error);
@@ -2798,7 +2801,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesPushCount)
     // managed_push_count_ increases by N, then decreases to 0 after
     // restore_gp_volatiles().
     struct GpPushCountKernel : public CodeGenerator, public RegPoolManager {
-        GpPushCountKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        GpPushCountKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     GpPushCountKernel k;
 
@@ -2833,7 +2836,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesEndToEnd)
     // clobbers all volatile registers, then verify the values survived.
     // The function returns 210 (via rax); we add our constants and return the sum.
     struct Kernel : public CodeGenerator, public RegPoolManager {
-        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             emit_prologue();
@@ -2879,7 +2882,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesAlignmentOdd)
     // managed_push_count_=1 (odd).  emit_call needs no alignment pad on SysV.
     // A misaligned stack would crash inside call_function_that_clobbers_registers.
     struct Kernel : public CodeGenerator, public RegPoolManager {
-        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             emit_prologue();
@@ -2904,7 +2907,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesAlignmentEven)
     // Allocate two volatile GPs: save_gp_volatiles() pushes 2 registers →
     // managed_push_count_=2 (even).  emit_call inserts an alignment pad on SysV.
     struct Kernel : public CodeGenerator, public RegPoolManager {
-        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             emit_prologue();
@@ -2934,7 +2937,7 @@ CYBOZU_TEST_AUTO(saveGpVolatilesAlignmentEven)
 CYBOZU_TEST_AUTO(resetClearsSavedGpVolatiles)
 {
     struct GpVolatileResetKernel : public CodeGenerator, public RegPoolManager {
-        GpVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        GpVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     GpVolatileResetKernel k;
 
@@ -2955,7 +2958,7 @@ CYBOZU_TEST_AUTO(resetClearsSavedGpVolatiles)
 // =============================================================================
 CYBOZU_TEST_AUTO(saveVecVolatilesNoCg)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     CYBOZU_TEST_EXCEPTION(rm.save_vec_volatiles(),    Xbyak::Error);
     CYBOZU_TEST_EXCEPTION(rm.restore_vec_volatiles(), Xbyak::Error);
 }
@@ -2966,7 +2969,7 @@ CYBOZU_TEST_AUTO(saveVecVolatilesNoCg)
 CYBOZU_TEST_AUTO(saveVecVolatilesEmpty)
 {
     struct VecSaveKernel : public CodeGenerator, public RegPoolManager {
-        VecSaveKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        VecSaveKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     VecSaveKernel k;
 
@@ -2982,7 +2985,7 @@ CYBOZU_TEST_AUTO(saveVecVolatilesEmpty)
 CYBOZU_TEST_AUTO(restoreVecVolatilesWithoutSaveThrows)
 {
     struct VecRestoreGuardKernel : public CodeGenerator, public RegPoolManager {
-        VecRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        VecRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     VecRestoreGuardKernel k;
     // No preceding save → throws.
@@ -3000,7 +3003,7 @@ CYBOZU_TEST_AUTO(restoreVecVolatilesWithoutSaveThrows)
 CYBOZU_TEST_AUTO(saveVecVolatilesPushCount)
 {
     struct VecPushCountKernel : public CodeGenerator, public RegPoolManager {
-        VecPushCountKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        VecPushCountKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     VecPushCountKernel k;
 
@@ -3029,7 +3032,7 @@ CYBOZU_TEST_AUTO(saveVecVolatilesPushCount)
 CYBOZU_TEST_AUTO(resetClearsSavedVecVolatiles)
 {
     struct VecVolatileResetKernel : public CodeGenerator, public RegPoolManager {
-        VecVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        VecVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     VecVolatileResetKernel k;
 
@@ -3051,7 +3054,7 @@ CYBOZU_TEST_AUTO(resetClearsSavedVecVolatiles)
 // =============================================================================
 CYBOZU_TEST_AUTO(saveVolatilesNoCg)
 {
-    RegPoolManager rm;
+    RegPoolManager rm(g_cpu);
     CYBOZU_TEST_EXCEPTION(rm.save_volatiles(),    Xbyak::Error);
     CYBOZU_TEST_EXCEPTION(rm.restore_volatiles(), Xbyak::Error);
 }
@@ -3064,7 +3067,7 @@ CYBOZU_TEST_AUTO(saveVolatilesEmpty)
     // save_volatiles() when nothing is live must arm the restore but save nothing.
     // restore_volatiles() must succeed (not throw) because save was called.
     struct CombinedSaveKernel : public CodeGenerator, public RegPoolManager {
-        CombinedSaveKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        CombinedSaveKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     CombinedSaveKernel k;
     k.save_volatiles();                      // nothing live — no-op for both families
@@ -3079,7 +3082,7 @@ CYBOZU_TEST_AUTO(saveVolatilesEmpty)
 CYBOZU_TEST_AUTO(restoreVolatilesWithoutSaveThrows)
 {
     struct CombinedRestoreGuardKernel : public CodeGenerator, public RegPoolManager {
-        CombinedRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        CombinedRestoreGuardKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     CombinedRestoreGuardKernel k;
     CYBOZU_TEST_EXCEPTION(k.restore_volatiles(), Xbyak::Error);
@@ -3097,7 +3100,7 @@ CYBOZU_TEST_AUTO(saveVolatilesPushCountGp)
 {
     // Allocate two volatile GPs: save_volatiles() pushes both; restore pops them.
     struct CombinedPushCountKernel : public CodeGenerator, public RegPoolManager {
-        CombinedPushCountKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        CombinedPushCountKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     CombinedPushCountKernel k;
 
@@ -3123,7 +3126,7 @@ CYBOZU_TEST_AUTO(saveVolatilesPushCountGp)
 CYBOZU_TEST_AUTO(resetClearsSavedVolatiles)
 {
     struct CombinedVolatileResetKernel : public CodeGenerator, public RegPoolManager {
-        CombinedVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        CombinedVolatileResetKernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
     };
     CombinedVolatileResetKernel k;
 
@@ -3150,7 +3153,7 @@ CYBOZU_TEST_AUTO(saveVecVolatilesEndToEnd)
     //   2. Call a helper that zeroes xmm0–xmm5.
     //   3. Verify the value is still present (save/restore preserved it).
     struct Kernel : public CodeGenerator, public RegPoolManager {
-        Kernel() : CodeGenerator(4096), RegPoolManager(this) {}
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
 
         void build() {
             emit_prologue();
@@ -3174,7 +3177,7 @@ CYBOZU_TEST_AUTO(saveVecVolatilesEndToEnd)
     };
 
     // Only run if vector registers are available on this machine.
-    if (RegPoolManager().get_free_vecs().empty()) return;
+    if (RegPoolManager(g_cpu).get_free_vecs().empty()) return;
 
     Kernel k;
     k.build();

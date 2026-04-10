@@ -80,35 +80,43 @@ struct reg_family<Tmm> {
 
 class RegPoolManager {
 public:
-    // Constructs the manager, detects APX, AVX-512, and AMX support, and populates
-    // the register pools accordingly.
+    // Constructs the manager and populates register pools based on the CPU features
+    // (APX, AVX-512, AMX) reported by the provided Xbyak::util::Cpu object.
     //
-    // Pass a pointer to the CodeGenerator into which instructions will be emitted by
-    // spill(), restore(), make_stack_frame(), emit_prologue(), and emit_epilogue().
-    // When only register tracking is required (alloc / free / mark_unavailable etc.),
-    // the default NULL is sufficient and the manager operates with no emission overhead.
+    // cpu — CPU feature query object.  Construct it once per process and share it
+    //       across all kernel instances to avoid redundant CPUID overhead:
+    //         Xbyak::util::Cpu cpu;
+    //         MyKernelA a(cpu);
+    //         MyKernelB b(cpu);
+    //
+    // cg  — optional pointer to the CodeGenerator into which instructions will be
+    //       emitted by spill(), restore(), make_stack_frame(), emit_prologue(), and
+    //       emit_epilogue().  Pass NULL (default) when only register tracking is
+    //       required; the manager then operates with no emission overhead.
     //
     // Composition pattern (RegPoolManager as a member):
     //   class MyKernel : public Xbyak::CodeGenerator {
     //       Xbyak::RegPoolManager rm_;
     //   public:
-    //       MyKernel() : Xbyak::CodeGenerator(4096), rm_(this) {}
+    //       MyKernel(const Xbyak::util::Cpu &cpu)
+    //           : Xbyak::CodeGenerator(4096), rm_(cpu, this) {}
     //   };
     //
     // Direct-inheritance pattern (RegPoolManager IS-A CodeGenerator):
     //   class MyKernel : public Xbyak::CodeGenerator,
     //                    public Xbyak::RegPoolManager {
     //   public:
-    //       MyKernel() : Xbyak::CodeGenerator(4096),
-    //                    Xbyak::RegPoolManager(this) {}
+    //       MyKernel(const Xbyak::util::Cpu &cpu)
+    //           : Xbyak::CodeGenerator(4096),
+    //             Xbyak::RegPoolManager(cpu, this) {}
     //   };
-    explicit RegPoolManager(Xbyak::CodeGenerator *cg = NULL)
+    explicit RegPoolManager(const Xbyak::util::Cpu &cpu,
+            Xbyak::CodeGenerator *cg = NULL)
             : prologue_gp_cursor_(0),
               prologue_vec_cursor_(0),
               managed_push_count_(0),
               allocated_stack_space_(0),
               cg_(cg) {
-        Xbyak::util::Cpu cpu;
         uint64_t xcr0 = 0;
         if (cpu.has(Xbyak::util::Cpu::tOSXSAVE)) {
             xcr0 = cpu.getXfeature();

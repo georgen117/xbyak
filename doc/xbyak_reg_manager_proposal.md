@@ -66,7 +66,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
   - [ ] 14d. Remove `_stack_pointer()`, `_base_pointer()`, `_opmask_k0()` helpers
 - [x] 15. ABI Configuration: Windows x64 vs SysV *(REJECTED — see §15)*
 - [x] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
-- [ ] 17. Accept External `Xbyak::util::Cpu` Reference
+- [x] 17. Accept External `Xbyak::util::Cpu` Reference
 - [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment) *(REVIEW NOTES — see §18)*
   - [x] 18a. Add debug assertion when `rax` is currently allocated at `emit_call()` invocation
   - ~~18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented~~ *(REJECTED — see §18)*
