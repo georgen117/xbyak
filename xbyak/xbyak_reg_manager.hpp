@@ -548,9 +548,19 @@ public:
         }
 
         // if object is owner of scoped reg and goes out of scope, deallocate
-        ~Scoped() {
+        ~Scoped() noexcept {
             if (!rm_) return;
+#if !defined(XBYAK_NO_EXCEPTION)
+            try {
+                rm_->free(reg_);
+            } catch (...) {
+#ifndef NDEBUG
+                fprintf(stderr, "RegPoolManager::Scoped::~Scoped: free() threw; swallowed\n");
+#endif
+            }
+#else
             rm_->free(reg_);
+#endif
         }
 
         // disable copy - scoped regs are move only to avoid ownership/double free issues as per RAII
@@ -587,16 +597,29 @@ public:
         StackFrame(RegPoolManager &rm, ptrdiff_t size)
                 : rm_(&rm), size_(size) {
             if (!rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
+            if (size_ <= 0 || (size_ % 8) != 0) XBYAK_THROW(ERR_RM_STACK_FRAME_SIZE_INVALID)
             rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(size_));
             rm_->managed_push_count_ += static_cast<size_t>(size_) / 8;
             rm_->allocated_stack_space_ += size_;
         }
 
-        ~StackFrame() {
+        ~StackFrame() noexcept {
             if (!rm_ || !rm_->cg_) return;
+#if !defined(XBYAK_NO_EXCEPTION)
+            try {
+                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
+                rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
+                rm_->allocated_stack_space_ -= size_;
+            } catch (...) {
+#ifndef NDEBUG
+                fprintf(stderr, "RegPoolManager::StackFrame::~StackFrame: exception swallowed\n");
+#endif
+            }
+#else
             rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
             rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
             rm_->allocated_stack_space_ -= size_;
+#endif
         }
 
         StackFrame(const StackFrame &) = delete;
@@ -838,6 +861,8 @@ public:
         const int new_vecs = (int)allocated_preserved_vec_.size() - prologue_vec_cursor_;
         if (new_vecs > 0) {
             cg_->sub(cg_->rsp, new_vecs * 16);
+            // Account for the stack space emitted as push-equivalent 8-byte slots.
+            managed_push_count_ += static_cast<size_t>(new_vecs) * (16 / 8);
             for (int i = 0; i < new_vecs; ++i)
                 cg_->movdqu(cg_->ptr[cg_->rsp + i * 16],
                             Xmm(allocated_preserved_vec_[prologue_vec_cursor_ + i]));
@@ -862,6 +887,8 @@ public:
             for (int i = 0; i < n; ++i)
                 cg_->movdqu(Xmm(allocated_preserved_vec_[i]), cg_->ptr[cg_->rsp + i * 16]);
             cg_->add(cg_->rsp, n * 16);
+            // Adjust managed_push_count_ to account for the reclaimed stack space
+            managed_push_count_ -= static_cast<size_t>(n) * (16 / 8);
         }
 #endif
         for (int i = (int)allocated_preserved_gp_.size() - 1; i >= 0; --i)
@@ -1057,9 +1084,9 @@ public:
         managed_push_count_ += total / 8;
         for (int i = 0; i < (int)vols.size(); ++i) {
             if (has_avx512_)
-                cg_->vmovdqu32(cg_->ptr[cg_->rsp + i * 64], Zmm(vols[i]));
+                cg_->vmovdqu32(cg_->ptr[cg_->rsp + i * bytes_per], Zmm(vols[i]));
             else
-                cg_->vmovdqu(cg_->ptr[cg_->rsp + i * 32], Ymm(vols[i]));
+                cg_->vmovdqu(cg_->ptr[cg_->rsp + i * bytes_per], Ymm(vols[i]));
         }
         saved_volatile_vec_ = vols;
         saved_volatile_vec_bytes_ = total;
@@ -1077,9 +1104,9 @@ public:
         const int bytes_per = has_avx512_ ? 64 : 32;
         for (int i = 0; i < (int)saved_volatile_vec_.size(); ++i) {
             if (has_avx512_)
-                cg_->vmovdqu32(Zmm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * 64]);
+                cg_->vmovdqu32(Zmm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * bytes_per]);
             else
-                cg_->vmovdqu(Ymm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * 32]);
+                cg_->vmovdqu(Ymm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * bytes_per]);
         }
         cg_->add(cg_->rsp, saved_volatile_vec_bytes_);
         managed_push_count_ -= saved_volatile_vec_bytes_ / 8;
