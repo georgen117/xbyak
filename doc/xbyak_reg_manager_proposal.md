@@ -38,6 +38,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 20. [Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`](#20-saverestore-live-volatile-registers-savevolatiles--restorevolatiles)
 21. [Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.](#21-pool-count-queries-free_gp_count-free_vec_count-etc)
 22. [Rename `in_use` to `live` in Getter Names](#22-rename-in_use-to-live-in-getter-names)
+23. [Unified Stack Layout: `StackLayout` / `CommittedLayout` (Replaces §7 and §8)](#23-unified-stack-layout-stacklayout--committedlayout-replaces-7-and-8)
 ---
 
 ## Implementation Status
@@ -2723,3 +2724,300 @@ auto live = rm.get_live_volatile_gps();
   will survive long-term are renamed.
 - Rename the internal data members (`in_use_gp_`, etc.) to `live_gp_`, etc. in the
   same commit for consistency.
+
+---
+
+## 23. Unified Stack Layout: `StackLayout` / `CommittedLayout` (Replaces §7 and §8)
+
+### Motivation
+
+The combination of `spill()`/`restore()` (§7) and `StackFrame` (§8) is the most
+architecturally fragile part of the current design. Each was designed independently and
+they are fundamentally incompatible:
+
+- `spill()` emits `push reg`, which moves `rsp` downward by 8 bytes.
+- `StackFrame` uses fixed `[rsp + offset]` addressing computed at frame-open time.
+- Any `spill()` emitted after a `StackFrame` is opened silently shifts every slot
+  address by 8 bytes, corrupting reads and writes without any diagnostic.
+
+The §7 review note acknowledges this with: *"users must not call `spill()` while any
+`StackFrame` is active"*. This is an unenforceable documentation contract that will
+be violated.
+
+The root cause is a mismatch between two models of stack management:
+
+| Model | How rsp moves | Address calculation |
+|---|---|---|  
+| `spill()` / `push` | Every push shifts rsp by −8 | Implicit; pop restores by LIFO |
+| `StackFrame` / fixed slots | Once, at frame open | Explicit: `[rsp + fixed_offset]` |
+
+These models cannot coexist in the same function without drift-corrected offset
+arithmetic that the user is expected to perform manually. Real compilers never mix
+them: they choose one `sub rsp, total` at function entry and use fixed offsets
+everywhere, or they use no local frame at all. This design should follow that model.
+
+The proposed `StackLayout` / `CommittedLayout` pair replaces both §7 and §8 with a
+two-phase design that eliminates the incompatibility by construction.
+
+### Why This Is Better Than §7 (`spill()`/`restore()`)
+
+1. **No silent address drift.** `spill()` shifts every open `StackFrame`'s slot
+   addresses invisibly. `CommittedLayout` fixes all offsets at `build()` and never
+   moves rsp again until `destroy()`. There is nothing to drift.
+
+2. **All register families supported.** `spill()` is GP-only (§7 review note §7a).
+   `CommittedLayout::park<T>()` accepts `Reg64`, `Ymm`, `Zmm`, and any other type
+   with a `do_store` overload — the same set `StackFrame` already supports.
+
+3. **No LIFO ordering constraint.** `restore()` must be called in exact reverse
+   spill order because `pop` targets the top of the physical hardware stack.
+   `CommittedLayout` uses `mov [rsp + fixed]` / `mov reg, [rsp + fixed]`, so slots
+   can be parked and reloaded in any order at any time.
+
+4. **No interleaving hazard.** The §7 / §8 incompatibility is resolved by removing
+   the concept of push-based spill entirely. There is only one model: a single
+   `sub rsp` at layout commit, fixed slot offsets, a single `add rsp` at destroy.
+
+### Why This Is Better Than §8 (`StackFrame`)
+
+1. **Fixed offsets require no mental arithmetic.** `StackFrame` exposes raw `ptrdiff_t`
+   offsets. The caller must manually compute and maintain slot positions, ensure slots
+   do not overlap, and keep the total within `size`. `StackLayout` issues typed
+   `ParkSlot` handles at declaration time that encapsulate their own fixed offset.
+   Off-by-8 mistakes are impossible.
+
+2. **Volatile-save integration.** `StackFrame` has no knowledge of volatile registers.
+   `save_gp_volatiles()` (§20) and `save_vec_volatiles()` still use push/sub rsp,
+   which conflicts with an open `StackFrame` for the same reason `spill()` does.
+   `StackLayout` pre-declares volatile-save slots at build time so the emit methods
+   use fixed offsets rather than additional rsp movement.
+
+3. **Single rsp movement enforced by design.** Because `CommittedLayout` is the *only*
+   way to interact with the stack frame, `managed_push_count_` becomes stable after
+   `emit_prologue()` and `build()`. `emit_call()` alignment is then trivially correct;
+   the `extra_pushes` escape hatch (§18) can be removed entirely.
+
+4. **Aligned total computed automatically.** `StackFrame` requires the caller to pass
+   an already-aligned size. `StackLayout` accumulates declared slot requirements and
+   rounds the total up to the nearest 16 bytes at `build()` time, preventing
+   misalignment silently.
+
+### Proposed API
+
+#### Phase 1 — Declaration (`StackLayout` builder, no code emitted)
+
+```cpp
+class StackLayout {
+public:
+    // Reserve n GP-sized (8-byte) named park slots.
+    // Returns *this for chaining.
+    StackLayout &gp_parks(int n);
+
+    // Reserve n vector-sized park slots.
+    // Slot size is 64 bytes (ZMM) when AVX-512 is present, 32 bytes (YMM) otherwise.
+    // Returns *this for chaining.
+    StackLayout &vec_parks(int n);
+
+    // Reserve a raw scratch area of 'bytes' bytes.
+    // Must be a positive multiple of 8.
+    // Returns *this for chaining.
+    StackLayout &scratch(ptrdiff_t bytes);
+
+    // Snapshot the currently-live volatile GP and vector registers so that
+    // save_volatiles() / restore_volatiles() on the CommittedLayout use
+    // fixed-offset mov instead of push/sub rsp.
+    // Returns *this for chaining.
+    StackLayout &with_volatile_save();
+
+    // Emit sub rsp, <aligned_total> and return a CommittedLayout owning the frame.
+    // After this call rsp will not move until CommittedLayout::destroy() or its
+    // destructor. Throws if no CodeGenerator has been provided.
+    CommittedLayout build();
+};
+
+// Factory on RegPoolManager:
+StackLayout make_stack_layout();
+```
+
+#### Phase 2 — Committed layout (`CommittedLayout`, owns the stack space)
+
+```cpp
+class CommittedLayout {
+public:
+    // Move-only; destructor emits add rsp, total if destroy() was not called.
+    CommittedLayout(const CommittedLayout &) = delete;
+    CommittedLayout &operator=(const CommittedLayout &) = delete;
+    CommittedLayout(CommittedLayout &&) noexcept;
+    ~CommittedLayout() noexcept;
+
+    // Emits add rsp, total immediately and disarms the destructor.
+    void destroy();
+
+    // Store reg at GP park slot 'idx' and free it from the allocator.
+    // Emits: mov [rsp + gp_base + idx*8], reg
+    // RegT may be Reg64, Reg32, Reg16.
+    template <class RegT>
+    void park(RegT &reg, int slot_idx);
+
+    // Store reg at GP park slot without freeing it.
+    template <class RegT>
+    void park(const RegT &reg, int slot_idx);
+
+    // Allocate a new register of type RegT, load GP park slot 'idx' into it.
+    // Caller is responsible for freeing the returned register.
+    template <class RegT>
+    RegT reload(int slot_idx);
+
+    // Vector equivalents (slot size 32 or 64 bytes depending on AVX-512).
+    template <class VecT>
+    void park_vec(VecT &reg, int slot_idx);
+
+    template <class VecT>
+    void park_vec(const VecT &reg, int slot_idx);
+
+    template <class VecT>
+    VecT reload_vec(int slot_idx);
+
+    // Emit store instructions for all volatile registers snapshotted by
+    // StackLayout::with_volatile_save(). Uses fixed offsets — does not move rsp.
+    // Must be called before the registers' values are clobbered.
+    void save_volatiles();
+
+    // Reload volatile registers from their fixed slots.
+    void restore_volatiles();
+
+    // Return a stack address suitable for use as a memory operand.
+    // Equivalent to [rsp + scratch_base + byte_offset].
+    Xbyak::Address scratch_addr(ptrdiff_t byte_offset = 0) const;
+
+    // Total bytes allocated by this layout.
+    ptrdiff_t total_size() const;
+};
+```
+
+#### Removed API (superseded by §23)
+
+```cpp
+// Removed from RegPoolManager:
+void spill(const Reg64 &reg);               // §7 — push-based, incompatible with frames
+std::vector<Reg64> spill(int count, ...);  // §7
+Reg64 restore();                            // §7
+void restore(const Reg64 &reg);             // §7
+void restore(const std::vector<Reg64> &);  // §7
+bool spill_stack_empty() const;             // §19 — only meaningful for push spills
+void assert_spill_stack_empty() const;      // §19
+StackFrame make_stack_frame(ptrdiff_t);     // §8 — replaced by make_stack_layout()
+void save_gp_volatiles();                   // §20 — absorbed into CommittedLayout
+void restore_gp_volatiles();                // §20
+void save_vec_volatiles();                  // §20
+void restore_vec_volatiles();               // §20
+void save_volatiles();                      // §20 — absorbed into CommittedLayout
+void restore_volatiles();                   // §20
+```
+
+`emit_prologue()`, `emit_epilogue()`, `emit_call()`, `alloc()`, `free()`, `Scoped<T>`,
+`mark_unavailable()`, and all pool/getter methods are **unchanged**.
+
+### Internal State Changes
+
+```cpp
+// Replaces: spill_stack_gp_, saved_volatile_gp_, saved_volatile_vec_,
+//           saved_volatile_vec_bytes_, saved_volatiles_armed_, allocated_stack_space_
+
+// managed_push_count_ is now only modified by emit_prologue() and
+// CommittedLayout::build() / destroy(). It is never modified mid-kernel.
+```
+
+The `StackLayout` builder is a lightweight value type that accumulates sizing data
+(counts and byte totals) in local variables before `build()` is called. No new
+persistent data members are needed on `RegPoolManager` beyond tracking whether a
+`CommittedLayout` is currently active (for debug assertions).
+
+### Usage Example — Typical oneDNN Kernel Pattern
+
+The most common pattern in oneDNN kernels is: receive pointer arguments in ABI
+registers, park them to the stack immediately, then use those hardware registers as
+scatch throughout the compute loop.
+
+```cpp
+class MyKernel : public Xbyak::CodeGenerator,
+                 public Xbyak::RegPoolManager {
+public:
+    MyKernel(const Xbyak::util::Cpu &cpu)
+        : Xbyak::CodeGenerator(4096),
+          Xbyak::RegPoolManager(cpu, this) {}
+
+    void generate() {
+        // Step 1: allocate callee-saved registers upfront so the prologue is complete
+        auto reg_src  = alloc<Reg64>();   // likely rax (volatile) or rbx (preserved)
+        auto reg_dst  = alloc<Reg64>();
+        auto reg_len  = alloc<Reg64>();
+        auto zmm_bias = alloc<Zmm>();
+
+        emit_prologue();  // push rbx etc. if any preserved regs were promoted
+
+        // Step 2: declare all stack needs upfront — nothing is emitted yet
+        auto cl = make_stack_layout()
+            .gp_parks(3)       // 3 x 8-byte slots for the pointer/length arguments
+            .vec_parks(1)      // 1 x 64-byte slot for zmm_bias (AVX-512 kernel)
+            .with_volatile_save()  // snapshot live volatiles for pre-call save
+            .build();          // emits ONCE: sub rsp, 112  (48 + 64, rounded to 16)
+
+        // Step 3: park ABI argument registers to free up hardware registers
+        // emits: mov [rsp+0],  rdi
+        cl.park(alloc<Reg64>(7 /*rdi*/), 0);  // src pointer
+        // emits: mov [rsp+8],  rsi
+        cl.park(alloc<Reg64>(6 /*rsi*/), 1);  // dst pointer
+        // emits: mov [rsp+16], rdx
+        cl.park(alloc<Reg64>(2 /*rdx*/), 2);  // length
+
+        // load and park zmm broadcast constant
+        vbroadcastss(zmm_bias, ptr[rdi + offsetof(args_t, bias)]);
+        cl.park_vec(zmm_bias, 0);  // emits: vmovdqu32 [rsp+48], zmm; frees zmm_bias
+
+        // rdi, rsi, rdx, zmm_bias are all free now — use them as scratch
+        // without consulting any offset table
+
+        // --- compute loop ---
+        auto r_src = cl.reload<Reg64>(0);    // emits: mov r_src, [rsp+0]
+        auto r_dst = cl.reload<Reg64>(1);    // emits: mov r_dst, [rsp+8]
+        auto z     = cl.reload_vec<Zmm>(0);  // emits: vmovdqu32 z, [rsp+48]
+        // ... loop body using r_src, r_dst, z ...
+        free(r_src); free(r_dst); free(z);
+
+        // Step 4: tear down in reverse order
+        cl.destroy();        // emits: add rsp, 112
+        emit_epilogue();     // pops callee-saved registers in reverse order
+        ret();
+    }
+};
+```
+
+### Usage Example — Calling a C Runtime Function
+
+```cpp
+// save_volatiles() snapshots the live volatile registers declared at layout
+// build time and stores them to fixed slots — no rsp movement.
+cl.save_volatiles();        // emits: mov [rsp+slot_N], reg for each live volatile
+emit_call(&my_c_function);  // alignment is trivially correct: managed_push_count_ stable
+cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
+```
+
+### Notes / Interactions
+
+- **Ordering constraint:** `emit_prologue()` must be called before `build()` so that
+  `managed_push_count_` is stable at the moment the alignment for `emit_call()` is
+  computed. The epilogue mirrors this: `destroy()` before `emit_epilogue()`.
+- **`emit_call()` simplification:** because `managed_push_count_` is now stable between
+  `emit_prologue()` and `emit_epilogue()`, the `extra_pushes` parameter becomes
+  unnecessary and can be removed.
+- **`assert_clean_stack()`** can be simplified: it only needs to check that no
+  `CommittedLayout` is currently open, rather than also checking `spill_stack_gp_`.
+- **No impact on prologue/epilogue:** `emit_prologue()` / `emit_epilogue()` operate
+  on callee-saved push/pop sequences which are fully outside and orthogonal to any
+  `CommittedLayout`. A kernel that only uses callee-saved GP registers with no stack
+  parking needs neither `StackLayout` nor any of the removed APIs.
+- **Migration path:** The `StackFrame`, `spill()`, and `save_volatiles()` family can
+  be kept as deprecated thin wrappers during a transition period, each calling the
+  new `StackLayout` / `CommittedLayout` primitives internally, before being removed
+  in a subsequent release.
