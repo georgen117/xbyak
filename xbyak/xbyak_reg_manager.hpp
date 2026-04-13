@@ -90,8 +90,8 @@ public:
     //         MyKernelB b(cpu);
     //
     // cg  — optional pointer to the CodeGenerator into which instructions will be
-    //       emitted by spill(), restore(), make_stack_frame(), emit_prologue(), and
-    //       emit_epilogue().  Pass NULL (default) when only register tracking is
+    //       emitted by emit_prologue(), emit_epilogue(), and make_stack_layout().
+    //       Pass NULL (default) when only register tracking is
     //       required; the manager then operates with no emission overhead.
     //
     // Composition pattern (RegPoolManager as a member):
@@ -390,49 +390,20 @@ public:
 #endif
     }
 
-    // Returns true if no registers are currently on the spill stack.
-    // Use this to inspect state programmatically.  For a hard stop in debug
-    // builds, use assert_spill_stack_empty() instead.
-    bool spill_stack_empty() const {
-        return spill_stack_gp_.empty();
-    }
-
-    // Checks that every spill()ed register has been matched by a restore().
-    //
-    // Call this at the end of JIT kernel construction alongside assert_all_free()
-    // to confirm there are no dangling spills.  An unrestored spill leaves a
-    // stale value on the hardware stack, making the return address unreachable.
-    //
-    // In debug builds (NDEBUG not defined): prints the indices of unrestored
-    // spilled registers to stderr and triggers an assertion.
-    //
-    // In release builds (NDEBUG defined): compiles to nothing.
-    void assert_spill_stack_empty() const {
-#ifndef NDEBUG
-        if (!spill_stack_gp_.empty()) {
-            fprintf(stderr, "assert_spill_stack_empty: unrestored spills:");
-            for (size_t i = 0; i < spill_stack_gp_.size(); ++i)
-                fprintf(stderr, " %d", spill_stack_gp_[i]);
-            fprintf(stderr, "\n");
-        }
-        assert(spill_stack_gp_.empty() &&
-               "assert_spill_stack_empty: spill() without matching restore()");
-#endif
-    }
-
-    // Returns true if both the spill stack is empty and no StackFrame is open.
+    // Returns true if no CommittedLayout is currently open.
     // Use this to inspect state programmatically.  For a hard stop in debug
     // builds, use assert_clean_stack() instead.
     bool clean_stack() const {
-        return spill_stack_gp_.empty() && allocated_stack_space_ == 0;
+        return allocated_stack_space_ == 0;
     }
 
-    // Checks that the hardware stack is fully balanced: no unrestored spills
-    // and no open StackFrames.
+    // Checks that the hardware stack is fully balanced: no CommittedLayout is
+    // currently open.
     //
-    // Call this just before ret() to confirm every spill() has a restore() and
-    // every make_stack_frame() result has been destroyed.  An open frame or
-    // dangling spill corrupts rsp, making the return address unreachable.
+    // Call this just before ret() to confirm every CommittedLayout opened with
+    // make_stack_layout().build() has been destroyed.  An open layout leaves
+    // rsp pointing into allocated frame space, making the return address
+    // unreachable.
     //
     // In debug builds (NDEBUG not defined): prints diagnostic information to
     // stderr and triggers an assertion.
@@ -440,13 +411,12 @@ public:
     // In release builds (NDEBUG defined): compiles to nothing.
     void assert_clean_stack() const {
 #ifndef NDEBUG
-        assert_spill_stack_empty();
         if (allocated_stack_space_ != 0)
             fprintf(stderr,
-                    "assert_clean_stack: StackFrame not destroyed (%td bytes still allocated)\n",
+                    "assert_clean_stack: CommittedLayout not destroyed (%td bytes still allocated)\n",
                     allocated_stack_space_);
         assert(clean_stack() &&
-               "assert_clean_stack: unbalanced stack — open StackFrame or unrestored spill");
+               "assert_clean_stack: unbalanced stack — open CommittedLayout");
 #endif
     }
 
@@ -586,166 +556,6 @@ public:
     template <class Reg>
     inline Scoped<Reg> makeScoped(Reg r) & {
         return Scoped<Reg>(*this, r);
-    }
-
-    // RAII helper owning a stack frame allocated via make_stack_frame().
-    // Construction emits: sub rsp, size
-    // Destruction emits:  add rsp, size  (unless destroy() was called first)
-    // Move-only; do not copy.  All nested frames must be closed in LIFO order.
-    class StackFrame {
-    public:
-        StackFrame(RegPoolManager &rm, ptrdiff_t size)
-                : rm_(&rm), size_(size) {
-            if (!rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
-            if (size_ <= 0 || (size_ % 8) != 0) XBYAK_THROW(ERR_RM_STACK_FRAME_SIZE_INVALID)
-            rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(size_));
-            rm_->managed_push_count_ += static_cast<size_t>(size_) / 8;
-            rm_->allocated_stack_space_ += size_;
-        }
-
-        ~StackFrame() noexcept {
-            if (!rm_ || !rm_->cg_) return;
-#if !defined(XBYAK_NO_EXCEPTION)
-            try {
-                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
-                rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
-                rm_->allocated_stack_space_ -= size_;
-            } catch (...) {
-#ifndef NDEBUG
-                fprintf(stderr, "RegPoolManager::StackFrame::~StackFrame: exception swallowed\n");
-#endif
-            }
-#else
-            rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
-            rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
-            rm_->allocated_stack_space_ -= size_;
-#endif
-        }
-
-        StackFrame(const StackFrame &) = delete;
-        StackFrame &operator=(const StackFrame &) = delete;
-
-        StackFrame(StackFrame &&other) noexcept : rm_(other.rm_), size_(other.size_) {
-            other.rm_ = NULL;
-        }
-
-        // Explicitly closes the frame: emits add rsp, size immediately and
-        // makes the destructor a no-op.  Use this instead of a scope block when
-        // the frame lifetime does not align neatly with C++ scope boundaries,
-        // e.g. when ret() must follow immediately:
-        //
-        //   auto frame = make_stack_frame(N);
-        //   ...
-        //   frame.destroy();  // add rsp, N emitted here
-        //   ret();            // correct: rsp fully restored
-        //
-        // Calling destroy() more than once on the same frame is a no-op.
-        void destroy() {
-            if (!rm_) return;
-            if (rm_->cg_) {
-                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(size_));
-                rm_->managed_push_count_ -= static_cast<size_t>(size_) / 8;
-                rm_->allocated_stack_space_ -= size_;
-            }
-            rm_ = NULL; // disarms destructor
-        }
-
-        // Store reg at [rsp + offset] and free it from the allocator.
-        // Use this to park a register value on the stack while reclaiming the
-        // hardware register for other uses.
-        template <class RegT>
-        void put_on_stack(RegT &reg, ptrdiff_t offset) {
-            check_offset(offset);
-            do_store(rm_->cg_, reg, offset);
-            rm_->free(reg);
-        }
-
-        // Store reg at [rsp + offset] without freeing it.
-        template <class RegT>
-        void put_on_stack(const RegT &reg, ptrdiff_t offset) {
-            check_offset(offset);
-            do_store(rm_->cg_, reg, offset);
-        }
-
-        // Allocate a register of type RegT, load [rsp + offset] into it, and
-        // return it.  Caller is responsible for freeing the returned register.
-        template <class RegT>
-        RegT read_from_stack(ptrdiff_t offset) {
-            check_offset(offset);
-            RegT reg = rm_->alloc<RegT>();
-            do_load(rm_->cg_, reg, offset);
-            return reg;
-        }
-
-        ptrdiff_t size() const { return size_; }
-
-    private:
-        RegPoolManager *rm_;
-        ptrdiff_t       size_;
-
-        void check_offset(ptrdiff_t offset) const {
-            if (offset < 0 || offset >= size_)
-                XBYAK_THROW(ERR_RM_STACK_FRAME_OFFSET_OOB)
-        }
-
-        // GP store / load — one overload per concrete register type (C++11).
-        static void do_store(Xbyak::CodeGenerator *cg, const Reg64 &r, ptrdiff_t off) {
-            cg->mov(cg->qword[cg->rsp + off], r);
-        }
-        static void do_store(Xbyak::CodeGenerator *cg, const Reg32 &r, ptrdiff_t off) {
-            cg->mov(cg->dword[cg->rsp + off], r);
-        }
-        static void do_store(Xbyak::CodeGenerator *cg, const Reg16 &r, ptrdiff_t off) {
-            cg->mov(cg->word[cg->rsp + off], r);
-        }
-        static void do_store(Xbyak::CodeGenerator *cg, const Xmm &r, ptrdiff_t off) {
-            cg->vmovdqu(cg->ptr[cg->rsp + off], r);
-        }
-        static void do_store(Xbyak::CodeGenerator *cg, const Ymm &r, ptrdiff_t off) {
-            cg->vmovdqu(cg->ptr[cg->rsp + off], r);
-        }
-        static void do_store(Xbyak::CodeGenerator *cg, const Zmm &r, ptrdiff_t off) {
-            cg->vmovdqu32(cg->ptr[cg->rsp + off], r);
-        }
-
-        static void do_load(Xbyak::CodeGenerator *cg, Reg64 &r, ptrdiff_t off) {
-            cg->mov(r, cg->qword[cg->rsp + off]);
-        }
-        static void do_load(Xbyak::CodeGenerator *cg, Reg32 &r, ptrdiff_t off) {
-            cg->mov(r, cg->dword[cg->rsp + off]);
-        }
-        static void do_load(Xbyak::CodeGenerator *cg, Reg16 &r, ptrdiff_t off) {
-            cg->mov(r, cg->word[cg->rsp + off]);
-        }
-        static void do_load(Xbyak::CodeGenerator *cg, Xmm &r, ptrdiff_t off) {
-            cg->vmovdqu(r, cg->ptr[cg->rsp + off]);
-        }
-        static void do_load(Xbyak::CodeGenerator *cg, Ymm &r, ptrdiff_t off) {
-            cg->vmovdqu(r, cg->ptr[cg->rsp + off]);
-        }
-        static void do_load(Xbyak::CodeGenerator *cg, Zmm &r, ptrdiff_t off) {
-            cg->vmovdqu32(r, cg->ptr[cg->rsp + off]);
-        }
-    };
-
-    // Allocates a stack frame of size bytes.  Emits sub rsp, size immediately
-    // and add rsp, size when the frame is closed.
-    // size must be a positive multiple of 8; multiples of 16 ensure the stack
-    // remains 16-byte aligned after the allocation.
-    //
-    // Close the frame explicitly with destroy() before ret() — preferred:
-    //   auto frame = make_stack_frame(N);
-    //   ...
-    //   frame.destroy();  // add rsp, N emitted here
-    //   ret();
-    //
-    // Alternatively, use a block scope to let the destructor close it:
-    //   { auto frame = make_stack_frame(N); ...; }  // add rsp, N on scope exit
-    //   ret();
-    //
-    // Throws Xbyak::Error if no CodeGenerator has been provided.
-    StackFrame make_stack_frame(ptrdiff_t size) {
-        return StackFrame(*this, size);
     }
 
     // -------------------------------------------------------------------------
@@ -1262,11 +1072,6 @@ public:
         reserved_vec.clear();
         reserved_opmask.clear();
         reserved_tile.clear();
-        spill_stack_gp_.clear();
-        saved_volatile_gp_.clear();
-        saved_volatile_vec_.clear();
-        saved_volatile_vec_bytes_ = 0;
-        saved_volatiles_armed_ = false;
         allocated_preserved_gp_.clear();
         allocated_preserved_vec_.clear();
         prologue_gp_cursor_ = 0;
@@ -1341,36 +1146,28 @@ public:
     // Handles 16-byte stack alignment and (on Windows x64) the 32-byte shadow
     // space requirement automatically.
     //
-    // func_ptr     — address of the target function.
-    // extra_pushes — escape hatch for push instructions emitted directly via
-    //                CodeGenerator that the manager has not tracked (e.g. a raw
-    //                push(rbx) to stash a return value).  Default 0.
-    //                Normal usage should route all pushes through spill(),
-    //                emit_prologue(), or save_volatiles(), in which case
-    //                extra_pushes is always 0.
+    // func_ptr — address of the target function.
     //
     // Return-value note: emit_call() uses rax internally (mov rax, func_ptr;
     //                call rax).  If rax is currently allocated, its value will
-    //                be destroyed.  Use save_volatiles() before the call and
-    //                stash the return value (mov preserved_reg, rax) before
-    //                calling restore_volatiles().
+    //                be destroyed.  Park it with CommittedLayout::park() before
+    //                the call and reload it afterwards.
     //
     // In debug builds (NDEBUG not defined): asserts that rax is not currently
     //                allocated and prints a diagnostic to stderr if it is.
     //
     // Throws Xbyak::Error if no CodeGenerator has been provided.
-    void emit_call(uint64_t func_ptr, size_t extra_pushes = 0) {
+    void emit_call(uint64_t func_ptr) {
         if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
 #ifndef NDEBUG
         if (live_gp_.count(0)) {
             fprintf(stderr,
                     "emit_call: rax (index 0) is currently allocated — its value will be "
-                    "destroyed by the call. Save it with save_volatiles() before calling.\n");
+                    "destroyed by the call. Park it with CommittedLayout::park() before calling.\n");
             assert(!live_gp_.count(0) && "emit_call: rax is live and will be clobbered");
         }
 #endif
-        const size_t total_pushes = managed_push_count_ + extra_pushes;
-        const bool needs_pad = (total_pushes % 2) == 0;
+        const bool needs_pad = (managed_push_count_ % 2) == 0;
 #ifdef _WIN32
         const int adj = 32 + (needs_pad ? 8 : 0);
 #else
@@ -1385,66 +1182,8 @@ public:
     // Convenience overload: accepts a typed function pointer.
     // The pointer is reinterpreted as a uint64_t address before emission.
     template <typename FuncT>
-    void emit_call(FuncT *func_ptr, size_t extra_pushes = 0) {
-        emit_call(reinterpret_cast<uint64_t>(func_ptr), extra_pushes);
-    }
-
-    // Pushes reg onto the hardware stack, marks it not-in-use, and returns its
-    // index to the free pool so alloc() can reuse it as a scratch register.
-    // Pair each spill() with a matching restore() once the scratch is freed.
-    //
-    // Throws Xbyak::Error if reg is not currently allocated, or if no
-    // CodeGenerator has been provided.
-    void spill(const Reg64 &reg) {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        const int idx = reg.getIdx();
-        if (!live_gp_.count(idx)) XBYAK_THROW(ERR_RM_SPILL_NOT_IN_USE)
-        cg_->push(Reg64(idx));
-        ++managed_push_count_;
-        live_gp_.erase(idx);
-        free_gp_regs.insert(idx);
-        spill_stack_gp_.push_back(idx);
-    }
-
-    // Restores the most-recently-spilled GP register (LIFO).
-    // Emits pop, removes it from the free pool, and re-adds it to in-use.
-    // Returns the restored register.
-    //
-    // Throws Xbyak::Error if nothing is spilled, or if no CodeGenerator
-    // has been provided.
-    Reg64 restore() {
-        if (!cg_) XBYAK_THROW_RET(ERR_RM_NO_CG, Reg64(0))
-        if (spill_stack_gp_.empty()) XBYAK_THROW_RET(ERR_RM_SPILL_NOT_IN_USE, Reg64(0))
-        const int idx = spill_stack_gp_.back();
-        spill_stack_gp_.pop_back();
-        cg_->pop(Reg64(idx));
-        --managed_push_count_;
-        free_gp_regs.erase(idx);
-        live_gp_.insert(idx);
-        return Reg64(idx);
-    }
-
-    // Restores a specific spilled register; reg must be the most-recently-spilled
-    // (top of the spill stack).  Throws if reg is not at the top, the stack is
-    // empty, or no CodeGenerator has been provided.
-    void restore(const Reg64 &reg) {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        if (spill_stack_gp_.empty() || spill_stack_gp_.back() != reg.getIdx())
-            XBYAK_THROW(ERR_RM_SPILL_NOT_IN_USE)
-        const int idx = spill_stack_gp_.back();
-        spill_stack_gp_.pop_back();
-        cg_->pop(Reg64(idx));
-        --managed_push_count_;
-        free_gp_regs.erase(idx);
-        live_gp_.insert(idx);
-    }
-
-    // Restores multiple spilled registers in reverse spill order.
-    // Pass the registers in the order they were spilled; the vector is
-    // iterated in reverse so the pops match the push sequence.
-    void restore(const std::vector<Reg64> &spilled_regs) {
-        for (int i = (int)spilled_regs.size() - 1; i >= 0; --i)
-            restore(spilled_regs[i]);
+    void emit_call(FuncT *func_ptr) {
+        emit_call(reinterpret_cast<uint64_t>(func_ptr));
     }
 
     // Returns the indices of callee-saved GP registers promoted by alloc(),
@@ -1459,131 +1198,6 @@ public:
     // on Linux and macOS where all vector registers are caller-saved.
     std::vector<int> get_allocated_preserved_vecs() const {
         return allocated_preserved_vec_;
-    }
-
-    // Pushes every currently live volatile GP register onto the hardware stack,
-    // in index order, and records them so restore_gp_volatiles() can reverse the
-    // sequence.  managed_push_count_ is incremented accordingly, keeping
-    // emit_call() alignment correct with no extra bookkeeping on your part.
-    //
-    // Pair each call with exactly one restore_gp_volatiles().  Nested calls are
-    // not supported.
-    //
-    // Throws Xbyak::Error if no CodeGenerator has been provided.
-    void save_gp_volatiles() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        saved_volatile_gp_.clear();
-        const std::vector<int> vols = get_live_volatile_gps();
-        for (int idx : vols) {
-            cg_->push(Reg64(idx));
-            ++managed_push_count_;
-            saved_volatile_gp_.push_back(idx);
-        }
-    }
-
-    // Pops the registers saved by the most recent save_gp_volatiles() in reverse
-    // order, restoring their values.  managed_push_count_ is decremented to
-    // match.
-    //
-    // Throws Xbyak::Error if called without a preceding save_gp_volatiles(),
-    // or if no CodeGenerator has been provided.
-    void restore_gp_volatiles() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        if (saved_volatile_gp_.empty()) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
-        for (int i = (int)saved_volatile_gp_.size() - 1; i >= 0; --i) {
-            cg_->pop(Reg64(saved_volatile_gp_[i]));
-            --managed_push_count_;
-        }
-        saved_volatile_gp_.clear();
-    }
-
-    // Saves every currently live volatile vector register to the stack using
-    // vmovdqu/vmovdqu32 and records them so restore_vec_volatiles() can reverse
-    // the sequence.  managed_push_count_ is updated accordingly, keeping
-    // emit_call() alignment correct with no extra bookkeeping on your part.
-    //
-    // On Windows (x64): only xmm0–xmm5 are volatile; xmm6–xmm15 are
-    // callee-saved and handled by emit_prologue()/emit_epilogue().
-    // On Linux/macOS: all vector registers are volatile.
-    //
-    // When AVX-512 is available, each register is saved at ZMM width (64
-    // bytes), preserving the full 512-bit state.  Otherwise each register is
-    // saved at YMM width (32 bytes), preserving both the XMM and upper-XMM
-    // (YMM) state.
-    //
-    // Pair each call with exactly one restore_vec_volatiles().  Nested calls
-    // are not supported.
-    //
-    // Throws Xbyak::Error if no CodeGenerator has been provided.
-    void save_vec_volatiles() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        saved_volatile_vec_.clear();
-        const std::vector<int> vols = get_live_volatile_vecs();
-        if (vols.empty()) return;
-        const int bytes_per = has_avx512_ ? 64 : 32;
-        const int total     = (int)vols.size() * bytes_per;
-        cg_->sub(cg_->rsp, total);
-        managed_push_count_ += total / 8;
-        for (int i = 0; i < (int)vols.size(); ++i) {
-            if (has_avx512_)
-                cg_->vmovdqu32(cg_->ptr[cg_->rsp + i * bytes_per], Zmm(vols[i]));
-            else
-                cg_->vmovdqu(cg_->ptr[cg_->rsp + i * bytes_per], Ymm(vols[i]));
-        }
-        saved_volatile_vec_ = vols;
-        saved_volatile_vec_bytes_ = total;
-    }
-
-    // Restores the vector registers saved by the most recent save_vec_volatiles()
-    // in the same slot order and reclaims the stack space.  managed_push_count_
-    // is decremented to match.
-    //
-    // Throws Xbyak::Error if called without a preceding save_vec_volatiles(),
-    // or if no CodeGenerator has been provided.
-    void restore_vec_volatiles() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        if (saved_volatile_vec_.empty()) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
-        const int bytes_per = has_avx512_ ? 64 : 32;
-        for (int i = 0; i < (int)saved_volatile_vec_.size(); ++i) {
-            if (has_avx512_)
-                cg_->vmovdqu32(Zmm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * bytes_per]);
-            else
-                cg_->vmovdqu(Ymm(saved_volatile_vec_[i]), cg_->ptr[cg_->rsp + i * bytes_per]);
-        }
-        cg_->add(cg_->rsp, saved_volatile_vec_bytes_);
-        managed_push_count_ -= saved_volatile_vec_bytes_ / 8;
-        saved_volatile_vec_.clear();
-        saved_volatile_vec_bytes_ = 0;
-    }
-
-    // Saves all currently live volatile GP and vector registers in one call.
-    // Calls save_gp_volatiles() followed by save_vec_volatiles() and arms the
-    // paired restore.  Pair with restore_volatiles().
-    //
-    // Unlike the individual save_gp_volatiles() / save_vec_volatiles(), the
-    // matching restore_volatiles() does not throw when nothing was saved (i.e.
-    // all volatile registers happen to be free at the call site).
-    //
-    // Throws Xbyak::Error if no CodeGenerator has been provided.
-    void save_volatiles() {
-        save_gp_volatiles();
-        save_vec_volatiles();
-        saved_volatiles_armed_ = true;
-    }
-
-    // Restores all registers saved by the most recent save_volatiles().
-    // Restores vector registers first (they were pushed via sub rsp last),
-    // then GP registers, maintaining correct LIFO stack order.
-    //
-    // Safe to call when save_volatiles() saved nothing.  Throws Xbyak::Error
-    // if called without a preceding save_volatiles(), or if no CodeGenerator
-    // has been provided.
-    void restore_volatiles() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
-        if (!saved_volatiles_armed_) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
-        saved_volatiles_armed_ = false;
-        if (!saved_volatile_vec_.empty()) restore_vec_volatiles();
-        if (!saved_volatile_gp_.empty())  restore_gp_volatiles();
     }
 
     // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
@@ -1959,29 +1573,12 @@ private:
     int prologue_vec_cursor_;
 
     // Running count of push-equivalent 8-byte stack slots emitted by the manager
-    // since function entry (incremented by emit_prologue and spill, decremented
-    // by restore).  Used by emit_call to compute 16-byte stack alignment.
+    // since function entry (incremented by emit_prologue, decremented by
+    // emit_epilogue).  Used by emit_call to compute 16-byte stack alignment.
     size_t managed_push_count_;
 
-    // Total bytes currently reserved by live StackFrame objects.
+    // Total bytes currently reserved by live CommittedLayout objects.
     ptrdiff_t allocated_stack_space_;
-
-    // LIFO stack of GP register indices currently pushed onto the hardware stack
-    // by spill().  restore() pops entries from the back in reverse order.
-    std::vector<int> spill_stack_gp_;
-
-    // GP register indices pushed by the most recent save_gp_volatiles(), in push
-    // order.  restore_gp_volatiles() pops them in reverse.
-    std::vector<int> saved_volatile_gp_;
-
-    // Vector register indices stored by the most recent save_vec_volatiles(),
-    // in save order.  restore_vec_volatiles() reloads from the same slots.
-    std::vector<int> saved_volatile_vec_;
-    int saved_volatile_vec_bytes_ = 0;
-
-    // Armed by save_volatiles() (combined); cleared by restore_volatiles() (combined).
-    // Distinguishes a correct restore_volatiles() call from one with no preceding save.
-    bool saved_volatiles_armed_ = false;
 
 #ifndef NDEBUG
     // Set by CommittedLayout construction, cleared by destroy()/destructor.
