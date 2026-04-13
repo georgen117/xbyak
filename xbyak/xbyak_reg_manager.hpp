@@ -748,6 +748,445 @@ public:
         return StackFrame(*this, size);
     }
 
+    // -------------------------------------------------------------------------
+    // StackLayout / CommittedLayout — two-phase unified stack management
+    //
+    // Guarantees rsp moves exactly once (at build()) and never again until
+    // destroy().  All slot offsets are fixed at build() time, so park,
+    // reload, and scratch operations remain valid regardless of what else
+    // happens between build() and destroy().
+    //
+    // Typical usage:
+    //
+    //   emit_prologue();                        // push callee-saves first
+    //
+    //   auto cl = make_stack_layout()
+    //       .gp_parks(2)                        // two 8-byte GP slots
+    //       .vec_parks(1)                       // one ZMM/YMM slot
+    //       .scratch(64)                        // 64 bytes of raw scratch
+    //       .with_volatile_save()               // snapshot live volatiles now
+    //       .build();                           // emits: sub rsp, <total>
+    //
+    //   cl.park(rdi, 0);                        // mov [rsp+0], rdi; free rdi
+    //   cl.park_vec(zmm0, 0);                   // vmovdqu32 [rsp+N], zmm0; free zmm0
+    //   cl.save_volatiles();                    // mov [rsp+..], live_vol_reg ...
+    //   emit_call(&my_func);
+    //   cl.restore_volatiles();
+    //   auto r = cl.reload<Reg64>(0);           // mov r, [rsp+0]; alloc r
+    //
+    //   cl.destroy();                           // emits: add rsp, <total>
+    //   emit_epilogue();
+    //   ret();
+    // -------------------------------------------------------------------------
+
+    // Forward declarations for the builder and committed types.
+    class CommittedLayout;
+
+    // Builder — accumulates slot requirements before any code is emitted.
+    // All methods return *this for chaining.  No machine code is emitted until
+    // build() is called.
+    class StackLayout {
+    public:
+        explicit StackLayout(RegPoolManager &rm)
+                : rm_(&rm), gp_count_(0), vec_count_(0),
+                  scratch_bytes_(0), with_volatile_save_(false) {}
+
+        // Reserve n GP-sized (8-byte) park slots.
+        StackLayout &gp_parks(int n) { gp_count_ = n; return *this; }
+
+        // Reserve n vector park slots.
+        // Each slot is 64 bytes when AVX-512 is present, 32 bytes otherwise.
+        StackLayout &vec_parks(int n) { vec_count_ = n; return *this; }
+
+        // Reserve a raw scratch area of 'bytes' bytes (must be a positive multiple of 8).
+        StackLayout &scratch(ptrdiff_t bytes) { scratch_bytes_ = bytes; return *this; }
+
+        // Reserve fixed-offset slots for all ABI-volatile GP and vector registers.
+        // save_volatiles() will store only those that are live at call time;
+        // restore_volatiles() reloads exactly the same set.  Because slots are
+        // sized for every possible volatile register, the set of live registers
+        // at save_volatiles() time does not need to match the set at build() time.
+        StackLayout &with_volatile_save() { with_volatile_save_ = true; return *this; }
+
+        // Commit: compute the total frame size, emit sub rsp, <total>, and
+        // return a CommittedLayout owning the frame.
+        // Throws Xbyak::Error if no CodeGenerator has been provided, or if a
+        // CommittedLayout is already active on this manager.
+        CommittedLayout build() {
+            return rm_->build_layout(gp_count_, vec_count_,
+                                     scratch_bytes_, with_volatile_save_);
+        }
+
+    private:
+        RegPoolManager *rm_;
+        int    gp_count_;
+        int    vec_count_;
+        ptrdiff_t scratch_bytes_;
+        bool   with_volatile_save_;
+    };
+
+    // Committed layout — owns the stack frame opened by StackLayout::build().
+    // Construction emits sub rsp, <total>.
+    // Destruction emits add rsp, <total> (unless destroy() was called first).
+    // Move-only.
+    class CommittedLayout {
+    public:
+        CommittedLayout(RegPoolManager &rm,
+                        ptrdiff_t      gp_base,
+                        int            gp_count,
+                        ptrdiff_t      vec_base,
+                        int            vec_count,
+                        int            vec_slot_bytes,
+                        ptrdiff_t      scratch_base,
+                        ptrdiff_t      scratch_bytes,
+                        ptrdiff_t      total,
+                        std::vector<int> volatile_gps,
+                        ptrdiff_t      vol_gp_base,
+                        std::vector<int> volatile_vecs,
+                        ptrdiff_t      vol_vec_base,
+                        int            vol_vec_slot_bytes,
+                        bool           vol_save_declared)
+                : rm_(&rm), gp_base_(gp_base), gp_count_(gp_count),
+                  vec_base_(vec_base), vec_count_(vec_count),
+                  vec_slot_bytes_(vec_slot_bytes),
+                  scratch_base_(scratch_base), scratch_bytes_(scratch_bytes),
+                  total_(total),
+                  volatile_gps_(volatile_gps), vol_gp_base_(vol_gp_base),
+                  volatile_vecs_(volatile_vecs), vol_vec_base_(vol_vec_base),
+                  vol_vec_slot_bytes_(vol_vec_slot_bytes),
+                  vol_save_declared_(vol_save_declared),
+                  vol_save_armed_(false) {
+            if (!rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
+            rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
+            rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
+            rm_->allocated_stack_space_ += total_;
+#ifndef NDEBUG
+            rm_->layout_active_ = true;
+#endif
+        }
+
+        ~CommittedLayout() noexcept { do_destroy(); }
+
+        CommittedLayout(const CommittedLayout &) = delete;
+        CommittedLayout &operator=(const CommittedLayout &) = delete;
+
+        CommittedLayout(CommittedLayout &&other) noexcept
+                : rm_(other.rm_), gp_base_(other.gp_base_),
+                  gp_count_(other.gp_count_), vec_base_(other.vec_base_),
+                  vec_count_(other.vec_count_),
+                  vec_slot_bytes_(other.vec_slot_bytes_),
+                  scratch_base_(other.scratch_base_),
+                  scratch_bytes_(other.scratch_bytes_), total_(other.total_),
+                  volatile_gps_(std::move(other.volatile_gps_)),
+                  vol_gp_base_(other.vol_gp_base_),
+                  volatile_vecs_(std::move(other.volatile_vecs_)),
+                  vol_vec_base_(other.vol_vec_base_),
+                  vol_vec_slot_bytes_(other.vol_vec_slot_bytes_),
+                  vol_save_declared_(other.vol_save_declared_),
+                  vol_save_armed_(other.vol_save_armed_),
+                  actually_saved_gp_indices_(std::move(other.actually_saved_gp_indices_)),
+                  actually_saved_vec_indices_(std::move(other.actually_saved_vec_indices_)) {
+            other.rm_ = NULL;
+        }
+
+        // Emit add rsp, <total> immediately and disarm the destructor.
+        void destroy() {
+            do_destroy();
+        }
+
+        // Store reg at GP park slot slot_idx and free it from the allocator.
+        // Emits: mov [rsp + gp_base + slot_idx*8], reg
+        template <class RegT>
+        void park(RegT &reg, int slot_idx) {
+            check_gp_slot(slot_idx);
+            do_store(rm_->cg_, reg,
+                     gp_base_ + static_cast<ptrdiff_t>(slot_idx) * 8);
+            rm_->free(reg);
+        }
+
+        // Store reg at GP park slot without freeing it.
+        template <class RegT>
+        void park(const RegT &reg, int slot_idx) {
+            check_gp_slot(slot_idx);
+            do_store(rm_->cg_, reg,
+                     gp_base_ + static_cast<ptrdiff_t>(slot_idx) * 8);
+        }
+
+        // Allocate a new register of type RegT and load GP park slot slot_idx into it.
+        // Caller is responsible for freeing the returned register.
+        template <class RegT>
+        RegT reload(int slot_idx) {
+            check_gp_slot(slot_idx);
+            RegT reg = rm_->alloc<RegT>();
+            do_load(rm_->cg_, reg,
+                    gp_base_ + static_cast<ptrdiff_t>(slot_idx) * 8);
+            return reg;
+        }
+
+        // Store vec reg at vector park slot slot_idx and free it from the allocator.
+        // Slot size is 64 bytes (ZMM) when AVX-512 is present, 32 bytes (YMM) otherwise.
+        template <class VecT>
+        void park_vec(VecT &reg, int slot_idx) {
+            check_vec_slot(slot_idx);
+            const ptrdiff_t off = vec_base_ + static_cast<ptrdiff_t>(slot_idx) * vec_slot_bytes_;
+            do_store(rm_->cg_, reg, off);
+            rm_->free(reg);
+        }
+
+        // Store vec reg at vector park slot without freeing it.
+        template <class VecT>
+        void park_vec(const VecT &reg, int slot_idx) {
+            check_vec_slot(slot_idx);
+            const ptrdiff_t off = vec_base_ + static_cast<ptrdiff_t>(slot_idx) * vec_slot_bytes_;
+            do_store(rm_->cg_, reg, off);
+        }
+
+        // Allocate a new register of type VecT and load vector park slot slot_idx into it.
+        // Caller is responsible for freeing the returned register.
+        template <class VecT>
+        VecT reload_vec(int slot_idx) {
+            check_vec_slot(slot_idx);
+            const ptrdiff_t off = vec_base_ + static_cast<ptrdiff_t>(slot_idx) * vec_slot_bytes_;
+            VecT reg = rm_->alloc<VecT>();
+            do_load(rm_->cg_, reg, off);
+            return reg;
+        }
+
+        // Emit fixed-offset stores for each volatile register that is currently
+        // live (allocated).  Must only be called if with_volatile_save() was
+        // declared.  Does not move rsp.  The set saved here is exactly the set
+        // that restore_volatiles() will reload.
+        void save_volatiles() {
+            if (!vol_save_declared_) XBYAK_THROW(ERR_RM_LAYOUT_SAVE_NOT_DECLARED)
+            actually_saved_gp_indices_.clear();
+            for (int i = 0; i < (int)volatile_gps_.size(); ++i) {
+                if (!rm_->live_gp_.count(volatile_gps_[i])) continue;
+                const ptrdiff_t off = vol_gp_base_ + static_cast<ptrdiff_t>(i) * 8;
+                rm_->cg_->mov(rm_->cg_->qword[rm_->cg_->rsp + off], Reg64(volatile_gps_[i]));
+                actually_saved_gp_indices_.push_back(i);
+            }
+            actually_saved_vec_indices_.clear();
+            for (int i = 0; i < (int)volatile_vecs_.size(); ++i) {
+                if (!rm_->live_vec_.count(volatile_vecs_[i])) continue;
+                const ptrdiff_t off = vol_vec_base_ + static_cast<ptrdiff_t>(i) * vol_vec_slot_bytes_;
+                if (vol_vec_slot_bytes_ == 64)
+                    rm_->cg_->vmovdqu32(rm_->cg_->ptr[rm_->cg_->rsp + off], Zmm(volatile_vecs_[i]));
+                else
+                    rm_->cg_->vmovdqu(rm_->cg_->ptr[rm_->cg_->rsp + off], Ymm(volatile_vecs_[i]));
+                actually_saved_vec_indices_.push_back(i);
+            }
+            vol_save_armed_ = true;
+        }
+
+        // Reload the registers saved by the preceding save_volatiles() call,
+        // in reverse order.  Only the registers that were actually stored are
+        // reloaded.  Must be called after save_volatiles().
+        void restore_volatiles() {
+            if (!vol_save_declared_) XBYAK_THROW(ERR_RM_LAYOUT_SAVE_NOT_DECLARED)
+            if (!vol_save_armed_) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
+            for (int i = (int)actually_saved_vec_indices_.size() - 1; i >= 0; --i) {
+                const int slot_i = actually_saved_vec_indices_[i];
+                const ptrdiff_t off = vol_vec_base_ + static_cast<ptrdiff_t>(slot_i) * vol_vec_slot_bytes_;
+                if (vol_vec_slot_bytes_ == 64)
+                    rm_->cg_->vmovdqu32(Zmm(volatile_vecs_[slot_i]), rm_->cg_->ptr[rm_->cg_->rsp + off]);
+                else
+                    rm_->cg_->vmovdqu(Ymm(volatile_vecs_[slot_i]), rm_->cg_->ptr[rm_->cg_->rsp + off]);
+            }
+            actually_saved_vec_indices_.clear();
+            for (int i = (int)actually_saved_gp_indices_.size() - 1; i >= 0; --i) {
+                const int slot_i = actually_saved_gp_indices_[i];
+                const ptrdiff_t off = vol_gp_base_ + static_cast<ptrdiff_t>(slot_i) * 8;
+                rm_->cg_->mov(Reg64(volatile_gps_[slot_i]), rm_->cg_->qword[rm_->cg_->rsp + off]);
+            }
+            actually_saved_gp_indices_.clear();
+            vol_save_armed_ = false;
+        }
+
+        // Return a memory address [rsp + scratch_base + byte_offset] for use as a
+        // memory operand in generated code.
+        // byte_offset must be in [0, scratch_bytes).
+        Xbyak::Address scratch_addr(ptrdiff_t byte_offset = 0) const {
+            if (byte_offset < 0 || byte_offset >= scratch_bytes_)
+                XBYAK_THROW_RET(ERR_RM_LAYOUT_SCRATCH_OOB,
+                                rm_->cg_->qword[rm_->cg_->rsp])
+            return rm_->cg_->ptr[rm_->cg_->rsp + scratch_base_ + byte_offset];
+        }
+
+        // Total bytes reserved by this layout.
+        ptrdiff_t total_size() const { return total_; }
+
+        // True if with_volatile_save() was declared on the builder.
+        bool has_volatile_save() const { return vol_save_declared_; }
+
+    private:
+        RegPoolManager *rm_;
+        ptrdiff_t gp_base_;
+        int       gp_count_;
+        ptrdiff_t vec_base_;
+        int       vec_count_;
+        int       vec_slot_bytes_;
+        ptrdiff_t scratch_base_;
+        ptrdiff_t scratch_bytes_;
+        ptrdiff_t total_;
+        std::vector<int> volatile_gps_;
+        ptrdiff_t vol_gp_base_;
+        std::vector<int> volatile_vecs_;
+        ptrdiff_t vol_vec_base_;
+        int       vol_vec_slot_bytes_;
+        bool      vol_save_declared_;
+        bool      vol_save_armed_;
+        // Indices into volatile_gps_ / volatile_vecs_ that were actually stored
+        // by the most recent save_volatiles() call.  Used by restore_volatiles()
+        // to emit loads for exactly the same set.
+        std::vector<int> actually_saved_gp_indices_;
+        std::vector<int> actually_saved_vec_indices_;
+
+        void check_gp_slot(int idx) const {
+            if (idx < 0 || idx >= gp_count_)
+                XBYAK_THROW(ERR_RM_LAYOUT_SLOT_OOB)
+        }
+        void check_vec_slot(int idx) const {
+            if (idx < 0 || idx >= vec_count_)
+                XBYAK_THROW(ERR_RM_LAYOUT_SLOT_OOB)
+        }
+
+        static void do_store(Xbyak::CodeGenerator *cg, const Reg64 &r, ptrdiff_t off) {
+            cg->mov(cg->qword[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Reg32 &r, ptrdiff_t off) {
+            cg->mov(cg->dword[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Reg16 &r, ptrdiff_t off) {
+            cg->mov(cg->word[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Xmm &r, ptrdiff_t off) {
+            cg->vmovdqu(cg->ptr[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Ymm &r, ptrdiff_t off) {
+            cg->vmovdqu(cg->ptr[cg->rsp + off], r);
+        }
+        static void do_store(Xbyak::CodeGenerator *cg, const Zmm &r, ptrdiff_t off) {
+            cg->vmovdqu32(cg->ptr[cg->rsp + off], r);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Reg64 &r, ptrdiff_t off) {
+            cg->mov(r, cg->qword[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Reg32 &r, ptrdiff_t off) {
+            cg->mov(r, cg->dword[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Reg16 &r, ptrdiff_t off) {
+            cg->mov(r, cg->word[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Xmm &r, ptrdiff_t off) {
+            cg->vmovdqu(r, cg->ptr[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Ymm &r, ptrdiff_t off) {
+            cg->vmovdqu(r, cg->ptr[cg->rsp + off]);
+        }
+        static void do_load(Xbyak::CodeGenerator *cg, Zmm &r, ptrdiff_t off) {
+            cg->vmovdqu32(r, cg->ptr[cg->rsp + off]);
+        }
+
+        void do_destroy() noexcept {
+            if (!rm_ || !rm_->cg_) return;
+#if !defined(XBYAK_NO_EXCEPTION)
+            try {
+                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
+                rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
+                rm_->allocated_stack_space_ -= total_;
+#ifndef NDEBUG
+                rm_->layout_active_ = false;
+#endif
+            } catch (...) {
+#ifndef NDEBUG
+                fprintf(stderr, "CommittedLayout::~CommittedLayout: exception swallowed\n");
+#endif
+            }
+#else
+            rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
+            rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
+            rm_->allocated_stack_space_ -= total_;
+#ifndef NDEBUG
+            rm_->layout_active_ = false;
+#endif
+#endif
+            rm_ = NULL;
+        }
+    };
+
+    // Create a StackLayout builder.  Chain declarations on the returned object
+    // then call build() to commit the frame.
+    //
+    //   auto cl = make_stack_layout()
+    //       .gp_parks(2)
+    //       .scratch(32)
+    //       .build();
+    //
+    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    StackLayout make_stack_layout() {
+        return StackLayout(*this);
+    }
+
+    // build() is defined here so it can reference CommittedLayout's constructor.
+    // Called by StackLayout::build() which delegates here after computing layout.
+    CommittedLayout build_layout(int gp_count, int vec_count,
+                                 ptrdiff_t scratch_bytes, bool with_vol) {
+        if (!cg_) XBYAK_THROW_RET(ERR_RM_NO_CG, CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+#ifndef NDEBUG
+        if (layout_active_) XBYAK_THROW_RET(ERR_RM_LAYOUT_ALREADY_ACTIVE,
+                CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+#endif
+        const int vec_slot = has_avx512_ ? 64 : 32;
+
+        // Slot layout (all offsets relative to the new rsp after sub):
+        //  [0 .. gp_count*8)              — GP park slots
+        //  [gp_base .. + vec_count*slot)  — vec park slots
+        //  [vec_end .. + vol_gp*8)        — volatile GP save slots
+        //  [vol_gp_end .. + vol_vec*slot) — volatile vec save slots
+        //  [vol_end .. + scratch)         — scratch
+        ptrdiff_t cursor = 0;
+
+        const ptrdiff_t gp_base = cursor;
+        cursor += static_cast<ptrdiff_t>(gp_count) * 8;
+
+        const ptrdiff_t vec_base = cursor;
+        cursor += static_cast<ptrdiff_t>(vec_count) * vec_slot;
+
+        // Reserve slots for the full set of ABI-volatile registers so that
+        // save_volatiles() / restore_volatiles() work regardless of which
+        // registers are allocated at build() time vs at the call site.
+        std::vector<int> vol_gps, vol_vecs;
+        if (with_vol) {
+            for (int idx : base_free_gp()) vol_gps.push_back(idx);
+            if (has_apx_)
+                for (int i = 16; i <= 31; ++i) vol_gps.push_back(i);
+            if (has_vec_base_) {
+                for (int idx : base_free_vec()) vol_vecs.push_back(idx);
+                if (has_avx512_)
+                    for (int i = 16; i <= 31; ++i) vol_vecs.push_back(i);
+            }
+        }
+
+        const ptrdiff_t vol_gp_base = cursor;
+        cursor += static_cast<ptrdiff_t>(vol_gps.size()) * 8;
+
+        const ptrdiff_t vol_vec_base = cursor;
+        cursor += static_cast<ptrdiff_t>(vol_vecs.size()) * vec_slot;
+
+        const ptrdiff_t scratch_base = cursor;
+        cursor += scratch_bytes;
+
+        // Round total up to nearest 16 bytes for stack alignment.
+        ptrdiff_t total = (cursor + 15) & ~ptrdiff_t(15);
+        if (total == 0) total = 16; // always emit something for simpler state
+
+        return CommittedLayout(*this, gp_base, gp_count, vec_base, vec_count,
+                               vec_slot, scratch_base, scratch_bytes, total,
+                               std::move(vol_gps), vol_gp_base,
+                               std::move(vol_vecs), vol_vec_base, vec_slot,
+                               with_vol);
+    }
+
     // helper methods to query APX support
     bool has_apx() const { return has_apx_; }
     int max_gp_registers() const { return max_gp_reg_idx_ + 1; }
@@ -834,6 +1273,9 @@ public:
         prologue_vec_cursor_ = 0;
         managed_push_count_ = 0;
         allocated_stack_space_ = 0;
+#ifndef NDEBUG
+        layout_active_ = false;
+#endif
     }
 
     // Emits a push instruction for each callee-saved GP register promoted by
@@ -1540,6 +1982,12 @@ private:
     // Armed by save_volatiles() (combined); cleared by restore_volatiles() (combined).
     // Distinguishes a correct restore_volatiles() call from one with no preceding save.
     bool saved_volatiles_armed_ = false;
+
+#ifndef NDEBUG
+    // Set by CommittedLayout construction, cleared by destroy()/destructor.
+    // Allows detection of nested build() calls in debug builds.
+    bool layout_active_ = false;
+#endif
 
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.

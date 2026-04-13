@@ -2823,9 +2823,11 @@ public:
     // Returns *this for chaining.
     StackLayout &scratch(ptrdiff_t bytes);
 
-    // Snapshot the currently-live volatile GP and vector registers so that
-    // save_volatiles() / restore_volatiles() on the CommittedLayout use
-    // fixed-offset mov instead of push/sub rsp.
+    // Reserve fixed-offset stack slots for every ABI-volatile GP and vector
+    // register.  save_volatiles() on the CommittedLayout will store only those
+    // that are live at the time of the call; restore_volatiles() reloads exactly
+    // that set.  The slot map is independent of which registers are allocated at
+    // build() time, so registration order does not matter.
     // Returns *this for chaining.
     StackLayout &with_volatile_save();
 
@@ -2878,12 +2880,13 @@ public:
     template <class VecT>
     VecT reload_vec(int slot_idx);
 
-    // Emit store instructions for all volatile registers snapshotted by
-    // StackLayout::with_volatile_save(). Uses fixed offsets — does not move rsp.
-    // Must be called before the registers' values are clobbered.
+    // Emit fixed-offset stores for each volatile register that is currently
+    // live (allocated) at the time of the call.  Uses fixed offsets — does not
+    // move rsp.  The saved set is recorded and passed to restore_volatiles().
     void save_volatiles();
 
-    // Reload volatile registers from their fixed slots.
+    // Reload the registers saved by the preceding save_volatiles() call,
+    // in reverse order.  Only the registers that were actually stored are reloaded.
     void restore_volatiles();
 
     // Return a stack address suitable for use as a memory operand.
@@ -2996,8 +2999,8 @@ public:
 ### Usage Example — Calling a C Runtime Function
 
 ```cpp
-// save_volatiles() snapshots the live volatile registers declared at layout
-// build time and stores them to fixed slots — no rsp movement.
+// save_volatiles() stores each volatile register that is live at that moment
+// to its pre-reserved fixed slot — no rsp movement.
 cl.save_volatiles();        // emits: mov [rsp+slot_N], reg for each live volatile
 emit_call(&my_c_function);  // alignment is trivially correct: managed_push_count_ stable
 cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
@@ -3005,6 +3008,16 @@ cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
 
 ### Notes / Interactions
 
+- **`with_volatile_save()` slot sizing:** `build()` reserves a slot for every
+  register in the ABI-volatile set (e.g., 9 GP slots + 16 or 32 vector slots on
+  Linux), regardless of which registers are allocated at that moment.
+  `save_volatiles()` and `restore_volatiles()` then inspect the live set at
+  emission time and only emit stores/loads for registers that are actually
+  allocated.  This avoids a footgun where a volatile register allocated after
+  `build()` would silently have no slot under a live-at-build-time snapshot
+  design, leading to data corruption on the next call.
+  The trade-off is that the frame is somewhat larger when few volatile registers
+  are in use, but for a JIT kernel this is generally acceptable.
 - **Ordering constraint:** `emit_prologue()` must be called before `build()` so that
   `managed_push_count_` is stable at the moment the alignment for `emit_call()` is
   computed. The epilogue mirrors this: `destroy()` before `emit_epilogue()`.

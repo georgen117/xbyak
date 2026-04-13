@@ -282,6 +282,10 @@ enum {
 	ERR_RM_STACK_FRAME_SIZE_INVALID,
 	ERR_RM_STACK_FRAME_OFFSET_OOB,
 	ERR_RM_RESTORE_WITHOUT_SAVE,
+	ERR_RM_LAYOUT_SLOT_OOB,
+	ERR_RM_LAYOUT_SCRATCH_OOB,
+	ERR_RM_LAYOUT_SAVE_NOT_DECLARED,
+	ERR_RM_LAYOUT_ALREADY_ACTIVE,
 	ERR_INTERNAL // Put it at last.
 };
 
@@ -369,6 +373,10 @@ inline const char *ConvertErrorToString(int err)
 		"reg manager: stack frame size invalid",
 		"reg manager: stack frame offset out of bounds",
 		"reg manager: restore_volatiles called without a preceding save_volatiles",
+		"reg manager: stack layout slot index out of bounds",
+		"reg manager: stack layout scratch offset out of bounds",
+		"reg manager: save_volatiles called but with_volatile_save() was not declared",
+		"reg manager: a CommittedLayout is already active on this manager",
 		"internal error"
 	};
 	assert(ERR_INTERNAL + 1 == sizeof(errTbl) / sizeof(*errTbl));

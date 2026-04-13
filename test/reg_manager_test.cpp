@@ -1,4 +1,4 @@
-/*******************************************************************************
+﻿/*******************************************************************************
  * Unit tests for xbyak/xbyak_reg_manager.hpp
  *
  * Uses the Cybozu test framework (cybozu/test.hpp) — same as all other tests
@@ -3184,3 +3184,408 @@ CYBOZU_TEST_AUTO(saveVecVolatilesEndToEnd)
     CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)99);
 }
 #endif
+
+// =============================================================================
+// Test – StackLayout: make_stack_layout() throws without a CodeGenerator
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutNoCg)
+{
+    RegPoolManager rm(g_cpu);  // no CG
+    CYBOZU_TEST_EXCEPTION(rm.make_stack_layout().build(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – StackLayout: gp_parks: park/reload round-trip via JIT execution
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutGpParkReload)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            // Allocate all three pointer arguments from the ABI.
+            auto reg_a = alloc<Reg64>(0);  // rax — return val
+            auto reg_b = alloc<Reg64>(7);  // rdi — first arg (SysV)
+
+            emit_prologue();
+
+            auto cl = make_stack_layout()
+                .gp_parks(2)
+                .build();
+
+            // Explicitly zero reg_b so the round-trip value is 0 on all
+            // platforms (RDI is callee-saved on Windows and may not be 0).
+            xor_(reg_b, reg_b);
+            cl.park(reg_b, 0);
+
+            // Now reload it into a fresh register and return it
+            auto r = cl.reload<Reg64>(0);
+            mov(rax, r);
+            free(r);
+
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    Kernel k;
+    k.build();
+    // The JIT function ignores all args; it parks rdi (=0 at call time via
+    // call_jit), then reloads and returns it.  We just verify no crash and
+    // the value round-trips.
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0);
+}
+
+// =============================================================================
+// Test – StackLayout: scratch_addr returns a valid address; write/read via JIT
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutScratch)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+
+            auto cl = make_stack_layout()
+                .scratch(16)
+                .build();
+
+            auto tmp = alloc<Reg64>();
+
+            // Store 0xDEAD into scratch slot 0 and read it back
+            mov(tmp, 0xDEADUL);
+            mov(cl.scratch_addr(0), tmp);    // [rsp + scratch_base + 0] = 0xDEAD
+            mov(rax, cl.scratch_addr(0));    // rax = [rsp + scratch_base + 0]
+
+            free(tmp);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xDEAD);
+}
+
+// =============================================================================
+// Test – StackLayout: scratch_addr offset out of bounds throws
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutScratchOob)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout().scratch(8).build();
+            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(8), Xbyak::Error);   // == size → OOB
+            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(-1), Xbyak::Error);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: slot index out of bounds throws
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutSlotOob)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout().gp_parks(1).build();
+            auto r = alloc<Reg64>();
+            CYBOZU_TEST_EXCEPTION(cl.park(static_cast<const Reg64&>(r), 1), Xbyak::Error);  // OOB
+            CYBOZU_TEST_EXCEPTION(cl.reload<Reg64>(1), Xbyak::Error);
+            free(r);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: save_volatiles throws if not declared
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutSaveNotDeclared)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout().scratch(8).build();  // no with_volatile_save()
+            CYBOZU_TEST_EXCEPTION(cl.save_volatiles(), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::Error);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: restore_volatiles without preceding save throws
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutRestoreWithoutSave)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout()
+                .with_volatile_save()
+                .build();
+            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::Error);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: with_volatile_save() works for registers allocated after build()
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutVolatileSaveOrderIndependent)
+{
+    // Declaring with_volatile_save() reserves slots for all ABI-volatile registers
+    // at frame sizing time.  save_volatiles() then saves whichever of those are
+    // live when called — even registers that were allocated after build().
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            // Declare volatile save BEFORE any volatile register is allocated.
+            auto cl = make_stack_layout()
+                .with_volatile_save()
+                .build();   // no volatile regs live yet — slots pre-reserved for all
+
+            // Allocate a volatile GP AFTER build().  Under the old (live-at-build)
+            // design no slot would exist for this register.
+            auto r = alloc<Reg64>(7);   // rdi — volatile on SysV and Windows
+
+            // save_volatiles() must save rdi even though it was not live at build().
+            CYBOZU_TEST_NO_EXCEPTION(cl.save_volatiles());
+            CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers));
+            CYBOZU_TEST_NO_EXCEPTION(cl.restore_volatiles());
+
+            free(r);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    CYBOZU_TEST_NO_EXCEPTION(k.build());
+}
+
+// =============================================================================
+// Test – StackLayout: destroy() is idempotent (double-destroy is a no-op)
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutDoubleDestroy)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout().scratch(8).build();
+            cl.destroy();                   // first destroy — emits add rsp
+            CYBOZU_TEST_NO_EXCEPTION(cl.destroy());  // second — no-op, no throw
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: managed_push_count_ updated so emit_call stays aligned
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutEmitCallAlignment)
+{
+    // Build a kernel with an odd number of prologue pushes, then open a layout.
+    // verify emit_call does not crash (alignment logic must account for the layout).
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto rbx_r = alloc<Reg64>(3);   // forces one callee-save push
+            emit_prologue();                 // push rbx  → managed_push_count_ = 1
+
+            auto cl = make_stack_layout().scratch(8).build();
+            // scratch(8) → total = 16 → managed_push_count_ += 2  (total = 3 now, odd)
+            // emit_call must add 8 bytes padding to align to 16.
+
+            // Just verify it emits without throwing.
+            CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers));
+
+            cl.destroy();
+            free(rbx_r);
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    CYBOZU_TEST_NO_EXCEPTION(k.build());
+}
+
+// =============================================================================
+// Test – StackLayout: total always a multiple of 16
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutTotalAlignment)
+{
+    struct Probe : CodeGenerator, RegPoolManager {
+        ptrdiff_t recorded_total = 0;
+        Probe() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build(int gp_n, int scratch_n) {
+            emit_prologue();
+            auto cl = make_stack_layout()
+                .gp_parks(gp_n)
+                .scratch(scratch_n)
+                .build();
+            recorded_total = cl.total_size();
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    {
+        Probe p;
+        p.build(1, 0);  // 8 bytes of GP slots → rounded up to 16
+        CYBOZU_TEST_EQUAL(p.recorded_total % 16, 0);
+    }
+    {
+        Probe p;
+        p.build(3, 8);  // 3*8 + 8 = 32 → already aligned
+        CYBOZU_TEST_EQUAL(p.recorded_total % 16, 0);
+    }
+    {
+        Probe p;
+        p.build(0, 24);  // 24 bytes scratch → already aligned
+        CYBOZU_TEST_EQUAL(p.recorded_total % 16, 0);
+    }
+}
+
+// =============================================================================
+// Test – StackLayout: assert_clean_stack() passes after destroy()
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutCleanStack)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout().scratch(16).build();
+            CYBOZU_TEST_ASSERT(!clean_stack());   // frame is open
+            cl.destroy();
+            CYBOZU_TEST_ASSERT(clean_stack());    // frame closed
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: reset() clears layout_active_ flag
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutReset)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            emit_prologue();
+            auto cl = make_stack_layout().scratch(8).build();
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    k.CodeGenerator::reset();
+    k.RegPoolManager::reset();
+    // After reset, building a second kernel must not throw ERR_RM_LAYOUT_ALREADY_ACTIVE
+    CYBOZU_TEST_NO_EXCEPTION(k.build());
+}
+
+// =============================================================================
+// Test – StackLayout: park (non-freeing const overload) does not free register
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutParkConstNoFree)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto r = alloc<Reg64>(8);   // r8
+            emit_prologue();
+            auto cl = make_stack_layout().gp_parks(1).build();
+
+            const Reg64 &cr = r;
+            cl.park(cr, 0);             // const overload — should NOT free r
+
+            CYBOZU_TEST_ASSERT(reg_in_use(r));   // r still allocated
+
+            free(r);
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// =============================================================================
+// Test – StackLayout: end-to-end value round-trip using GP park/reload in JIT
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutEndToEnd)
+{
+    // JIT function: parks rdi (=42 passed by caller), reloads it, returns it.
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            // On SysV rdi (reg 7) is the first arg; on Windows x64 it is rcx (reg 1).
+#ifdef _WIN32
+            auto arg = alloc<Reg64>(1);   // rcx = first arg on Windows x64
+#else
+            auto arg = alloc<Reg64>(7);   // rdi = first arg on SysV
+#endif
+            emit_prologue();
+
+            auto cl = make_stack_layout().gp_parks(1).build();
+            cl.park(arg, 0);             // mov [rsp+base], rdi; free arg
+
+            auto res = cl.reload<Reg64>(0);  // mov res, [rsp+base]; alloc res
+            mov(rax, res);
+            free(res);
+
+            cl.destroy();
+            emit_epilogue();
+            ret();
+        }
+    };
+
+    // Generate the kernel and call it via a typed function pointer.
+    Kernel k;
+    k.build();
+    typedef uint64_t(*fn_t)(uint64_t);
+    fn_t fn = (fn_t)k.getCode();
+    CYBOZU_TEST_EQUAL(fn(42), (uint64_t)42);
+    CYBOZU_TEST_EQUAL(fn(7),  (uint64_t)7);
+}
