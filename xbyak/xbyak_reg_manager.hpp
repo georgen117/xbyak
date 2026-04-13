@@ -13,8 +13,8 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 *******************************************************************************/
-#ifndef CPU_X64_XBYAK_REG_MANAGER_HPP
-#define CPU_X64_XBYAK_REG_MANAGER_HPP
+#ifndef XBYAK_REG_MANAGER_HPP
+#define XBYAK_REG_MANAGER_HPP
 
 #include <cstddef>
 #include <cstdint>
@@ -22,8 +22,12 @@
 #include <vector>
 #include <type_traits>
 
-#define XBYAK64
-#define XBYAK_NO_OP_NAMES
+#ifndef XBYAK64
+#  define XBYAK64
+#endif
+#ifndef XBYAK_NO_OP_NAMES
+#  define XBYAK_NO_OP_NAMES
+#endif
 #include "xbyak/xbyak.h"
 #include "xbyak/xbyak_util.h"
 
@@ -159,6 +163,12 @@ public:
             }
         }
 
+        // Opmask registers (k1-k7) are only available with AVX-512
+        if (has_avx512_) {
+            free_opmask_regs = base_free_opmask();
+            preserved_opmask = base_preserved_opmask();
+        }
+
         // Detect AMX for tile registers (tmm0-tmm7)
         // Requires both XCR0[17] (XTILECFG) and XCR0[18] (XTILEDATA) to be OS-enabled
         if (cpu.has(Xbyak::util::Cpu::tAMX_TILE)) {
@@ -173,6 +183,11 @@ public:
             }
         }
     }
+
+    RegPoolManager(const RegPoolManager &) = delete;
+    RegPoolManager &operator=(const RegPoolManager &) = delete;
+    RegPoolManager(RegPoolManager &&) = default;
+    RegPoolManager &operator=(RegPoolManager &&) = default;
 
     // Usage:
     // Reg64 rax = rm.alloc<Reg64>(); // Allocate next available 64-bit register (freed by user)
@@ -483,7 +498,27 @@ public:
         }
     }
 
-    // member function - add a register to the free pool of general registers
+    // Adds a GP register to the allocatable pool that was deliberately excluded
+    // at construction time.
+    //
+    // The primary use case is rsp (index 4) and rbp (index 5): both are valid
+    // hardware registers but are omitted from every pool by default because
+    // using them as general allocatables would corrupt the stack frame or frame
+    // pointer.  A kernel that manages its own frame layout — for example, a
+    // leaf function that repurposes rbp as an extra GP scratch register — may
+    // call this to opt one of them in:
+    //
+    //   rm.add_to_gp_pool(rm.base_ptr());  // opt rbp in as a scratch reg
+    //   auto rbp_scratch = rm.alloc<Reg64>();    // may now return rbp (idx 5)
+    //
+    // No counterpart exists for Vec, Opmask, or Tile families because all
+    // allocatable registers in those families are already in their respective
+    // pools when the required ISA extension is OS-enabled.  (k0 is excluded
+    // from the opmask pool but must never be allocated — using it as a write
+    // mask silently disables masking.)
+    //
+    // Throws Xbyak::Error if the index is out of range, or if the register is
+    // already tracked (free, preserved, in-use, or reserved).
     void add_to_gp_pool(const Reg64 &reg) { add_to_gp_pool(reg.getIdx()); }
     void add_to_gp_pool(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
@@ -491,7 +526,8 @@ public:
         const bool in_free = free_gp_regs.count(idx) != 0;
         const bool in_preserved = preserved_gp.count(idx) != 0;
         const bool in_use = live_gp_.count(idx) != 0;
-        if (in_free || in_preserved || in_use)
+        const bool in_reserved = reserved_gp.count(idx) != 0;
+        if (in_free || in_preserved || in_use || in_reserved)
             XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
         free_gp_regs.insert(idx);
     }
@@ -608,7 +644,8 @@ public:
         // Each slot is 64 bytes when AVX-512 is present, 32 bytes otherwise.
         StackLayout &vec_parks(int n) { vec_count_ = n; return *this; }
 
-        // Reserve a raw scratch area of 'bytes' bytes (must be a positive multiple of 8).
+        // Reserve a raw scratch area of at least 'bytes' bytes.
+        // The value is rounded up to the nearest 8-byte boundary automatically.
         StackLayout &scratch(ptrdiff_t bytes) { scratch_bytes_ = bytes; return *this; }
 
         // Reserve fixed-offset slots for all ABI-volatile GP and vector registers.
@@ -670,9 +707,7 @@ public:
             rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
             rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
             rm_->allocated_stack_space_ += total_;
-#ifndef NDEBUG
             rm_->layout_active_ = true;
-#endif
         }
 
         ~CommittedLayout() noexcept { do_destroy(); }
@@ -904,9 +939,7 @@ public:
                 rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
                 rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
                 rm_->allocated_stack_space_ -= total_;
-#ifndef NDEBUG
                 rm_->layout_active_ = false;
-#endif
             } catch (...) {
 #ifndef NDEBUG
                 fprintf(stderr, "CommittedLayout::~CommittedLayout: exception swallowed\n");
@@ -916,9 +949,7 @@ public:
             rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
             rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
             rm_->allocated_stack_space_ -= total_;
-#ifndef NDEBUG
             rm_->layout_active_ = false;
-#endif
 #endif
             rm_ = NULL;
         }
@@ -942,10 +973,19 @@ public:
     CommittedLayout build_layout(int gp_count, int vec_count,
                                  ptrdiff_t scratch_bytes, bool with_vol) {
         if (!cg_) XBYAK_THROW_RET(ERR_RM_NO_CG, CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
-#ifndef NDEBUG
+        // Nested layouts are not allowed: only one CommittedLayout may be open
+        // at a time.  Destroy the current layout before building a new one.
         if (layout_active_) XBYAK_THROW_RET(ERR_RM_LAYOUT_ALREADY_ACTIVE,
                 CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
-#endif
+        if (gp_count < 0 || vec_count < 0)
+            XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
+                            CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+        if (scratch_bytes < 0)
+            XBYAK_THROW_RET(ERR_RM_LAYOUT_SCRATCH_OOB,
+                            CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+        // Round scratch up to the nearest 8-byte boundary so callers can
+        // request an arbitrary byte count without caring about alignment.
+        scratch_bytes = (scratch_bytes + 7) & ~ptrdiff_t(7);
         const int vec_slot = has_avx512_ ? 64 : 32;
 
         // Slot layout (all offsets relative to the new rsp after sub):
@@ -988,7 +1028,9 @@ public:
 
         // Round total up to nearest 16 bytes for stack alignment.
         ptrdiff_t total = (cursor + 15) & ~ptrdiff_t(15);
-        if (total == 0) total = 16; // always emit something for simpler state
+        if (total == 0)
+            XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
+                            CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
 
         return CommittedLayout(*this, gp_base, gp_count, vec_base, vec_count,
                                vec_slot, scratch_base, scratch_bytes, total,
@@ -1060,8 +1102,13 @@ public:
                 free_vec_regs.insert(i);
         }
         live_opmask_.clear();
-        free_opmask_regs = base_free_opmask();
-        preserved_opmask = base_preserved_opmask();
+        if (has_avx512_) {
+            free_opmask_regs = base_free_opmask();
+            preserved_opmask = base_preserved_opmask();
+        } else {
+            free_opmask_regs.clear();
+            preserved_opmask.clear();
+        }
         live_tile_.clear();
         free_tile_regs.clear();
         if (has_amx_) {
@@ -1078,9 +1125,7 @@ public:
         prologue_vec_cursor_ = 0;
         managed_push_count_ = 0;
         allocated_stack_space_ = 0;
-#ifndef NDEBUG
         layout_active_ = false;
-#endif
     }
 
     // Emits a push instruction for each callee-saved GP register promoted by
@@ -1140,6 +1185,7 @@ public:
 #endif
         for (int i = (int)allocated_preserved_gp_.size() - 1; i >= 0; --i)
             cg_->pop(Reg64(allocated_preserved_gp_[i]));
+        managed_push_count_ -= allocated_preserved_gp_.size();
     }
 
     // Emits an ABI-correct call to a runtime C function.
@@ -1200,14 +1246,17 @@ public:
         return allocated_preserved_vec_;
     }
 
-    // helper methods to return special registers as per x86-64 calling convention (System V AMD64 ABI)
-    // Stack pointer: rsp
-    inline Reg64 _stack_pointer() { return Reg64(4); }
-    // Base pointer: rbp
-    inline Reg64 _base_pointer() { return Reg64(5); }
-    // Opmask k0: special mask register that means "unmasked" (no masking)
-    // When k0 is used as a write mask, all elements are written (effectively no masking)
-    inline Opmask _opmask_k0() { return Opmask(0); }
+    // Returns the stack-pointer register object (rsp, index 4).
+    // Useful as an argument to add_to_gp_pool() when repurposing rsp is intentional.
+    inline Reg64 stack_ptr() const { return Reg64(4); }
+    // Returns the base-pointer register object (rbp, index 5).
+    // Useful as an argument to add_to_gp_pool() when repurposing rbp is intentional.
+    inline Reg64 base_ptr() const { return Reg64(5); }
+    // Returns the opmask k0 register object.
+    // k0 means "unmasked" — when used as a write mask all elements are written.
+    // k0 is intentionally excluded from the opmask allocation pool; this accessor
+    // provides a named way to reference it without constructing Opmask(0) directly.
+    inline Opmask k0() const { return Opmask(0); }
 
 private:
     // helper method - converts members of set to vector
@@ -1402,35 +1451,6 @@ private:
             XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
         }
     }
-
-    // member function - moves given index from in-use set to free set for given family
-    void release_gp(int idx) {
-        if (idx < 0 || idx > max_gp_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = live_gp_.find(idx);
-        if (it == live_gp_.end())
-            XBYAK_THROW(ERR_RM_GP_NOT_IN_USE)
-        live_gp_.erase(it);
-        free_gp_regs.insert(idx);
-    }
-    void release_vec(int idx) {
-        if (idx < 0 || idx > max_vec_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = live_vec_.find(idx);
-        if (it == live_vec_.end())
-            XBYAK_THROW(ERR_RM_VEC_NOT_IN_USE)
-        live_vec_.erase(it);
-        free_vec_regs.insert(idx);
-    }
-    void release_opmask(int idx) {
-        if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        auto it = live_opmask_.find(idx);
-        if (it == live_opmask_.end())
-            XBYAK_THROW(ERR_RM_OPMASK_NOT_IN_USE)
-        live_opmask_.erase(it);
-        free_opmask_regs.insert(idx);
-    }
     void tile_reg(int idx) {
         if (reg_in_use_idx(idx, RegFamily::Tile))
             XBYAK_THROW(ERR_RM_TILE_IN_USE)
@@ -1441,6 +1461,41 @@ private:
         } else {
             XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
         }
+    }
+
+    // member function - moves given index from in-use set to free set for given family
+    void release_gp(int idx) {
+        if (idx < 0 || idx > max_gp_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        auto it = live_gp_.find(idx);
+        if (it == live_gp_.end())
+            XBYAK_THROW(ERR_RM_GP_NOT_IN_USE)
+        live_gp_.erase(it);
+        if (base_preserved_gp().count(idx))
+            preserved_gp.insert(idx);
+        else
+            free_gp_regs.insert(idx);
+    }
+    void release_vec(int idx) {
+        if (idx < 0 || idx > max_vec_reg_idx_)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        auto it = live_vec_.find(idx);
+        if (it == live_vec_.end())
+            XBYAK_THROW(ERR_RM_VEC_NOT_IN_USE)
+        live_vec_.erase(it);
+        if (base_preserved_vec().count(idx))
+            preserved_vec.insert(idx);
+        else
+            free_vec_regs.insert(idx);
+    }
+    void release_opmask(int idx) {
+        if (idx < 0 || idx > 7)
+            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+        auto it = live_opmask_.find(idx);
+        if (it == live_opmask_.end())
+            XBYAK_THROW(ERR_RM_OPMASK_NOT_IN_USE)
+        live_opmask_.erase(it);
+        free_opmask_regs.insert(idx);
     }
     void release_tile(int idx) {
         if (idx < 0 || idx > 7)
@@ -1533,8 +1588,8 @@ private:
     }
 
     std::set<int> live_opmask_;
-    std::set<int> free_opmask_regs = base_free_opmask();
-    std::set<int> preserved_opmask = base_preserved_opmask();
+    std::set<int> free_opmask_regs; // populated in constructor if AVX-512 present
+    std::set<int> preserved_opmask; // populated in constructor if AVX-512 present
 
     // Registers blocked from allocation via mark_unavailable().
     std::set<int> reserved_gp;
@@ -1580,11 +1635,10 @@ private:
     // Total bytes currently reserved by live CommittedLayout objects.
     ptrdiff_t allocated_stack_space_;
 
-#ifndef NDEBUG
     // Set by CommittedLayout construction, cleared by destroy()/destructor.
-    // Allows detection of nested build() calls in debug builds.
+    // Guards against nested build() calls: only one CommittedLayout may be
+    // open at a time on a given RegPoolManager.
     bool layout_active_ = false;
-#endif
 
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.
@@ -1593,4 +1647,4 @@ private:
 
 } // namespace Xbyak
 
-#endif // CPU_X64_XBYAK_REG_MANAGER_HPP
+#endif // XBYAK_REG_MANAGER_HPP

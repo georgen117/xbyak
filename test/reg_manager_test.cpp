@@ -12,7 +12,7 @@
  *   vectorRegisters         – alloc / free of Xmm / Ymm / Zmm
  *   opmaskRegisters         – alloc / free of Opmask (k1-k7, k0 is special)
  *   apxSupport              – max_gp_registers() reflects APX capability
- *   addToPool               – _stack_pointer / _base_pointer / add_to_gp_pool
+ *   addToPool               – stack_ptr / base_ptr / add_to_gp_pool
  *   registerExhaustion      – allocating more regs than available throws
  *   mixedAllocation         – mix of GP / Vec / Opmask in one manager
  *   regInUseAllFamilies     – reg_in_use round-trip for every register family
@@ -313,12 +313,12 @@ CYBOZU_TEST_AUTO(addToPool)
 {
     RegPoolManager rm(g_cpu);
 
-    // _stack_pointer() == rsp (index 4).
-    auto rsp_reg = rm._stack_pointer();
+    // stack_ptr() == rsp (index 4).
+    auto rsp_reg = rm.stack_ptr();
     CYBOZU_TEST_EQUAL(rsp_reg.getIdx(), 4);
 
-    // _base_pointer() == rbp (index 5).
-    auto rbp_reg = rm._base_pointer();
+    // base_ptr() == rbp (index 5).
+    auto rbp_reg = rm.base_ptr();
     CYBOZU_TEST_EQUAL(rbp_reg.getIdx(), 5);
 
     // add_to_gp_pool with an out-of-range index must throw.
@@ -2095,6 +2095,26 @@ CYBOZU_TEST_AUTO(stackLayoutNoCg)
 {
     RegPoolManager rm(g_cpu);  // no CG
     CYBOZU_TEST_EXCEPTION(rm.make_stack_layout().build(), Xbyak::Error);
+}
+
+// =============================================================================
+// Test – StackLayout: negative / misaligned builder arguments are rejected
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutNegativeArgs)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build_negative_gp()      { make_stack_layout().gp_parks(-1).build(); }
+        void build_negative_vec()     { make_stack_layout().vec_parks(-1).build(); }
+        void build_negative_scratch() { make_stack_layout().scratch(-8).build(); }
+        void build_empty()            { make_stack_layout().build(); }
+    };
+
+    Kernel k;
+    CYBOZU_TEST_EXCEPTION(k.build_negative_gp(),       Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(k.build_negative_vec(),      Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(k.build_negative_scratch(),  Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(k.build_empty(),             Xbyak::Error);
 }
 
 // =============================================================================

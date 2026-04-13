@@ -3034,3 +3034,32 @@ cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
   be kept as deprecated thin wrappers during a transition period, each calling the
   new `StackLayout` / `CommittedLayout` primitives internally, before being removed
   in a subsequent release.
+
+---
+
+## Open Issue: `Reg8`/`Reg16` in `reg_family<>` but no `do_store`/`do_load` overloads (Issue 11)
+
+`reg_family<Reg8>` and `reg_family<Reg16>` are defined (mapping to `RegFamily::GP`),
+so `alloc<Reg8>()`, `free(Reg8(...))`, and `mark_unavailable<Reg8>(idx)` all compile
+and function correctly for pool tracking purposes.
+
+However, `CommittedLayout::park()` and `reload()` dispatch via `do_store`/`do_load`,
+which have overloads for `Reg64`, `Reg32`, and `Reg16` but **not** `Reg8`.  Calling
+`cl.park(Reg8(...), slot)` therefore fails to compile.
+
+### Options
+
+1. **Add `do_store`/`do_load` overloads for `Reg8`** — emit `mov byte [rsp+off], r8`
+   / `mov r8, byte [rsp+off]`.  Architecturally sound; completes the matrix.
+
+2. **Remove `reg_family<Reg8>` (and `reg_family<Reg16>`)** — narrow the public API
+   surface to the widths that are practically useful for JIT kernels (`Reg32`,
+   `Reg64`, and the vector/opmask/tile families).  `Reg8`/`Reg16` can still be
+   constructed manually from a `Reg32`/`Reg64` index when needed.
+
+3. **Keep current state with a `static_assert` guard** — add a `static_assert` inside
+   `park()`/`reload()` that fires a clear error message when `Reg8` is passed,
+   preventing the confusing linker/template error.
+
+The recommended path is **option 1**: it is consistent, low-risk, and closes the gap
+without removing already-working tracking functionality.
