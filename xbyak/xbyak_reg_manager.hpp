@@ -549,13 +549,14 @@ public:
     public:
         explicit Scoped(RegPoolManager &rm, Reg r)
             // pointer to allocator, allocate scoped reg at construction & track, unowned = NULL
-            : rm_(&rm), reg_(r) {
+            : rm_(&rm), reg_(r), generation_(rm.generation_) {
             validate_scoped_reg(rm_, reg_);
         }
 
         // if object is owner of scoped reg and goes out of scope, deallocate
         ~Scoped() noexcept {
             if (!rm_) return;
+            if (generation_ != rm_->generation_) return; // manager was reset; don't free
 #if !defined(XBYAK_NO_EXCEPTION)
             try {
                 rm_->free(reg_);
@@ -574,7 +575,7 @@ public:
         Scoped &operator=(const Scoped &) = delete;
 
         // move constructor - used when scoped regs initialised from rvalue (incl. std::move)
-        Scoped(Scoped &&other) noexcept : rm_(other.rm_), reg_(other.reg_) {
+        Scoped(Scoped &&other) noexcept : rm_(other.rm_), reg_(other.reg_), generation_(other.generation_) {
             other.rm_ = NULL; // set previous owner to no longer own
         }
 
@@ -586,6 +587,7 @@ public:
         RegPoolManager *rm_
                 = NULL; // pointer to allocator, initialised as NULL
         Reg reg_ {};
+        std::size_t generation_ = 0;
     };
 
     // helper factory - calls Scoped ctor
@@ -1082,6 +1084,7 @@ public:
     // Cleared: all in-use, reserved, and spilled registers; prologue history;
     // stack tracking.
     void reset() {
+        ++generation_;
         live_gp_.clear();
         free_gp_regs = base_free_gp();
         preserved_gp = base_preserved_gp();
@@ -1643,6 +1646,12 @@ private:
     // Optional CodeGenerator for instruction-emitting features (spill/restore, etc.).
     // Null when the manager is used for tracking only.
     Xbyak::CodeGenerator *cg_;
+
+    // Incremented by reset() to invalidate any Scoped guards that outlive the
+    // current kernel build.  A Scoped whose generation_ differs from the
+    // manager's generation_ will skip the free() in its destructor, preventing
+    // double-free or corrupt state after a reset.
+    std::size_t generation_ = 0;
 };
 
 } // namespace Xbyak
