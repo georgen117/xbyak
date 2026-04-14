@@ -9,6 +9,8 @@
  *   specificAllocation      – index-based alloc<T>(int) + duplicate-alloc exception
  *   namedRegisterAlloc      – named-register alloc(reg) overload across all families
  *   scopedRegisters         – RAII makeScoped auto-free on scope exit
+ *   allocScopedConvenience  – allocScoped<T>() / allocScoped<T>(idx) helpers
+ *   scopedImplicitConversion – Scoped implicit conversion and forwarding accessors
  *   vectorRegisters         – alloc / free of Xmm / Ymm / Zmm
  *   opmaskRegisters         – alloc / free of Opmask (k1-k7, k0 is special)
  *   apxSupport              – max_gp_registers() reflects APX capability
@@ -240,6 +242,99 @@ CYBOZU_TEST_AUTO(scopedRegisters)
     }
 
     CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+}
+
+// =============================================================================
+// Test – allocScoped convenience helpers
+// =============================================================================
+CYBOZU_TEST_AUTO(allocScopedConvenience)
+{
+    RegPoolManager rm(g_cpu);
+
+    // allocScoped<T>() — auto-free on scope exit, same as makeScoped(alloc<T>()).
+    {
+        auto r1 = rm.allocScoped<Reg64>();
+        auto r2 = rm.allocScoped<Reg64>();
+        CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(), 2);
+    }
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+
+    // allocScoped<T>(idx) — specific register by index.
+    {
+        auto r10 = rm.allocScoped<Reg64>(10);
+        CYBOZU_TEST_EQUAL((int)r10.get().getIdx(), 10);
+        CYBOZU_TEST_ASSERT(rm.reg_in_use(r10.get()));
+    }
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+
+    // Works across all tracked families.
+    {
+        auto xmm = rm.allocScoped<Xmm>();
+        CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(), 1);
+        auto k   = rm.allocScoped<Opmask>();
+        CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+    }
+    CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
+
+    // Scoped guard is invalidated by reset() — no double-free or error.
+    {
+        auto r = rm.allocScoped<Reg64>();
+        rm.reset();
+        // destructor of r fires here; should silently no-op due to generation mismatch
+    }
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+}
+
+// =============================================================================
+// Test – Scoped implicit conversion and forwarding accessors
+// =============================================================================
+CYBOZU_TEST_AUTO(scopedImplicitConversion)
+{
+    RegPoolManager rm(g_cpu);
+
+    // getIdx() / getBit() forwarding — no .get() needed.
+    {
+        auto r = rm.allocScoped<Reg64>(8);  // r8
+        CYBOZU_TEST_EQUAL(r.getIdx(), 8);
+        CYBOZU_TEST_EQUAL(r.getBit(), 64);
+
+        auto x = rm.allocScoped<Xmm>(2);   // xmm2
+        CYBOZU_TEST_EQUAL(x.getIdx(), 2);
+        CYBOZU_TEST_EQUAL(x.getBit(), 128);
+    }
+    CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+    CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
+
+    // Implicit conversion — Scoped<Reg64> passed to a function expecting const Reg64 &.
+    {
+        auto r = rm.allocScoped<Reg64>(9);  // r9
+        // reg_in_use(const RegT&) accepts Scoped<Reg64> via the implicit conversion.
+        CYBOZU_TEST_ASSERT(rm.reg_in_use<Reg64>(r));
+    }
+
+    // Implicit conversion in JIT emission — Scoped<Reg64> used as a CodeGenerator operand.
+    {
+        class ImplicitJit : public CodeGenerator {
+        public:
+            ImplicitJit() : CodeGenerator(4096) {}
+            void gen(RegPoolManager &rm) {
+                // allocScoped returns Scoped<Reg64>; the implicit conversion to const Reg64&
+                // lets it pass directly to mov/ret without calling .get().
+                auto dst = rm.allocScoped<Reg64>(0); // rax
+                auto src = rm.allocScoped<Reg64>(8); // r8
+                mov(src, uint32_t(0xABCDu));
+                mov(dst, src);  // Scoped<Reg64> implicitly converts to const Reg64&
+                ret();
+            }
+        };
+
+        ImplicitJit jit;
+        jit.gen(rm);
+        CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
+        auto result = reinterpret_cast<uint64_t(*)()>(jit.getCode())();
+        CYBOZU_TEST_EQUAL(result, (uint64_t)0xABCDu);
+    }
 }
 
 // =============================================================================
@@ -2127,6 +2222,7 @@ CYBOZU_TEST_AUTO(stackLayoutGpParkReload)
         void build() {
             // Allocate all three pointer arguments from the ABI.
             auto reg_a = alloc<Reg64>(0);  // rax — return val
+            (void)reg_a; // silence unused warning
             auto reg_b = alloc<Reg64>(7);  // rdi — first arg (SysV)
 
             emit_prologue();

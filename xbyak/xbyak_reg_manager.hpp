@@ -583,6 +583,11 @@ public:
         operator const Reg &() const noexcept { return reg_; }
         const Reg &get() const noexcept { return reg_; }
 
+        // forwarding accessors — avoids .get() when auto-type deduction
+        // prevents the implicit conversion from firing
+        int getIdx() const noexcept { return reg_.getIdx(); }
+        int getBit() const noexcept { return reg_.getBit(); }
+
     private:
         RegPoolManager *rm_
                 = NULL; // pointer to allocator, initialised as NULL
