@@ -596,6 +596,19 @@ public:
         return Scoped<Reg>(*this, r);
     }
 
+    // Allocates a register and wraps it in a Scoped guard in one call.
+    // Equivalent to makeScoped(alloc<RegT>()) or makeScoped(alloc<RegT>(idx)).
+    // The register is freed automatically when the returned Scoped goes out of scope.
+    //
+    // Usage:
+    //   auto r  = rm.allocScoped<Reg64>();     // next available GP register
+    //   auto r9 = rm.allocScoped<Reg64>(9);    // specific register by index
+    template <class RegT>
+    inline Scoped<RegT> allocScoped() & { return makeScoped(alloc<RegT>()); }
+
+    template <class RegT>
+    inline Scoped<RegT> allocScoped(int idx) & { return makeScoped(alloc<RegT>(idx)); }
+
     // -------------------------------------------------------------------------
     // StackLayout / CommittedLayout — two-phase unified stack management
     //
