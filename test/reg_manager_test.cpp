@@ -2608,3 +2608,492 @@ CYBOZU_TEST_AUTO(stackLayoutEndToEnd)
     CYBOZU_TEST_EQUAL(fn(42), (uint64_t)42);
     CYBOZU_TEST_EQUAL(fn(7),  (uint64_t)7);
 }
+
+
+// 4-arg sum: all args fit in registers on both ABIs.
+// SysV:  a=rdi, b=rsi, c=rdx, d=rcx
+// Win64: a=rcx, b=rdx, c=r8,  d=r9
+extern "C" uint64_t spill_test_sum4(
+        uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    volatile uint64_t va = a, vb = b, vc = c, vd = d;
+    return va + vb + vc + vd;
+}
+
+// Indirect sum: a + b + sum(extra[0..count-1]).
+// Pointer args let the caller pass "extra" values that live in the scratch
+// area rather than requiring additional ABI stack slots.
+// SysV:  a=rdi, b=rsi, extra=rdx, count=rcx
+// Win64: a=rcx, b=rdx, extra=r8,  count=r9
+extern "C" uint64_t spill_test_sum_indirect(
+        uint64_t a, uint64_t b, const uint64_t *extra, uint64_t count) {
+    uint64_t s = a + b;
+    for (uint64_t i = 0; i < count; ++i) s += extra[i];
+    return s;
+}
+
+// 8-arg sum: exceeds the GP register limit on both ABIs.
+// SysV:  a-f in registers (rdi,rsi,rdx,rcx,r8,r9); g,h on stack ([rsp+0],[rsp+8])
+// Win64: a-d in registers (rcx,rdx,r8,r9);  e-h on stack ([rsp+32..56], above shadow)
+extern "C" uint64_t spill_test_sum8(
+        uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+        uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
+    volatile uint64_t va=a, vb=b, vc=c, vd=d, ve=e, vf=f, vg=g, vh=h;
+    return va + vb + vc + vd + ve + vf + vg + vh;
+}
+
+// =============================================================================
+// Test – CommittedLayout as replacement for spill() / restore()
+//
+//  Three scenarios that together cover every use-case spill/restore addressed:
+//
+//  Scenario 1 – Register pressure relief:
+//    The kernel parks an in-use register to free its hardware slot for other
+//    work, then reloads the original value.  This is the direct replacement for
+//    the old single-register spill(reg)/restore(reg) pattern.
+//
+//  Scenario 2 – Live-value preservation across a C call:
+//    Two GP registers holding important values are parked before a call that
+//    would otherwise clobber them (the old "spill all live regs, call, restore"
+//    pattern).  park() frees the hardware registers for argument loading;
+//    emit_call() handles alignment and shadow space; reload() brings the values
+//    back.
+//
+//    Platform differences (Win64 vs SysV argument registers) are isolated to
+//    the argument-loading block; all other code is platform-independent.
+//
+//  Scenario 3 – "Extra arguments beyond register count" via scratch + pointer:
+//    The old compiler model: push extra values onto the stack before the call,
+//    pop them after.  The CommittedLayout model: store the extra values in a
+//    pre-declared scratch area (fixed offset, no rsp movement), then pass the
+//    scratch address as a normal register argument.  The callee receives a
+//    pointer and reads the extras from there.
+//
+//    This avoids the push/pop model entirely: rsp is stable while the layout
+//    is open, so scratch offsets never drift and no manual alignment arithmetic
+//    is required.
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
+{
+    // ------------------------------------------------------------------
+    // Scenario 1 – park() / reload() as register pressure relief.
+    //
+    // Three live values (111, 222, 333).  Park 333 to free its hardware
+    // register, occupy that freed slot with unrelated work, then reload.
+    // Expected result: 111 + 222 + 333 = 666.
+    // ------------------------------------------------------------------
+    {
+        struct Kernel : CodeGenerator, RegPoolManager {
+            Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+            void build() {
+                auto r0 = alloc<Reg64>(); // will hold 111
+                auto r1 = alloc<Reg64>(); // will hold 222
+                auto r2 = alloc<Reg64>(); // will hold 333 — to be parked/reloaded
+
+                emit_prologue();
+
+                // One GP park slot for r2.
+                auto cl = make_stack_layout().gp_parks(1).build();
+
+                mov(r0, 111); mov(r1, 222); mov(r2, 333);
+
+                // park(r2, 0): emits  mov [rsp+slot], r2
+                //              frees  r2's hardware register back to the pool.
+                cl.park(r2, 0);
+
+                // The freed slot is now available.  Use it for something else.
+                auto r_tmp = alloc<Reg64>();
+                mov(r_tmp, 0xDEADUL); // arbitrary work using the reclaimed register
+                free(r_tmp);
+
+                // reload<Reg64>(0): allocs a register, emits  mov reg, [rsp+slot]
+                //                   r2 now refers to the reloaded register.
+                r2 = cl.reload<Reg64>(0);
+
+                mov(rax, r0); add(rax, r1); add(rax, r2);
+                free(r0); free(r1); free(r2);
+
+                cl.destroy();
+                emit_epilogue();
+                ret();
+            }
+        };
+
+        Kernel k; k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)(111 + 222 + 333));
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario 2 – Preserve live values across a C call.
+    //
+    // Two live GP registers (100 and 200) must survive a call to
+    // spill_test_sum4(10, 20, 30, 40) = 100 that clobbers all volatile regs.
+    // After the call the parked values are reloaded and added to rax.
+    //
+    // Expected result: 10+20+30+40 + 100 + 200 = 400.
+    // ------------------------------------------------------------------
+    {
+        struct Kernel : CodeGenerator, RegPoolManager {
+            Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+            void build() {
+                auto r_ka = alloc<Reg64>(); // preserved value 100
+                auto r_kb = alloc<Reg64>(); // preserved value 200
+
+                emit_prologue();
+
+                // Two GP park slots: one for r_ka, one for r_kb.
+                // No with_volatile_save() needed — we handle preservation manually
+                // via explicit park/reload.
+                auto cl = make_stack_layout().gp_parks(2).build();
+
+                mov(r_ka, 100); mov(r_kb, 200);
+
+                // Park both live values.  Their hardware registers are freed and
+                // become available for loading call arguments.
+                cl.park(r_ka, 0);
+                cl.park(r_kb, 1);
+
+                // Load call arguments into the now-free hardware registers.
+                // Argument registers differ between Win64 and SysV.
+#ifdef _WIN32
+                mov(rcx, 10); mov(rdx, 20); mov(r8, 30); mov(r9, 40);
+#else
+                mov(rdi, 10); mov(rsi, 20); mov(rdx, 30); mov(rcx, 40);
+#endif
+                emit_call(&spill_test_sum4); // rax = 10+20+30+40 = 100
+
+                // Reload the preserved values.
+                r_ka = cl.reload<Reg64>(0);
+                r_kb = cl.reload<Reg64>(1);
+
+                add(rax, r_ka); add(rax, r_kb);
+                free(r_ka); free(r_kb);
+
+                cl.destroy();
+                emit_epilogue();
+                ret();
+            }
+        };
+
+        Kernel k; k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
+                          (uint64_t)(10 + 20 + 30 + 40 + 100 + 200));
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario 3 – Extra values beyond register count, via scratch + pointer.
+    //
+    // Old model (spill/restore):
+    //   spill(r_x0);  spill(r_x1);   // push; push  ← moves rsp
+    //   call func(a, b, [stack]);     // callee reads extras from [rsp+8]
+    //   restore(r_x1); restore(r_x0); // pop; pop
+    //
+    // New model (CommittedLayout):
+    //   mov [rsp+scratch+0], r_x0    // store into pre-declared scratch area
+    //   mov [rsp+scratch+8], r_x1    // rsp never moves between build/destroy
+    //   lea r_ptr, [rsp+scratch+0]   // form pointer to the scratch block
+    //   call func(a, b, r_ptr, count) // callee receives pointer in a register
+    //
+    // spill_test_sum_indirect(100, 200, &scratch[0], 2)
+    //   scratch[0] = 300, scratch[1] = 400
+    //   return = 100 + 200 + 300 + 400 = 1000
+    //
+    // Arg registers per ABI (all 4 fit in registers — no ABI stack slots needed):
+    //   SysV:  a=rdi, b=rsi, extra_ptr=rdx, count=rcx
+    //   Win64: a=rcx, b=rdx, extra_ptr=r8,  count=r9
+    //
+    // Extra-pointer argument is moved into its destination register BEFORE any
+    // other argument register is written, to avoid clobbering the pointer in
+    // the case where alloc() assigned r_ptr to that same hardware register.
+    // ------------------------------------------------------------------
+    {
+        struct Kernel : CodeGenerator, RegPoolManager {
+            Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+            void build() {
+                // Two "extra" register values that exceed the hypothetical
+                // register-arg capacity of the callee.
+                auto r_x0 = alloc<Reg64>(); // will hold 300
+                auto r_x1 = alloc<Reg64>(); // will hold 400
+
+                emit_prologue();
+
+                // Reserve 2 × 8 bytes of scratch for the extra values.
+                // This replaces the two push instructions of the old model.
+                auto cl = make_stack_layout().scratch(2 * 8).build();
+
+                mov(r_x0, 300); mov(r_x1, 400);
+
+                // Store extras into scratch (no rsp movement).
+                mov(cl.scratch_addr(0), r_x0); // scratch[0] = 300
+                mov(cl.scratch_addr(8), r_x1); // scratch[1] = 400
+                free(r_x0); free(r_x1);
+
+                // Form a pointer to the scratch block.
+                auto r_ptr = alloc<Reg64>();
+                lea(r_ptr, cl.scratch_addr(0)); // r_ptr = &scratch[0]
+
+                // Move the pointer into its ABI arg register first, before any
+                // other argument is written.  This prevents clobbering r_ptr if
+                // alloc() assigned it to one of the other arg registers.
+#ifdef _WIN32
+                mov(r8,  r_ptr); // extra_ptr (arg3)
+                free(r_ptr);
+                mov(rcx, 100);   // a (arg1)
+                mov(rdx, 200);   // b (arg2)
+                mov(r9,  2);     // count (arg4)
+#else
+                mov(rdx, r_ptr); // extra_ptr (arg3)
+                free(r_ptr);
+                mov(rdi, 100);   // a (arg1)
+                mov(rsi, 200);   // b (arg2)
+                mov(rcx, 2);     // count (arg4)
+#endif
+                // rax = 100 + 200 + 300 + 400 = 1000
+                emit_call(&spill_test_sum_indirect);
+
+                cl.destroy();
+                emit_epilogue();
+                ret();
+            }
+        };
+
+        Kernel k; k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
+                          (uint64_t)(100 + 200 + 300 + 400));
+    }
+}
+
+// =============================================================================
+// Test – with_outgoing_args() / CommittedLayout::emit_call() for stack-overflow arguments
+//
+// Demonstrates the correct way to call a function whose argument count exceeds
+// the ABI register limit:
+//   SysV:  6 GP register args (rdi,rsi,rdx,rcx,r8,r9); args 7+ go on the stack.
+//   Win64: 4 GP register args (rcx,rdx,r8,r9);          args 5+ go on the stack.
+//
+// Why RegPoolManager::emit_call() cannot be used here:
+//   emit_call() emits "sub rsp, adj; call; add rsp, adj" for alignment.  Any
+//   stack args written to [rsp+X] before this sub would be at [rsp+X+adj] at
+//   call time — the wrong offsets.
+//
+// Why with_outgoing_args() + CommittedLayout::emit_call() work:
+//   with_outgoing_args(n) reserves the overflow-arg slots at [rsp+0] (SysV) or
+//   [rsp+32] (Win64, above the shadow space that is also pre-reserved).
+//   build() adjusts the frame total so that rsp is already 16-aligned at the
+//   call instruction, so CommittedLayout::emit_call() can be a bare
+//   "mov rax; call rax".
+//
+// Two sub-scenarios: P=0 (even pushes) and P=1 (odd push), covering both
+// branches of the alignment logic in build_layout().
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutOutgoingStackArgs)
+{
+    // ------------------------------------------------------------------
+    // Scenario A — no prologue push (P = 0, even).
+    //   build() chooses total ≡ 8 (mod 16) to compensate for rsp being
+    //   8-misaligned after an even number of pushes.
+    //
+    // Expected: spill_test_sum8(10,20,30,40,50,60,70,80) = 360.
+    // ------------------------------------------------------------------
+    {
+        struct Kernel : CodeGenerator, RegPoolManager {
+            Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+            void build() {
+                // No preserved registers allocated — emit_prologue() is a no-op.
+                // managed_push_count_ stays 0 (even) before build().
+                emit_prologue();
+
+                // Declare the overflow-arg slots.  The layout also pre-reserves
+                // Win64 shadow space ([rsp+0..31]) automatically.
+#ifdef _WIN32
+                // Win64: args 5-8 overflow (e,f,g,h) → 4 slots
+                auto cl = make_stack_layout().with_outgoing_args(4).build();
+#else
+                // SysV:  args 7-8 overflow (g,h)     → 2 slots
+                auto cl = make_stack_layout().with_outgoing_args(2).build();
+#endif
+                auto r_tmp = alloc<Reg64>();
+
+#ifdef _WIN32
+                // outgoing_arg_addr(n) = [rsp + 32 + n*8]  (above shadow space).
+                mov(r_tmp, 50); mov(cl.outgoing_arg_addr(0), r_tmp); // e
+                mov(r_tmp, 60); mov(cl.outgoing_arg_addr(1), r_tmp); // f
+                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(2), r_tmp); // g
+                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(3), r_tmp); // h
+                free(r_tmp);
+                mov(rcx, 10); mov(rdx, 20); mov(r8, 30); mov(r9, 40);
+#else
+                // outgoing_arg_addr(n) = [rsp + n*8].
+                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(0), r_tmp); // g
+                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(1), r_tmp); // h
+                free(r_tmp);
+                mov(rdi, 10); mov(rsi, 20); mov(rdx, 30);
+                mov(rcx, 40); mov(r8,  50); mov(r9,  60);
+#endif
+                // Bare call — no sub/add rsp.  rsp is already 16-aligned because
+                // build() absorbed the required adjustment into the frame total.
+                cl.emit_call(&spill_test_sum8);
+                // rax = 10+20+30+40+50+60+70+80 = 360
+
+                cl.destroy();
+                emit_epilogue();
+                ret();
+            }
+        };
+
+        Kernel k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
+                          (uint64_t)(10+20+30+40+50+60+70+80));
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario B — one prologue push (P = 1, odd).
+    //   build() uses standard ≡ 0 (mod 16) rounding — exercises the
+    //   else-branch of the alignment logic in build_layout().
+    //
+    // Expected: spill_test_sum8(10,20,30,40,50,60,70,80) = 360.
+    // ------------------------------------------------------------------
+    {
+        struct Kernel : CodeGenerator, RegPoolManager {
+            Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+            void build() {
+                // rbx (index 3) is callee-saved on all ABIs.  Allocating it
+                // causes emit_prologue() to emit one push → managed_push_count_
+                // becomes 1 (odd) before build().
+                auto r_pres = alloc<Reg64>(3); // rbx
+                emit_prologue();               // push rbx
+
+#ifdef _WIN32
+                auto cl = make_stack_layout().with_outgoing_args(4).build();
+#else
+                auto cl = make_stack_layout().with_outgoing_args(2).build();
+#endif
+                auto r_tmp = alloc<Reg64>();
+
+#ifdef _WIN32
+                mov(r_tmp, 50); mov(cl.outgoing_arg_addr(0), r_tmp); // e
+                mov(r_tmp, 60); mov(cl.outgoing_arg_addr(1), r_tmp); // f
+                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(2), r_tmp); // g
+                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(3), r_tmp); // h
+                free(r_tmp);
+                mov(rcx, 10); mov(rdx, 20); mov(r8, 30); mov(r9, 40);
+#else
+                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(0), r_tmp); // g
+                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(1), r_tmp); // h
+                free(r_tmp);
+                mov(rdi, 10); mov(rsi, 20); mov(rdx, 30);
+                mov(rcx, 40); mov(r8,  50); mov(r9,  60);
+#endif
+                cl.emit_call(&spill_test_sum8);
+
+                free(r_pres);
+                cl.destroy();
+                emit_epilogue(); // pop rbx
+                ret();
+            }
+        };
+
+        Kernel k;
+        k.build();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
+                          (uint64_t)(10+20+30+40+50+60+70+80));
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario C — outgoing_arg_addr() out-of-bounds throws.
+    // ------------------------------------------------------------------
+    {
+        struct Kernel : CodeGenerator, RegPoolManager {
+            Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+            void build() {
+                emit_prologue();
+                auto cl = make_stack_layout().with_outgoing_args(2).build();
+                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(2),  Xbyak::Error); // n == count
+                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(-1), Xbyak::Error);
+                cl.destroy();
+                emit_epilogue();
+                ret();
+            }
+        };
+        Kernel k;
+        k.build();
+    }
+}
+
+// =============================================================================
+// Test – multiple calls in one with_outgoing_args layout, mixing call styles
+//
+// A single CommittedLayout built with with_outgoing_args() can serve both a
+// register-only call and an overflow-arg call.  cl.emit_call() is used for
+// both: the frame alignment guarantee from build() is correct for any call,
+// not just ones that use the overflow slots.
+//
+// Sequence:
+//   1. cl.emit_call(&call_function_that_clobbers_registers)
+//        — all args in registers; overflow slots left untouched.
+//        — returns 210, held in rbx (callee-saved) across the second call.
+//   2. cl.emit_call(&spill_test_sum8(1,2,3,4,5,6,7,8))
+//        — uses overflow slots for the args that spill past the register limit.
+//        — returns 36.
+//   3. add rax, rbx  → 246.
+//
+// Keeping the first result in a callee-saved register is the idiomatic approach:
+// it survives any call automatically without needing a park slot.
+// =============================================================================
+CYBOZU_TEST_AUTO(stackLayoutMixedCalls)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            // rbx (index 3) is callee-saved on every x86-64 ABI.
+            // emit_prologue() will push it; it survives cl.emit_call() calls.
+            auto r_pres = alloc<Reg64>(3); // rbx
+            emit_prologue();               // push rbx — managed_push_count_ = 1 (odd)
+
+#ifdef _WIN32
+            auto cl = make_stack_layout().with_outgoing_args(4).build();
+#else
+            auto cl = make_stack_layout().with_outgoing_args(2).build();
+#endif
+
+            // ---- Call 1: register-only ----
+            // call_function_that_clobbers_registers() needs no stack args.
+            // Overflow slots exist in the frame but are simply not written.
+            cl.emit_call(&call_function_that_clobbers_registers); // rax = 210
+            mov(r_pres, rax); // rbx = 210 — survives call 2 unchanged
+
+            // ---- Call 2: overflow-arg call ----
+            // spill_test_sum8(1,2,3,4,5,6,7,8) = 36.
+            // Write stack-overflow args to outgoing_arg_addr(), populate
+            // register args, then call.  Same cl.emit_call(), different path.
+            auto r_tmp = alloc<Reg64>();
+#ifdef _WIN32
+            mov(r_tmp, 5); mov(cl.outgoing_arg_addr(0), r_tmp); // e
+            mov(r_tmp, 6); mov(cl.outgoing_arg_addr(1), r_tmp); // f
+            mov(r_tmp, 7); mov(cl.outgoing_arg_addr(2), r_tmp); // g
+            mov(r_tmp, 8); mov(cl.outgoing_arg_addr(3), r_tmp); // h
+            free(r_tmp);
+            mov(rcx, 1); mov(rdx, 2); mov(r8, 3); mov(r9, 4);
+#else
+            mov(r_tmp, 7); mov(cl.outgoing_arg_addr(0), r_tmp); // g
+            mov(r_tmp, 8); mov(cl.outgoing_arg_addr(1), r_tmp); // h
+            free(r_tmp);
+            mov(rdi, 1); mov(rsi, 2); mov(rdx, 3);
+            mov(rcx, 4); mov(r8,  5); mov(r9,  6);
+#endif
+            cl.emit_call(&spill_test_sum8); // rax = 1+2+3+4+5+6+7+8 = 36
+
+            add(rax, r_pres); // 36 + 210 = 246
+
+            free(r_pres);
+            cl.destroy();
+            emit_epilogue(); // pop rbx
+            ret();
+        }
+    };
+
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
+                      (uint64_t)(210 + 1+2+3+4+5+6+7+8));
+}

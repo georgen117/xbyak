@@ -622,6 +622,24 @@ public:
     // reload, and scratch operations remain valid regardless of what else
     // happens between build() and destroy().
     //
+    // Required call order
+    // -------------------
+    //  1. alloc() all registers you need (determines which are callee-saved).
+    //  2. emit_prologue() — pushes callee-saved GP registers onto the stack.
+    //     Must come before build() so that stack alignment is correctly
+    //     computed for any emit_call() within the layout.
+    //  3. build() — emits sub rsp, <total> and opens the CommittedLayout.
+    //     Must come after emit_prologue() (see above).
+    //  4. ... use park/reload/save_volatiles/emit_call as needed ...
+    //  5. destroy() (or let CommittedLayout go out of scope) — emits
+    //     add rsp, <total>.  Must come before emit_epilogue() so that rsp
+    //     points back to the return-address slot before the pop sequence.
+    //  6. emit_epilogue() — pops callee-saved GP registers in reverse order.
+    //     Must come after destroy().
+    //  7. ret()
+    //
+    // Violating steps 2→3 or 5→6 corrupts rsp and produces an invalid frame.
+    //
     // Typical usage:
     //
     //   emit_prologue();                        // push callee-saves first
@@ -655,7 +673,8 @@ public:
     public:
         explicit StackLayout(RegPoolManager &rm)
                 : rm_(&rm), gp_count_(0), vec_count_(0),
-                  scratch_bytes_(0), with_volatile_save_(false) {}
+                  scratch_bytes_(0), with_volatile_save_(false),
+                  outgoing_arg_count_(0) {}
 
         // Reserve n GP-sized (8-byte) park slots.
         StackLayout &gp_parks(int n) { gp_count_ = n; return *this; }
@@ -675,13 +694,32 @@ public:
         // at save_volatiles() time does not need to match the set at build() time.
         StackLayout &with_volatile_save() { with_volatile_save_ = true; return *this; }
 
+        // Reserve n stack-overflow argument slots at [rsp+0] (SysV) or
+        // [rsp+32] (Win64, above the 32-byte shadow space that is also reserved).
+        //
+        // Use this when calling a C function whose argument count exceeds the
+        // ABI register limit (SysV: more than 6 GP args; Win64: more than 4 GP
+        // args).  After build(), write each overflow argument to
+        // outgoing_arg_addr(n) on the CommittedLayout, load the register
+        // arguments, then call emit_call() on the CommittedLayout instead of
+        // RegPoolManager::emit_call().
+        //
+        // CommittedLayout::emit_call() emits only "mov rax, func; call rax" — no sub/add
+        // rsp — because build() adjusts the frame total so that rsp is already
+        // 16-byte aligned (at the call instruction) without any extra adjustment.
+        StackLayout &with_outgoing_args(int n) {
+            outgoing_arg_count_ = n;
+            return *this;
+        }
+
         // Commit: compute the total frame size, emit sub rsp, <total>, and
         // return a CommittedLayout owning the frame.
         // Throws Xbyak::Error if no CodeGenerator has been provided, or if a
         // CommittedLayout is already active on this manager.
         CommittedLayout build() {
             return rm_->build_layout(gp_count_, vec_count_,
-                                     scratch_bytes_, with_volatile_save_);
+                                     scratch_bytes_, with_volatile_save_,
+                                     outgoing_arg_count_);
         }
 
     private:
@@ -690,6 +728,7 @@ public:
         int    vec_count_;
         ptrdiff_t scratch_bytes_;
         bool   with_volatile_save_;
+        int    outgoing_arg_count_;
     };
 
     // Committed layout — owns the stack frame opened by StackLayout::build().
@@ -712,7 +751,9 @@ public:
                         std::vector<int> volatile_vecs,
                         ptrdiff_t      vol_vec_base,
                         int            vol_vec_slot_bytes,
-                        bool           vol_save_declared)
+                        bool           vol_save_declared,
+                ptrdiff_t      outgoing_arg_base = 0,
+                int            n_outgoing_args = 0)
                 : rm_(&rm), gp_base_(gp_base), gp_count_(gp_count),
                   vec_base_(vec_base), vec_count_(vec_count),
                   vec_slot_bytes_(vec_slot_bytes),
@@ -722,7 +763,9 @@ public:
                   volatile_vecs_(volatile_vecs), vol_vec_base_(vol_vec_base),
                   vol_vec_slot_bytes_(vol_vec_slot_bytes),
                   vol_save_declared_(vol_save_declared),
-                  vol_save_armed_(false) {
+                  vol_save_armed_(false),
+                  outgoing_arg_base_(outgoing_arg_base),
+                  n_outgoing_args_(n_outgoing_args) {
             if (!rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
             rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
             rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
@@ -749,6 +792,8 @@ public:
                   vol_vec_slot_bytes_(other.vol_vec_slot_bytes_),
                   vol_save_declared_(other.vol_save_declared_),
                   vol_save_armed_(other.vol_save_armed_),
+                  outgoing_arg_base_(other.outgoing_arg_base_),
+                  n_outgoing_args_(other.n_outgoing_args_),
                   actually_saved_gp_indices_(std::move(other.actually_saved_gp_indices_)),
                   actually_saved_vec_indices_(std::move(other.actually_saved_vec_indices_)) {
             other.rm_ = NULL;
@@ -883,6 +928,71 @@ public:
         // True if with_volatile_save() was declared on the builder.
         bool has_volatile_save() const { return vol_save_declared_; }
 
+        // Returns the number of outgoing stack-overflow argument slots declared
+        // with with_outgoing_args().  Zero if not declared.
+        int outgoing_arg_count() const { return n_outgoing_args_; }
+
+        // Returns an address operand for outgoing stack-overflow argument slot n.
+        //
+        //   SysV:  [rsp + n*8]        — the callee sees this as arg(6+n)
+        //   Win64: [rsp + 32 + n*8]   — the callee sees this as arg(4+n),
+        //                               above the 32-byte shadow space
+        //
+        // Write each overflow argument here before calling emit_call().
+        // n must be in [0, with_outgoing_args count).
+        Xbyak::Address outgoing_arg_addr(int n) const {
+            if (n < 0 || n >= n_outgoing_args_)
+                XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
+                                rm_->cg_->qword[rm_->cg_->rsp])
+            return rm_->cg_->ptr[rm_->cg_->rsp
+                                 + outgoing_arg_base_
+                                 + static_cast<ptrdiff_t>(n) * 8];
+        }
+
+        // Emit a call to func_ptr with automatic ABI correctness.
+        //
+        // Two behaviours depending on how the layout was built:
+        //
+        // — with_outgoing_args(n) declared:
+        //     Emits only "mov rax, func; call rax" — no sub/add rsp.
+        //     build() computed the frame total so that rsp is already 16-byte
+        //     aligned at this call instruction.  Win64 shadow space is included
+        //     in the frame total.  Write overflow arguments to
+        //     outgoing_arg_addr(0..n-1) and load register arguments before
+        //     calling.
+        //
+        // — with_outgoing_args() not declared:
+        //     Delegates to RegPoolManager::emit_call(), which emits the standard
+        //     "sub rsp, adj; mov rax, func; call rax; add rsp, adj" sequence.
+        //     Use this form for calls whose arguments all fit in registers.
+        //
+        // rax will be clobbered in both cases (used to hold the function address).
+        void emit_call(uint64_t func_ptr) {
+            if (!rm_ || !rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
+            if (n_outgoing_args_ > 0) {
+                // Bare call — rsp already aligned by build().
+#ifndef NDEBUG
+                if (rm_->live_gp_.count(0)) {
+                    fprintf(stderr,
+                            "CommittedLayout::emit_call: rax (index 0) is currently allocated — "
+                            "its value will be destroyed. Park it before calling.\n");
+                    assert(!rm_->live_gp_.count(0) &&
+                           "CommittedLayout::emit_call: rax is live and will be clobbered");
+                }
+#endif
+                rm_->cg_->mov(rm_->cg_->rax, func_ptr);
+                rm_->cg_->call(rm_->cg_->rax);
+            } else {
+                // Standard call — delegate to manager for sub/add alignment.
+                rm_->emit_call(func_ptr);
+            }
+        }
+
+        template <typename FuncT>
+        void emit_call(FuncT *func_ptr) {
+            emit_call(reinterpret_cast<uint64_t>(func_ptr));
+        }
+
     private:
         RegPoolManager *rm_;
         ptrdiff_t gp_base_;
@@ -900,6 +1010,8 @@ public:
         int       vol_vec_slot_bytes_;
         bool      vol_save_declared_;
         bool      vol_save_armed_;
+        ptrdiff_t outgoing_arg_base_;
+        int       n_outgoing_args_;
         // Indices into volatile_gps_ / volatile_vecs_ that were actually stored
         // by the most recent save_volatiles() call.  Used by restore_volatiles()
         // to emit loads for exactly the same set.
@@ -991,7 +1103,8 @@ public:
     // build() is defined here so it can reference CommittedLayout's constructor.
     // Called by StackLayout::build() which delegates here after computing layout.
     CommittedLayout build_layout(int gp_count, int vec_count,
-                                 ptrdiff_t scratch_bytes, bool with_vol) {
+                                 ptrdiff_t scratch_bytes, bool with_vol,
+                                 int outgoing_args = 0) {
         if (!cg_) XBYAK_THROW_RET(ERR_RM_NO_CG, CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         // Nested layouts are not allowed: only one CommittedLayout may be open
         // at a time.  Destroy the current layout before building a new one.
@@ -1009,12 +1122,34 @@ public:
         const int vec_slot = has_avx512_ ? 64 : 32;
 
         // Slot layout (all offsets relative to the new rsp after sub):
-        //  [0 .. gp_count*8)              — GP park slots
-        //  [gp_base .. + vec_count*slot)  — vec park slots
-        //  [vec_end .. + vol_gp*8)        — volatile GP save slots
-        //  [vol_gp_end .. + vol_vec*slot) — volatile vec save slots
-        //  [vol_end .. + scratch)         — scratch
+        //
+        //  When with_outgoing_args(n) is used (slots at lowest addresses):
+        //    [0 .. 32)                        — Win64 shadow space (omitted on SysV)
+        //    [shadow .. + outgoing_args*8)    — outgoing stack-arg slots
+        //    [outg_end .. + gp_count*8)       — GP park slots
+        //    ...                              — vec parks, volatile saves, scratch
+        //
+        //  Default (no with_outgoing_args):
+        //    [0 .. gp_count*8)              — GP park slots
+        //    [gp_base .. + vec_count*slot)  — vec park slots
+        //    [vec_end .. + vol_gp*8)        — volatile GP save slots
+        //    [vol_gp_end .. + vol_vec*slot) — volatile vec save slots
+        //    [vol_end .. + scratch)         — scratch
         ptrdiff_t cursor = 0;
+
+        // Outgoing stack-arg slots must sit at the lowest rsp offsets so the
+        // callee finds them at the ABI-correct positions after the call
+        // instruction pushes the 8-byte return address.
+        ptrdiff_t outgoing_arg_base = 0;
+        if (outgoing_args > 0) {
+#ifdef _WIN32
+            cursor += 32;               // shadow space at [rsp+0..31]
+            outgoing_arg_base = cursor; // overflow args start at [rsp+32]
+#else
+            outgoing_arg_base = 0;      // overflow args start at [rsp+0]
+#endif
+            cursor += static_cast<ptrdiff_t>(outgoing_args) * 8;
+        }
 
         const ptrdiff_t gp_base = cursor;
         cursor += static_cast<ptrdiff_t>(gp_count) * 8;
@@ -1046,8 +1181,36 @@ public:
         const ptrdiff_t scratch_base = cursor;
         cursor += scratch_bytes;
 
-        // Round total up to nearest 16 bytes for stack alignment.
-        ptrdiff_t total = (cursor + 15) & ~ptrdiff_t(15);
+        // Compute the frame total with the correct alignment for the intended
+        // call style.
+        //
+        // Standard case (no outgoing args, use emit_call()):
+        //   total is always a multiple of 16.  emit_call() adds an 8-byte pad
+        //   at emission time when managed_push_count_ is even.
+        //
+        // Outgoing-args case (use emit_layout_call()):
+        //   CommittedLayout::emit_call() is a bare "mov rax; call rax" with no sub/add.
+        //   For rsp to be 16-aligned at the call instruction:
+        //     rsp_at_call = rsp_entry − 8·P − total   (P = managed_push_count_)
+        //     rsp_entry = 16k − 8  (C caller's call pushed 8-byte return addr)
+        //   Solving: (8 + 8P + total) % 16 == 0
+        //     P even  → total ≡  8 (mod 16)
+        //     P odd   → total ≡  0 (mod 16)  ← same as normal rounding
+        ptrdiff_t total;
+        if (outgoing_args > 0) {
+            const bool p_even = (managed_push_count_ % 2 == 0);
+            if (p_even) {
+                // Round cursor up to nearest value ≡ 8 (mod 16).
+                const ptrdiff_t next_16 = (cursor + 15) & ~ptrdiff_t(15);
+                total = next_16 - 8;
+                if (total < cursor) total = next_16 + 8;
+            } else {
+                total = (cursor + 15) & ~ptrdiff_t(15);
+            }
+        } else {
+            // Round total up to nearest 16 bytes for stack alignment.
+            total = (cursor + 15) & ~ptrdiff_t(15);
+        }
         if (total == 0)
             XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
                             CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
@@ -1056,7 +1219,7 @@ public:
                                vec_slot, scratch_base, scratch_bytes, total,
                                std::move(vol_gps), vol_gp_base,
                                std::move(vol_vecs), vol_vec_base, vec_slot,
-                               with_vol);
+                               with_vol, outgoing_arg_base, outgoing_args);
     }
 
     // helper methods to query APX support
