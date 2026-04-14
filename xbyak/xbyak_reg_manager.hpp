@@ -132,9 +132,12 @@ public:
         }
         max_gp_reg_idx_ = has_apx_ ? 31 : 15;
 
-        // Detect AVX-512 for extended vector registers (zmm16-zmm31)
+        // Opmask registers (k1-k7) require AVX-512F and XCR0[5] (OPMASK state).
+        // Full ZMM support (zmm0-31) additionally requires XCR0[6] (ZMM_Hi256)
+        // and XCR0[7] (Hi16_ZMM = zmm16-31).
         if (cpu.has(Xbyak::util::Cpu::tAVX512F)) {
-            has_avx512_ = ((xcr0 >> 7) & 1) == 1; // Check if XCR0[7] is set for AVX-512 support
+            has_opmask_ = ((xcr0 >> 5) & 1) == 1; // XCR0[5]: OPMASK state (k registers)
+            has_avx512_ = ((xcr0 >> 5) & 7) == 7; // XCR0[5:7] all set for full ZMM support
         }
         max_vec_reg_idx_ = has_avx512_ ? 31 : 15;
 
@@ -163,8 +166,9 @@ public:
             }
         }
 
-        // Opmask registers (k1-k7) are only available with AVX-512
-        if (has_avx512_) {
+        // Opmask registers (k1-k7) require AVX-512F + XCR0[5] (OPMASK state).
+        // This is independent of full ZMM (zmm16-31) support.
+        if (has_opmask_) {
             free_opmask_regs = base_free_opmask();
             preserved_opmask = base_preserved_opmask();
         }
@@ -1228,6 +1232,10 @@ public:
 
     // helper methods to query AVX-512 support
     bool has_avx512() const { return has_avx512_; }
+    // Returns true when opmask registers (k1-k7) are available.
+    // Requires AVX-512F and OS-enabled OPMASK state (XCR0[5]).
+    // May be true even when full ZMM (zmm16-31) support is absent.
+    bool has_opmask() const { return has_opmask_; }
     int max_vec_registers() const { return max_vec_reg_idx_ + 1; }
 
     // helper methods to query AMX support
@@ -1286,7 +1294,7 @@ public:
                 free_vec_regs.insert(i);
         }
         live_opmask_.clear();
-        if (has_avx512_) {
+        if (has_opmask_) {
             free_opmask_regs = base_free_opmask();
             preserved_opmask = base_preserved_opmask();
         } else {
@@ -1786,7 +1794,8 @@ private:
     int max_gp_reg_idx_ = 15; // 15 without APX, 31 with APX
 
     // AVX-512 feature support
-    bool has_avx512_ = false;
+    bool has_avx512_ = false; // true when XCR0[5:7] all set (full ZMM support including zmm16-31)
+    bool has_opmask_ = false; // true when XCR0[5] set (k registers available; subset of AVX-512)
     // 15 without (SSE/AVX/AVX2), 31 with AVX-512
     int max_vec_reg_idx_ = 15;
     // True when the OS has enabled XMM and YMM state saving (XCR0[1:2] == 3).

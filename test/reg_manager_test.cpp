@@ -183,12 +183,6 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
             CYBOZU_TEST_EQUAL(reg_ymm3.getIdx(), ymm3.getIdx());
             CYBOZU_TEST_EQUAL(reg_zmm4.getIdx(), zmm4.getIdx());
 
-            // Opmask — k1 and k2.
-            auto reg_k1 = rm.alloc(k1);
-            auto reg_k2 = rm.alloc(k2);
-            CYBOZU_TEST_EQUAL(reg_k1.getIdx(), k1.getIdx());
-            CYBOZU_TEST_EQUAL(reg_k2.getIdx(), k2.getIdx());
-
             // AMX Tile — tmm0 and tmm1 (skipped if AMX is not available).
             // tmm0-tmm7 are const Tmm members of CodeGenerator, so they work
             // identically to rax, xmm2, k1 etc.
@@ -210,17 +204,25 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
             // same error path as alloc<Reg64>(int idx) for a duplicate index.
             CYBOZU_TEST_EXCEPTION(rm.alloc(rdx),  Xbyak::Error);
             CYBOZU_TEST_EXCEPTION(rm.alloc(xmm2), Xbyak::Error);
-            CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   Xbyak::Error);
 
-            // Free all and confirm every pool is clean.
+            // Free GP and Vec registers.
             rm.free(reg_rdx);  rm.free(reg_r10);
             rm.free(reg_r8d);  rm.free(reg_r9w);
             rm.free(reg_xmm2); rm.free(reg_ymm3); rm.free(reg_zmm4);
-            rm.free(reg_k1);   rm.free(reg_k2);
 
             CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
             CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
-            CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
+
+            // Opmask — k1 and k2 (skipped if AVX-512F is not available).
+            if (rm.has_avx512()) {
+                auto reg_k1 = rm.alloc(k1);
+                auto reg_k2 = rm.alloc(k2);
+                CYBOZU_TEST_EQUAL(reg_k1.getIdx(), k1.getIdx());
+                CYBOZU_TEST_EQUAL(reg_k2.getIdx(), k2.getIdx());
+                CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   Xbyak::Error);
+                rm.free(reg_k1);   rm.free(reg_k2);
+                CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
+            }
         }
     };
     NamedAllocTest t;
@@ -271,8 +273,10 @@ CYBOZU_TEST_AUTO(allocScopedConvenience)
     {
         auto xmm = rm.allocScoped<Xmm>();
         CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(), 1);
-        auto k   = rm.allocScoped<Opmask>();
-        CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+        if (rm.has_avx512()) {
+            auto k = rm.allocScoped<Opmask>();
+            CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+        }
     }
     CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
     CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
@@ -367,6 +371,7 @@ CYBOZU_TEST_AUTO(vectorRegisters)
 CYBOZU_TEST_AUTO(opmaskRegisters)
 {
     RegPoolManager rm(g_cpu);
+    if (!rm.has_avx512()) return; // opmask requires AVX-512F
 
     auto k1 = rm.alloc<Opmask>();
     auto k2 = rm.alloc<Opmask>();
@@ -463,19 +468,22 @@ CYBOZU_TEST_AUTO(mixedAllocation)
     auto xmm = rm.alloc<Xmm>();
     auto ymm = rm.alloc<Ymm>();
     auto zmm = rm.alloc<Zmm>();
-    auto k   = rm.alloc<Opmask>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(),     3);
-    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(),    3);
-    CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(),  3);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(), 3);
+
+    if (rm.has_avx512()) {
+        auto k = rm.alloc<Opmask>();
+        CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+        rm.free(k);
+        CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
+    }
 
     rm.free(r64);  rm.free(r32);  rm.free(r16);
     rm.free(xmm);  rm.free(ymm);  rm.free(zmm);
-    rm.free(k);
 
     CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
     CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
-    CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
 }
 
 // =============================================================================
@@ -1032,11 +1040,16 @@ CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
 
     auto r64 = rm.alloc<Reg64>();
     auto xmm = rm.alloc<Xmm>();
-    auto k   = rm.alloc<Opmask>();
 
-    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(),     1);
-    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(),    1);
-    CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_gps().size(),  1);
+    CYBOZU_TEST_EQUAL((int)rm.get_live_vecs().size(), 1);
+
+    if (rm.has_avx512()) {
+        auto k = rm.alloc<Opmask>();
+        CYBOZU_TEST_EQUAL((int)rm.get_live_opmasks().size(), 1);
+        rm.free(k);
+        CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
+    }
 
     if (rm.has_amx()) {
         auto t0 = rm.alloc<Tmm>();
@@ -1051,11 +1064,9 @@ CYBOZU_TEST_AUTO(mixedAllocationWithAMX)
 
     rm.free(r64);
     rm.free(xmm);
-    rm.free(k);
 
     CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
     CYBOZU_TEST_ASSERT(rm.get_live_vecs().empty());
-    CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
 }
 
 // =============================================================================
@@ -1313,11 +1324,7 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
         have_vec_preserved = true;
     }
 
-    // Opmask registers
-    auto k1 = rm.alloc<Opmask>();
-    auto k2 = rm.alloc<Opmask>();
-
-    // Query all families
+    // Query GP and Vec families
     auto gp_volatile   = rm.get_live_volatile_gps();
     auto gp_preserved  = rm.get_live_preserved_gps();
     auto vec_volatile  = rm.get_live_volatile_vecs();
@@ -1342,12 +1349,18 @@ CYBOZU_TEST_AUTO(comprehensiveSaveRestore)
                            != vec_preserved.end());
     }
 
-    // Cleanup
+    // Cleanup GP and Vec
     rm.free(r1);  rm.free(r2);
     if (have_gp_preserved) rm.free(r3);
     rm.free(xmm1);  rm.free(ymm2);
     if (have_vec_preserved) rm.free(xmm3);
-    rm.free(k1);  rm.free(k2);
+
+    // Opmask registers (skipped if AVX-512F is not available).
+    if (rm.has_avx512()) {
+        auto k1 = rm.alloc<Opmask>();
+        auto k2 = rm.alloc<Opmask>();
+        rm.free(k1);  rm.free(k2);
+    }
 }
 
 // =============================================================================
@@ -1475,23 +1488,25 @@ CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
                            != free_vecs.end());
     }
 
-    // ---- Opmask ----
-    // k1 (idx=1) is always in the free opmask pool.
-    const int opmask_idx = 1;
-    CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
+    // ---- Opmask (skipped if AVX-512F is not available) ----
+    if (rm.has_avx512()) {
+        // k1 (idx=1) is always in the free opmask pool.
+        const int opmask_idx = 1;
+        CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
 
-    rm.mark_unavailable<Opmask>(opmask_idx);
-    CYBOZU_TEST_ASSERT(rm.is_reserved<Opmask>(opmask_idx));
+        rm.mark_unavailable<Opmask>(opmask_idx);
+        CYBOZU_TEST_ASSERT(rm.is_reserved<Opmask>(opmask_idx));
 
-    // alloc by index must throw for reserved opmask.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Opmask>(opmask_idx), Xbyak::Error);
+        // alloc by index must throw for reserved opmask.
+        CYBOZU_TEST_EXCEPTION(rm.alloc<Opmask>(opmask_idx), Xbyak::Error);
 
-    rm.mark_available<Opmask>(opmask_idx);
-    CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
-    {
-        const auto free_masks = rm.get_free_opmasks();
-        CYBOZU_TEST_ASSERT(std::find(free_masks.begin(), free_masks.end(), opmask_idx)
-                           != free_masks.end());
+        rm.mark_available<Opmask>(opmask_idx);
+        CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
+        {
+            const auto free_masks = rm.get_free_opmasks();
+            CYBOZU_TEST_ASSERT(std::find(free_masks.begin(), free_masks.end(), opmask_idx)
+                               != free_masks.end());
+        }
     }
 }
 
@@ -1572,12 +1587,14 @@ CYBOZU_TEST_AUTO(markUnavailableNamedReg)
             rm.mark_available(xmm1);
             CYBOZU_TEST_ASSERT(!rm.is_reserved(xmm1));
 
-            // Opmask named overload
-            rm.mark_unavailable(k2);
-            CYBOZU_TEST_ASSERT(rm.is_reserved(k2));
-            CYBOZU_TEST_EXCEPTION(rm.alloc(k2), Xbyak::Error);
-            rm.mark_available(k2);
-            CYBOZU_TEST_ASSERT(!rm.is_reserved(k2));
+            // Opmask named overload (skipped if AVX-512F is not available).
+            if (rm.has_avx512()) {
+                rm.mark_unavailable(k2);
+                CYBOZU_TEST_ASSERT(rm.is_reserved(k2));
+                CYBOZU_TEST_EXCEPTION(rm.alloc(k2), Xbyak::Error);
+                rm.mark_available(k2);
+                CYBOZU_TEST_ASSERT(!rm.is_reserved(k2));
+            }
         }
     };
     NamedTest t;
@@ -1649,17 +1666,22 @@ CYBOZU_TEST_AUTO(allFreeMultiFamily)
     auto r1 = rm.alloc<Reg64>();
     auto v0 = rm.alloc<Xmm>();
     auto v1 = rm.alloc<Ymm>();
-    auto k0 = rm.alloc<Opmask>();
 
     CYBOZU_TEST_ASSERT(!rm.all_free());
 
     rm.free(r0);
-    CYBOZU_TEST_ASSERT(!rm.all_free()); // four still in use
+    CYBOZU_TEST_ASSERT(!rm.all_free()); // r1, v0, v1 still in use
 
     rm.free(r1);
     rm.free(v0);
     rm.free(v1);
-    rm.free(k0);
+
+    // Opmask (skipped if AVX-512F is not available).
+    if (rm.has_avx512()) {
+        auto k0 = rm.alloc<Opmask>();
+        CYBOZU_TEST_ASSERT(!rm.all_free());
+        rm.free(k0);
+    }
 
     CYBOZU_TEST_ASSERT(rm.all_free());
     rm.assert_all_free();
