@@ -39,6 +39,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 21. [Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.](#21-pool-count-queries-free_gp_count-free_vec_count-etc)
 22. [Rename `in_use` to `live` in Getter Names](#22-rename-in_use-to-live-in-getter-names)
 23. [Unified Stack Layout: `StackLayout` / `CommittedLayout` (Replaces §7 and §8)](#23-unified-stack-layout-stacklayout--committedlayout-replaces-7-and-8)
+24. [Open Task: ABI-portable argument register mapping (Future Work)](#24-open-task-abi-portable-argument-register-mapping-future-work)
+25. [Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`](#25-stack-overflow-arguments-with_outgoing_args--committedlayoutemit_call)
 ---
 
 ## Implementation Status
@@ -75,6 +77,9 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
 - [x] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc. *(REJECTED — see §21)*
 - [x] 22. Rename `in_use` to `live` in Getter Names
+- [ ] 23. Unified Stack Layout: `StackLayout` / `CommittedLayout`
+- [ ] 24. Open Task: ABI-portable argument register mapping (Future Work)
+- [ ] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
 
 ---
 
@@ -3037,7 +3042,7 @@ cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
 
 ---
 
-## Open Issue: `Reg8`/`Reg16` in `reg_family<>` but no `do_store`/`do_load` overloads (Issue 11)
+## Open Issue: `Reg8`/`Reg16` in `reg_family<>` but no `do_store`/`do_load` overloads 
 
 `reg_family<Reg8>` and `reg_family<Reg16>` are defined (mapping to `RegFamily::GP`),
 so `alloc<Reg8>()`, `free(Reg8(...))`, and `mark_unavailable<Reg8>(idx)` all compile
@@ -3063,3 +3068,428 @@ which have overloads for `Reg64`, `Reg32`, and `Reg16` but **not** `Reg8`.  Call
 
 The recommended path is **option 1**: it is consistent, low-risk, and closes the gap
 without removing already-working tracking functionality.
+
+---
+
+## 24. Open Task: ABI-portable argument register mapping (Future Work)
+
+### Motivation
+
+JIT kernels that accept incoming function arguments must know which registers
+hold those arguments at function entry.  This mapping is ABI-specific:
+
+| Arg position | SysV AMD64 (Linux/macOS) | Windows x64        |
+|--------------|--------------------------|--------------------|
+| GP arg 0     | rdi (index 7)            | rcx (index 1)      |
+| GP arg 1     | rsi (index 6)            | rdx (index 2)      |
+| GP arg 2     | rdx (index 2)            | r8  (index 8)      |
+| GP arg 3     | rcx (index 1)            | r9  (index 9)      |
+| GP arg 4     | r8  (index 8)            | stack              |
+| GP arg 5     | r9  (index 9)            | stack              |
+| FP arg 0     | xmm0                     | xmm0               |
+| FP arg 1     | xmm1                     | xmm1               |
+| …            | xmm0–xmm7 (8 regs)       | xmm0–xmm3 (4 regs) |
+
+Today every call site must `#ifdef` around the register index:
+
+```cpp
+#ifdef _WIN32
+    auto arg0 = alloc<Reg64>(1);   // rcx
+#else
+    auto arg0 = alloc<Reg64>(7);   // rdi
+#endif
+```
+
+This is verbose, error-prone, and defeats the goal of writing platform-portable
+JIT kernels with a single code path.
+
+### Fundamental ABI asymmetry
+
+The two ABIs count GP and FP slots **differently**, which means a single
+`arg_reg_index(n)` function is insufficient for mixed-type signatures.
+
+On **SysV**, GP and FP argument counters are **independent**:
+
+```
+void f(int a, double b, int c)
+      rdi       xmm0    rsi
+```
+
+On **Windows x64**, all arguments share a **single slot counter** and the register
+type follows the argument type at that position:
+
+```
+void f(int a, double b, int c)
+      rcx       xmm1    r8
+       0         1       2   ← slot position
+```
+
+A JIT kernel generating code to process its own incoming arguments can handle
+this with two separate index queries (one for GP, one for FP).  Generating a JIT
+*caller* that passes mixed-type arguments to a C function is inherently
+platform-dependent at the slot-counting level and may require a higher-level
+abstraction (e.g. an `ArgBuilder` that tracks both counters).
+
+### Proposed API (static helpers only — no new member state)
+
+```cpp
+// Returns the register index of the n-th integer/pointer argument register.
+// n is the GP argument count (0-based), independent of any FP arguments.
+//
+// SysV:    n=0→rdi(7), n=1→rsi(6), n=2→rdx(2), n=3→rcx(1), n=4→r8(8), n=5→r9(9)
+// Windows: n=0→rcx(1), n=1→rdx(2), n=2→r8(8),  n=3→r9(9)
+//
+// Throws ERR_RM_REG_IDX_OUT_OF_RANGE if n >= gp_arg_reg_count().
+static int gp_arg_reg_index(int n);
+
+// Returns the register index of the n-th FP/vector argument register.
+// n is the FP argument count (0-based), independent of any GP arguments on SysV.
+// On Windows, n is the slot position (must account for preceding GP args).
+//
+// SysV/Windows: n=0→xmm0, n=1→xmm1, ..., up to xmm7 (SysV) / xmm3 (Windows).
+//
+// Throws ERR_RM_REG_IDX_OUT_OF_RANGE if n >= fp_arg_reg_count().
+static int fp_arg_reg_index(int n);
+
+// Returns the number of GP argument registers available in registers.
+// SysV: 6  (rdi, rsi, rdx, rcx, r8, r9)
+// Windows: 4  (rcx, rdx, r8, r9)
+static int gp_arg_reg_count();
+
+// Returns the number of FP argument registers.
+// SysV: 8  (xmm0–xmm7)
+// Windows: 4  (xmm0–xmm3)
+static int fp_arg_reg_count();
+```
+
+### Stack-passed arguments
+
+Arguments beyond `gp_arg_reg_count()` (GP) or `fp_arg_reg_count()` (FP) are
+passed on the stack.  The manager has no visibility into the caller's frame layout
+at the point of the JIT entry, so stack-passed arguments are **out of scope** for
+this API.  Callers that need to access them must do so manually, using the known
+ABI layout:
+
+- **SysV**: 7th GP arg at `[rsp+8]` (before any prologue push), then `[rsp+16]`, etc.
+- **Windows**: 5th arg at `[rsp+40]` (after 32-byte shadow space + return address).
+
+`gp_arg_reg_index()` and `fp_arg_reg_index()` should throw when `n` exceeds the
+register count so call sites receive a clear error rather than silently using a
+wrong index.
+
+### Usage example (after implementation)
+
+```cpp
+// Platform-portable: park the first two integer arguments
+auto arg0 = alloc<Reg64>(gp_arg_reg_index(0));   // rdi / rcx
+auto arg1 = alloc<Reg64>(gp_arg_reg_index(1));   // rsi / rdx
+
+// Platform-portable: park the first FP argument
+auto fp0  = alloc<Xmm>(fp_arg_reg_index(0));     // xmm0 on both ABIs
+
+emit_prologue();
+auto cl = make_stack_layout().gp_parks(2).build();
+cl.park(arg0, 0);
+cl.park(arg1, 1);
+// ... kernel body ...
+cl.destroy();
+emit_epilogue();
+ret();
+```
+
+Compared to the current boilerplate:
+
+```cpp
+// Before: required #ifdef at every call site
+#ifdef _WIN32
+    auto arg0 = alloc<Reg64>(1);   // rcx
+    auto arg1 = alloc<Reg64>(2);   // rdx
+#else
+    auto arg0 = alloc<Reg64>(7);   // rdi
+    auto arg1 = alloc<Reg64>(6);   // rsi
+#endif
+```
+
+### Remaining open question
+
+For kernels that both **receive** mixed-type arguments (as callee) and **emit
+calls** to mixed-signature C functions (as caller), the two ABIs' different
+slot-counting rules mean a second, higher-level abstraction may be needed —
+an `ArgDescriptor` or `CallBuilder` that accumulates argument types in order and
+resolves both the GP and FP register assignments simultaneously.  This is deferred
+until concrete use cases drive the design.
+
+### Internal state changes
+
+None.  All four functions are `static` — they encode only compile-time ABI
+constants.  No new member variables or constructor changes are required.
+
+---
+
+## 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
+
+### Motivation
+
+`RegPoolManager::emit_call()` (§18) handles the common case: a call whose
+arguments all fit in ABI registers.  Its `sub rsp, adj; call; add rsp, adj`
+sequence is correct when rsp only needs to move for alignment and Win64 shadow
+space — it emits that movement at call time and immediately undoes it.
+
+This model breaks down for functions whose argument count exceeds the ABI GP
+register limit:
+
+| ABI     | GP regs for args       | Stack args start at |
+|---------|------------------------|---------------------|
+| SysV    | 6 (rdi,rsi,rdx,rcx,r8,r9) | arg 7+           |
+| Win64   | 4 (rcx,rdx,r8,r9)     | arg 5+              |
+
+Stack-overflow arguments must be written to specific `[rsp + offset]` slots
+**before** the `call` instruction.  The callee reads them at fixed positions
+relative to the rsp it sees on entry:
+
+- SysV:  7th arg at `[rsp + 0]`, 8th at `[rsp + 8]`, …
+- Win64: 5th arg at `[rsp + 32]`, 6th at `[rsp + 40]`, …  (above the 32-byte
+  shadow space the caller already owns)
+
+`emit_call()` emits `sub rsp, adj` immediately before the `call`.  Any
+stack-overflow args written to `[rsp + X]` before that `sub` are shifted to
+`[rsp + X + adj]` at call time — the callee reads the wrong values with no
+diagnostic of any kind.
+
+The fundamental mismatch is:
+
+| Method | When rsp moves | Stack-arg writes |
+|--------|---------------|-----------------|
+| `emit_call()` | At call, transiently | Must be *after* the sub |
+| `CommittedLayout` | Once at `build()`, stable | Can be written at *any time* before the call |
+
+§23's commitment — that rsp does not move between `build()` and `destroy()` —
+provides exactly the stability needed for fixed-offset pre-call writes.  The
+missing piece is a way to (a) declare the overflow-arg slots inside the
+`StackLayout` builder so they are placed at the correct ABI position, and (b)
+make `build()` absorb the required alignment adjustment into the frame total so
+the call itself needs no further rsp movement.
+
+### Design
+
+Two additions are required:
+
+**1. `StackLayout::with_outgoing_args(n)`** — declares `n` stack-overflow argument
+slots.  The builder records this count; `build()` places the slots at the
+ABI-correct base:
+
+- SysV:  slots at `[rsp + 0]`, `[rsp + 8]`, … (`outgoing_arg_base = 0`)
+- Win64: 32 bytes of shadow space at `[rsp + 0..31]`, then slots at
+  `[rsp + 32]`, `[rsp + 40]`, … (`outgoing_arg_base = 32`)
+
+Both shadow space and overflow slots are laid out by `build_layout()` **below**
+any GP/Vec park slots, scratch area, or volatile-save slots, so they sit at the
+lowest rsp offsets as the ABI requires.
+
+**2. Alignment-aware `build_layout()` total.**  When `with_outgoing_args(n)` is
+declared, `emit_layout_call()` (see below) emits a bare `call` with no sub/add.
+For rsp to be 16-aligned at that `call` instruction the frame total must satisfy:
+
+```
+rsp_at_call = rsp_entry − 8·P − total
+rsp_entry   = 16k − 8  (the C caller's call instruction pushed an 8-byte return address)
+
+Alignment constraint: (8 + 8·P + total) % 16 == 0
+
+P even → total ≡  8 (mod 16)   ← round cursor up to the nearest value ≡ 8 (mod 16)
+P odd  → total ≡  0 (mod 16)   ← standard nearest-16 rounding (same as default path)
+```
+
+where `P = managed_push_count_` at the time `build()` is called (i.e. after
+`emit_prologue()`).
+
+**3. `CommittedLayout::emit_call()` — unified call method.**  Rather than
+introducing a separate `emit_layout_call()` method that callers must remember to
+use, `CommittedLayout` gains its own `emit_call()` that automatically selects the
+correct behaviour:
+
+- `with_outgoing_args(n)` was declared → bare `mov rax, func; call rax`.  rsp is
+  already aligned; no sub/add emitted.
+- Not declared → delegate to `RegPoolManager::emit_call()`, which performs the
+  standard `sub rsp, adj; call; add rsp, adj` sequence.
+
+From the caller's perspective there is exactly **one call method** inside a
+`CommittedLayout`.  The same `cl.emit_call(&func)` works for both register-only
+calls and overflow-arg calls in the same layout.
+
+### Proposed API
+
+#### On `StackLayout` (builder additions)
+
+```cpp
+// Reserve n outgoing stack-overflow argument slots.
+//
+// Slot positions after build():
+//   SysV:  [rsp + n*8]          (n = 0-based overflow arg index)
+//   Win64: [rsp + 32 + n*8]     (preceded by 32-byte shadow space; total Win64
+//                                 stack arg base = rsp + 32, as the ABI requires)
+//
+// build() adjusts the frame total so that rsp is 16-aligned at the subsequent
+// emit_call() instruction, absorbing alignment compensation into the sub rsp.
+// Returns *this for chaining.
+StackLayout &with_outgoing_args(int n);
+```
+
+#### On `CommittedLayout` (new methods)
+
+```cpp
+// Returns the number of outgoing stack-overflow argument slots declared
+// with with_outgoing_args().  Zero if not declared.
+int outgoing_arg_count() const;
+
+// Returns an address operand for outgoing stack-overflow argument slot n.
+//
+//   SysV:  [rsp + n*8]
+//   Win64: [rsp + 32 + n*8]   (above the 32-byte shadow space)
+//
+// Write each overflow argument here before calling emit_call().
+// n must be in [0, outgoing_arg_count()).
+// Throws ERR_RM_LAYOUT_SLOT_OOB if n is out of range.
+Xbyak::Address outgoing_arg_addr(int n) const;
+
+// Emit a call to func_ptr with automatic ABI correctness.
+//
+// Behaviour depends on whether with_outgoing_args() was declared:
+//
+//   with_outgoing_args(n) declared:
+//     Emits only "mov rax, func; call rax" — no sub/add rsp.
+//     build() has already absorbed the required alignment into the frame total.
+//     Win64 shadow space is included in the frame.
+//     Write overflow arguments to outgoing_arg_addr(0..n-1) and load register
+//     arguments before calling.
+//
+//   with_outgoing_args() not declared:
+//     Delegates to RegPoolManager::emit_call(), which emits the standard
+//     "sub rsp, adj; mov rax, func; call rax; add rsp, adj" sequence.
+//     Use this form when all arguments fit in registers.
+//
+// rax is clobbered in both cases.
+// Throws ERR_RM_NO_CG if no CodeGenerator is attached.
+void emit_call(uint64_t func_ptr);
+
+template <typename FuncT>
+void emit_call(FuncT *func_ptr);
+```
+
+### Internal State Changes
+
+```cpp
+// Added to CommittedLayout:
+ptrdiff_t outgoing_arg_base_;   // rsp-relative base of the first overflow-arg slot
+int       n_outgoing_args_;     // 0 if with_outgoing_args() was not declared
+```
+
+`build_layout()` gains an `outgoing_args` parameter (default `0`) and a second
+block in the total-rounding logic that selects between `≡ 8 (mod 16)` and
+`≡ 0 (mod 16)` depending on `managed_push_count_` parity.
+
+No new persistent state is required on `RegPoolManager` itself.
+
+### Usage Example — 8-argument function (4 register + 4 stack on SysV; 4 register + 4 stack on Win64)
+
+```cpp
+// C function to call:
+//   SysV:  a-f in regs (rdi,rsi,rdx,rcx,r8,r9); g,h on stack
+//   Win64: a-d in regs (rcx,rdx,r8,r9); e-h on stack
+extern "C" uint64_t sum8(uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+                         uint64_t e, uint64_t f, uint64_t g, uint64_t h);
+
+struct MyKernel : CodeGenerator, RegPoolManager {
+    MyKernel(const util::Cpu &cpu)
+        : CodeGenerator(4096), RegPoolManager(cpu, this) {}
+
+    void build() {
+        emit_prologue();  // no callee-saved regs used here — no-op
+
+        // Declare overflow slots.  build() reserves Win64 shadow space
+        // automatically and aligns the frame total for a bare call.
+#ifdef _WIN32
+        auto cl = make_stack_layout().with_outgoing_args(4).build(); // e,f,g,h
+#else
+        auto cl = make_stack_layout().with_outgoing_args(2).build(); // g,h
+#endif
+
+        // Write stack-overflow arguments to their pre-reserved fixed slots.
+        // rsp is stable — offsets are correct at the call instruction.
+        auto r_tmp = alloc<Reg64>();
+#ifdef _WIN32
+        mov(r_tmp, 5); mov(cl.outgoing_arg_addr(0), r_tmp); // e → [rsp+32]
+        mov(r_tmp, 6); mov(cl.outgoing_arg_addr(1), r_tmp); // f → [rsp+40]
+        mov(r_tmp, 7); mov(cl.outgoing_arg_addr(2), r_tmp); // g → [rsp+48]
+        mov(r_tmp, 8); mov(cl.outgoing_arg_addr(3), r_tmp); // h → [rsp+56]
+        free(r_tmp);
+        // Load register arguments.
+        mov(rcx, 1); mov(rdx, 2); mov(r8, 3); mov(r9, 4);
+#else
+        mov(r_tmp, 7); mov(cl.outgoing_arg_addr(0), r_tmp); // g → [rsp+0]
+        mov(r_tmp, 8); mov(cl.outgoing_arg_addr(1), r_tmp); // h → [rsp+8]
+        free(r_tmp);
+        mov(rdi, 1); mov(rsi, 2); mov(rdx, 3);
+        mov(rcx, 4); mov(r8,  5); mov(r9,  6);
+#endif
+        // Bare call — rsp is already 16-aligned; no sub/add emitted.
+        cl.emit_call(&sum8); // rax = 1+2+3+4+5+6+7+8 = 36
+
+        cl.destroy();
+        emit_epilogue();
+        ret();
+    }
+};
+```
+
+### Usage Example — Mixed calls in one layout
+
+The same `with_outgoing_args` layout can serve both a register-only call and an
+overflow-arg call.  `cl.emit_call()` selects the bare-call path for both; the
+overflow slots simply go unwritten before the register-only call.
+
+```cpp
+auto r_pres = alloc<Reg64>(3);  // rbx — survives every call
+emit_prologue();                 // push rbx → P = 1 (odd)
+
+#ifdef _WIN32
+auto cl = make_stack_layout().with_outgoing_args(4).build();
+#else
+auto cl = make_stack_layout().with_outgoing_args(2).build();
+#endif
+
+// Call 1: register-only.  Overflow slots untouched.
+cl.emit_call(&no_args_func);    // rax = ...
+mov(r_pres, rax);               // stash in callee-saved register
+
+// Call 2: overflow-arg call.
+auto r_tmp = alloc<Reg64>();
+// ... write outgoing_arg_addr slots and register args ...
+cl.emit_call(&sum8);            // rax = sum
+free(r_tmp);
+
+add(rax, r_pres);               // combine results
+
+free(r_pres);
+cl.destroy();
+emit_epilogue();
+ret();
+```
+
+### Notes / Interactions
+
+- **`emit_call()` vs `RegPoolManager::emit_call()`** — inside a layout the user
+  always calls `cl.emit_call()`.  `RegPoolManager::emit_call()` should generally
+  not be used inside an active `CommittedLayout`; in debug builds an assertion
+  could guard against this, though the current implementation does not require it.
+- **Overflow slot count must be declared upfront** — the count is fixed at
+  `build()` time and reflects the worst case across all calls made inside the
+  layout.  If different calls within the same layout have different overflow counts,
+  declare the maximum.
+- **Win64 shadow space is non-optional when `with_outgoing_args(n)` is used** —
+  `build_layout()` always reserves the full 32 bytes on Win64 so that register-only
+  calls within the same layout also have shadow space available.
+- **`emit_layout_call()` (interim name)** — during development a separate method
+  `emit_layout_call()` was briefly used for the bare-call path before being merged
+  into `CommittedLayout::emit_call()`.  The unified single-method design is the
+  intended final form.
