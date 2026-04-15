@@ -44,20 +44,23 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 ---
 
 ## Implementation Status
+[x] - Completed
+[o] - Rejected (Should have a reason for rejection or point to an alternate proposal)
+[ ] - Yet to be implemeted / still under consideration
 
 - [x] 1. Bug Fix: XCR0 Operator Precedence
-- [x] 2. Performance: Replace `std::set` with Bitmask Pools *(REJECTED — see §2)*
-- [x] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
+- [o] 2. Performance: Replace `std::set` with Bitmask Pools *(REJECTED — see §2)*
+- [o] 3. Pool Management: `add_to_vec_pool()` and `add_to_opmask_pool()` *(REJECTED — see §3)*
 - [x] 4. Register Reservation: `mark_unavailable()` / `mark_available()`
-- [x] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
+- [o] 5. Pinned Registers: `pin()` and `alloc_pinned()` *(REJECTED — see §5)*
 - [x] 6. Code Emission Coupling: `set_code_generator()`
-- [x] 7. Register Spill / Restore: `spill()` and `restore()` *(REVIEW NOTES — see §7)*
-  - [ ] 7a. Resolve GP-only limitation: extend `spill()` to Vec, or remove in favour of a unified approach
-  - [ ] 7b. Guard against `spill()` being called while a `StackFrame` is active
-- [x] 8. Stack Frame Management: `StackFrame` RAII Helper *(REVIEW NOTES — see §8)*
-  - [ ] 8a. Fix `put_on_stack(RegT &reg)` destructive-free behaviour: remove or rename to make intent obvious
+- [o] 7. Register Spill / Restore: `spill()` and `restore()` *(REVIEW NOTES — see §7)* *(REJECTED in favor of §23)*
+  - [o] 7a. Resolve GP-only limitation: extend `spill()` to Vec, or remove in favour of a unified approach
+  - [o] 7b. Guard against `spill()` being called while a `StackFrame` is active
+- [o] 8. Stack Frame Management: `StackFrame` RAII Helper *(REVIEW NOTES — see §8)* *(REJECTED in favor of §23)*
+  - [o] 8a. Fix `put_on_stack(RegT &reg)` destructive-free behaviour: remove or rename to make intent obvious
 - [x] 9. Preserved Register Tracking: `emit_prologue()` / `emit_epilogue()`
-  - ~~9a. Add debug assertion: fire if preserved register is promoted by `alloc()` before `emit_prologue()` has been called~~ *(REJECTED — see §9)*
+  - [o] 9a. Add debug assertion: fire if preserved register is promoted by `alloc()` before `emit_prologue()` has been called *(REJECTED — see §9)*
 - [x] 10. End-of-JIT Validation: `assert_all_free()`
 - [x] 11. Error Handling: Align with `XBYAK_THROW` / `Xbyak::Error`
 - [x] 12. Named-Register `alloc()` Overload
@@ -72,14 +75,14 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 17. Accept External `Xbyak::util::Cpu` Reference
 - [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment) *(REVIEW NOTES — see §18)*
   - [x] 18a. Add debug assertion when `rax` is currently allocated at `emit_call()` invocation
-  - ~~18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented~~ *(REJECTED — see §18)*
+  - [o]18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented *(REJECTED — see §18)*
 - [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
 - [x] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
 - [x] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc. *(REJECTED — see §21)*
 - [x] 22. Rename `in_use` to `live` in Getter Names
-- [ ] 23. Unified Stack Layout: `StackLayout` / `CommittedLayout`
+- [x] 23. Unified Stack Layout: `StackLayout` / `CommittedLayout`
 - [ ] 24. Open Task: ABI-portable argument register mapping (Future Work)
-- [ ] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
+- [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
 
 ---
 
