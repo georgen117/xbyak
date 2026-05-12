@@ -17,7 +17,7 @@
  *   addToPool               – stack_ptr / base_ptr / add_to_gp_pool
  *   registerExhaustion      – allocating more regs than available throws
  *   mixedAllocation         – mix of GP / Vec / Opmask in one manager
- *   regInUseAllFamilies     – reg_in_use round-trip for every register family
+ *   regInUseAllFamilies     – reg_live round-trip for every register family
  *   gpRegisterAliasing      – Reg64/Reg32/Reg16 share a physical register index
  *   vectorRegisterAliasing  – Xmm/Ymm/Zmm share a physical register index
  *   registerContentsViaJIT  – write + read register values through JIT execution
@@ -30,7 +30,7 @@
  *   amxTileExhaustion       – allocating more tiles than available throws
  *   mixedAllocationWithAMX  – mix of GP / Vec / Opmask / AMX in one manager
  *   amxScopedRegisters      – RAII makeScoped auto-free for Tmm
- *   amxRegInUse             – reg_in_use helpers for Tmm
+ *   amxRegInUse             – reg_live helpers for Tmm
  *   inUseVolatilePreservedGPs – get_live_volatile/preserved_gps() correctness
  *   volatileGPCallerSave    – JIT caller-saves only volatile GPs around a call
  *   vecVolatilePreserved    – get_live_volatile/preserved_vecs() correctness
@@ -143,7 +143,7 @@ CYBOZU_TEST_AUTO(specificAllocation)
     CYBOZU_TEST_EQUAL(r11.getIdx(), 11);
 
     // Allocating an already-in-use index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), Xbyak::RegManagerError);
 
     rm.free(r10);
     rm.free(r11);
@@ -193,7 +193,7 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
                 CYBOZU_TEST_EQUAL(reg_tmm1.getIdx(), tmm1.getIdx());
 
                 // Duplicate alloc by name must throw for tiles too.
-                CYBOZU_TEST_EXCEPTION(rm.alloc(tmm0), Xbyak::Error);
+                CYBOZU_TEST_EXCEPTION(rm.alloc(tmm0), Xbyak::RegManagerError);
 
                 rm.free(reg_tmm0);
                 rm.free(reg_tmm1);
@@ -202,8 +202,8 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
 
             // Allocating an already-in-use register by name must throw — the
             // same error path as alloc<Reg64>(int idx) for a duplicate index.
-            CYBOZU_TEST_EXCEPTION(rm.alloc(rdx),  Xbyak::Error);
-            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm2), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(rdx),  Xbyak::RegManagerError);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm2), Xbyak::RegManagerError);
 
             // Free GP and Vec registers.
             rm.free(reg_rdx);  rm.free(reg_r10);
@@ -219,7 +219,7 @@ CYBOZU_TEST_AUTO(namedRegisterAlloc)
                 auto reg_k2 = rm.alloc(k2);
                 CYBOZU_TEST_EQUAL(reg_k1.getIdx(), k1.getIdx());
                 CYBOZU_TEST_EQUAL(reg_k2.getIdx(), k2.getIdx());
-                CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   Xbyak::Error);
+                CYBOZU_TEST_EXCEPTION(rm.alloc(k1),   Xbyak::RegManagerError);
                 rm.free(reg_k1);   rm.free(reg_k2);
                 CYBOZU_TEST_ASSERT(rm.get_live_opmasks().empty());
             }
@@ -265,7 +265,7 @@ CYBOZU_TEST_AUTO(allocScopedConvenience)
     {
         auto r10 = rm.allocScoped<Reg64>(10);
         CYBOZU_TEST_EQUAL((int)r10.get().getIdx(), 10);
-        CYBOZU_TEST_ASSERT(rm.reg_in_use(r10.get()));
+        CYBOZU_TEST_ASSERT(rm.reg_live(r10.get()));
     }
     CYBOZU_TEST_ASSERT(rm.get_live_gps().empty());
 
@@ -313,8 +313,8 @@ CYBOZU_TEST_AUTO(scopedImplicitConversion)
     // Implicit conversion — Scoped<Reg64> passed to a function expecting const Reg64 &.
     {
         auto r = rm.allocScoped<Reg64>(9);  // r9
-        // reg_in_use(const RegT&) accepts Scoped<Reg64> via the implicit conversion.
-        CYBOZU_TEST_ASSERT(rm.reg_in_use<Reg64>(r));
+        // reg_live(const RegT&) accepts Scoped<Reg64> via the implicit conversion.
+        CYBOZU_TEST_ASSERT(rm.reg_live<Reg64>(r));
     }
 
     // Implicit conversion in JIT emission — Scoped<Reg64> used as a CodeGenerator operand.
@@ -422,13 +422,13 @@ CYBOZU_TEST_AUTO(addToPool)
     CYBOZU_TEST_EQUAL(rbp_reg.getIdx(), 5);
 
     // add_to_gp_pool with an out-of-range index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(200), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(200), Xbyak::RegManagerError);
 
     // add_to_gp_pool for an index already in the free pool (rax=0, always
     // caller-saved) or the preserved pool (rbx=3, always callee-saved) must
     // throw on both Windows and Linux.
-    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(0), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(3), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(0), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.add_to_gp_pool(3), Xbyak::RegManagerError);
 }
 
 // =============================================================================
@@ -443,7 +443,7 @@ CYBOZU_TEST_AUTO(registerExhaustion)
     try {
         for (int i = 0; i < 50; ++i)
             allocated.push_back(rm.alloc<Reg64>());
-    } catch (const Xbyak::Error &) {
+    } catch (const Xbyak::RegManagerError &) {
         // Exhaustion exception is expected.
     }
 
@@ -487,7 +487,7 @@ CYBOZU_TEST_AUTO(mixedAllocation)
 }
 
 // =============================================================================
-// Test – reg_in_use round-trip for every register family
+// Test – reg_live round-trip for every register family
 // =============================================================================
 CYBOZU_TEST_AUTO(regInUseAllFamilies)
 {
@@ -495,48 +495,48 @@ CYBOZU_TEST_AUTO(regInUseAllFamilies)
 
     // GP (Reg64)
     auto gp = rm.alloc<Reg64>();
-    CYBOZU_TEST_ASSERT(rm.reg_in_use(gp));
+    CYBOZU_TEST_ASSERT(rm.reg_live(gp));
     rm.free(gp);
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(gp));
+    CYBOZU_TEST_ASSERT(!rm.reg_live(gp));
 
     // GP aliases: Reg32 and Reg16 share the same physical index.
     auto gp32 = rm.alloc<Reg32>();
-    CYBOZU_TEST_ASSERT(rm.reg_in_use(gp32));
+    CYBOZU_TEST_ASSERT(rm.reg_live(gp32));
     rm.free(gp32);
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(gp32));
+    CYBOZU_TEST_ASSERT(!rm.reg_live(gp32));
 
     // Vec (Xmm / Ymm / Zmm) — only exercised when the OS has enabled vector state
     if (rm.has_avx512() || !rm.get_free_vecs().empty()) {
         auto xmm = rm.alloc<Xmm>();
-        CYBOZU_TEST_ASSERT(rm.reg_in_use(xmm));
+        CYBOZU_TEST_ASSERT(rm.reg_live(xmm));
         rm.free(xmm);
-        CYBOZU_TEST_ASSERT(!rm.reg_in_use(xmm));
+        CYBOZU_TEST_ASSERT(!rm.reg_live(xmm));
 
         auto ymm = rm.alloc<Ymm>();
-        CYBOZU_TEST_ASSERT(rm.reg_in_use(ymm));
+        CYBOZU_TEST_ASSERT(rm.reg_live(ymm));
         rm.free(ymm);
-        CYBOZU_TEST_ASSERT(!rm.reg_in_use(ymm));
+        CYBOZU_TEST_ASSERT(!rm.reg_live(ymm));
 
         auto zmm = rm.alloc<Zmm>();
-        CYBOZU_TEST_ASSERT(rm.reg_in_use(zmm));
+        CYBOZU_TEST_ASSERT(rm.reg_live(zmm));
         rm.free(zmm);
-        CYBOZU_TEST_ASSERT(!rm.reg_in_use(zmm));
+        CYBOZU_TEST_ASSERT(!rm.reg_live(zmm));
     }
 
     // Opmask (k1-k7)
     if (!rm.get_free_opmasks().empty()) {
         auto k = rm.alloc<Opmask>();
-        CYBOZU_TEST_ASSERT(rm.reg_in_use(k));
+        CYBOZU_TEST_ASSERT(rm.reg_live(k));
         rm.free(k);
-        CYBOZU_TEST_ASSERT(!rm.reg_in_use(k));
+        CYBOZU_TEST_ASSERT(!rm.reg_live(k));
     }
 
     // AMX Tile (tmm0-tmm7) — only exercised when AMX is available
     if (rm.has_amx()) {
         auto tmm = rm.alloc<Tmm>();
-        CYBOZU_TEST_ASSERT(rm.reg_in_use(tmm));
+        CYBOZU_TEST_ASSERT(rm.reg_live(tmm));
         rm.free(tmm);
-        CYBOZU_TEST_ASSERT(!rm.reg_in_use(tmm));
+        CYBOZU_TEST_ASSERT(!rm.reg_live(tmm));
     }
 }
 
@@ -552,9 +552,9 @@ CYBOZU_TEST_AUTO(gpRegisterAliasing)
     CYBOZU_TEST_EQUAL(rax_reg.getIdx(), 0);
 
     // EAX (Reg32(0)) shares the same physical register – must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg32>(0), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg32>(0), Xbyak::RegManagerError);
     // AX (Reg16(0)) also shares it – must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg16>(0), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg16>(0), Xbyak::RegManagerError);
 
     rm.free(rax_reg);
 
@@ -577,8 +577,8 @@ CYBOZU_TEST_AUTO(vectorRegisterAliasing)
     CYBOZU_TEST_EQUAL(xmm0.getIdx(), 0);
 
     // YMM0 and ZMM0 share the same physical register – both must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Ymm>(0), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Zmm>(0), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Ymm>(0), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Zmm>(0), Xbyak::RegManagerError);
 
     rm.free(xmm0);
 
@@ -933,7 +933,7 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
                           (uint64_t)(100 + 200 + 300 + 400 + 210));
     }
 
-    // Scenario 2: loop-based save/restore using reg_in_use().
+    // Scenario 2: loop-based save/restore using reg_live().
     {
         RegPoolManager rm(g_cpu);
         DynamicJit jit;
@@ -972,7 +972,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
 
     if (!rm.has_amx()) {
         // Without AMX hardware alloc must throw immediately.
-        CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(), Xbyak::Error);
+        CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(), Xbyak::RegManagerError);
         return;
     }
 
@@ -990,7 +990,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
     CYBOZU_TEST_EQUAL(t2.getIdx(), 2);
 
     // Duplicate allocation of tile 2 must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(2), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(2), Xbyak::RegManagerError);
 
     rm.free(t0);
     rm.free(t1);
@@ -1000,7 +1000,7 @@ CYBOZU_TEST_AUTO(amxTileRegisters)
     CYBOZU_TEST_EQUAL((int)rm.get_free_tiles().size(), 8);
 
     // Freeing a tile that is not in use must throw.
-    CYBOZU_TEST_EXCEPTION(rm.free(t0), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.free(t0), Xbyak::RegManagerError);
 }
 
 // =============================================================================
@@ -1015,7 +1015,7 @@ CYBOZU_TEST_AUTO(amxTileExhaustion)
     try {
         for (int i = 0; i < 10; ++i)
             allocated.push_back(rm.alloc<Tmm>());
-    } catch (const Xbyak::Error &) {
+    } catch (const Xbyak::RegManagerError &) {
         // Exhaustion exception is expected.
     }
 
@@ -1094,7 +1094,7 @@ CYBOZU_TEST_AUTO(amxScopedRegisters)
 }
 
 // =============================================================================
-// Test – reg_in_use helpers for Tmm
+// Test – reg_live helpers for Tmm
 // =============================================================================
 CYBOZU_TEST_AUTO(amxRegInUse)
 {
@@ -1104,12 +1104,12 @@ CYBOZU_TEST_AUTO(amxRegInUse)
 
     auto t3 = rm.alloc<Tmm>(3);
 
-    CYBOZU_TEST_ASSERT(rm.reg_in_use(t3));
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(Tmm(4)));
+    CYBOZU_TEST_ASSERT(rm.reg_live(t3));
+    CYBOZU_TEST_ASSERT(!rm.reg_live(Tmm(4)));
 
     rm.free(t3);
 
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(t3));
+    CYBOZU_TEST_ASSERT(!rm.reg_live(t3));
 }
 
 // =============================================================================
@@ -1389,7 +1389,7 @@ CYBOZU_TEST_AUTO(markUnavailableGP)
     }
 
     // Attempting to alloc the reserved register by index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(idx), Xbyak::RegManagerError);
 
     // The next free alloc() must skip the reserved register.
     auto alloc1 = rm.alloc<Reg64>();
@@ -1397,7 +1397,7 @@ CYBOZU_TEST_AUTO(markUnavailableGP)
     rm.free(alloc1);
 
     // Double-reserving must throw.
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(idx), Xbyak::RegManagerError);
 
     // mark_available releases it back to its pool.
     rm.mark_available<Reg64>(idx);
@@ -1414,7 +1414,7 @@ CYBOZU_TEST_AUTO(markUnavailableGP)
     rm.free(r);
 
     // mark_available on a non-reserved register must throw.
-    CYBOZU_TEST_EXCEPTION(rm.mark_available<Reg64>(idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Reg64>(idx), Xbyak::RegManagerError);
 }
 
 // =============================================================================
@@ -1478,7 +1478,7 @@ CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
     }
 
     // alloc by index must throw for reserved vec.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Xmm>(vec_idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Xmm>(vec_idx), Xbyak::RegManagerError);
 
     rm.mark_available<Xmm>(vec_idx);
     CYBOZU_TEST_ASSERT(!rm.is_reserved<Xmm>(vec_idx));
@@ -1498,7 +1498,7 @@ CYBOZU_TEST_AUTO(markUnavailableVecOpmask)
         CYBOZU_TEST_ASSERT(rm.is_reserved<Opmask>(opmask_idx));
 
         // alloc by index must throw for reserved opmask.
-        CYBOZU_TEST_EXCEPTION(rm.alloc<Opmask>(opmask_idx), Xbyak::Error);
+        CYBOZU_TEST_EXCEPTION(rm.alloc<Opmask>(opmask_idx), Xbyak::RegManagerError);
 
         rm.mark_available<Opmask>(opmask_idx);
         CYBOZU_TEST_ASSERT(!rm.is_reserved<Opmask>(opmask_idx));
@@ -1533,10 +1533,10 @@ CYBOZU_TEST_AUTO(markUnavailableTile)
     }
 
     // Allocating a reserved tile by index must throw.
-    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(tile_idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Tmm>(tile_idx), Xbyak::RegManagerError);
 
     // Double-reserve must throw.
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::RegManagerError);
 
     rm.mark_available<Tmm>(tile_idx);
     CYBOZU_TEST_ASSERT(!rm.is_reserved<Tmm>(tile_idx));
@@ -1553,7 +1553,7 @@ CYBOZU_TEST_AUTO(markUnavailableTile)
     CYBOZU_TEST_EQUAL(t.getIdx(), tile_idx);
 
     // Reserving an in-use tile must throw.
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(tile_idx), Xbyak::RegManagerError);
 
     rm.free(t);
 }
@@ -1570,7 +1570,7 @@ CYBOZU_TEST_AUTO(markUnavailableNamedReg)
             // mark_unavailable(rdi) — named overload
             rm.mark_unavailable(rdi);
             CYBOZU_TEST_ASSERT(rm.is_reserved(rdi));
-            CYBOZU_TEST_EXCEPTION(rm.alloc(rdi), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(rdi), Xbyak::RegManagerError);
 
             rm.mark_available(rdi);
             CYBOZU_TEST_ASSERT(!rm.is_reserved(rdi));
@@ -1583,7 +1583,7 @@ CYBOZU_TEST_AUTO(markUnavailableNamedReg)
             // Vec named overload
             rm.mark_unavailable(xmm1);
             CYBOZU_TEST_ASSERT(rm.is_reserved(xmm1));
-            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm1), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(rm.alloc(xmm1), Xbyak::RegManagerError);
             rm.mark_available(xmm1);
             CYBOZU_TEST_ASSERT(!rm.is_reserved(xmm1));
 
@@ -1591,7 +1591,7 @@ CYBOZU_TEST_AUTO(markUnavailableNamedReg)
             if (rm.has_avx512()) {
                 rm.mark_unavailable(k2);
                 CYBOZU_TEST_ASSERT(rm.is_reserved(k2));
-                CYBOZU_TEST_EXCEPTION(rm.alloc(k2), Xbyak::Error);
+                CYBOZU_TEST_EXCEPTION(rm.alloc(k2), Xbyak::RegManagerError);
                 rm.mark_available(k2);
                 CYBOZU_TEST_ASSERT(!rm.is_reserved(k2));
             }
@@ -1611,7 +1611,7 @@ CYBOZU_TEST_AUTO(markUnavailableInUseThrows)
     auto r = rm.alloc<Reg64>(9);  // r9 is caller-saved
 
     // Trying to reserve an already-allocated register must throw.
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(9), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(9), Xbyak::RegManagerError);
 
     rm.free(r);
 }
@@ -1623,15 +1623,15 @@ CYBOZU_TEST_AUTO(markUnavailableOutOfRange)
 {
     RegPoolManager rm(g_cpu);
 
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(200), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Xmm>(200), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Opmask>(8), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(8),    Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Reg64>(200), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Xmm>(200), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Opmask>(8), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.mark_unavailable<Tmm>(8),    Xbyak::RegManagerError);
 
-    CYBOZU_TEST_EXCEPTION(rm.mark_available<Reg64>(200), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.mark_available<Xmm>(200), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.mark_available<Opmask>(8), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.mark_available<Tmm>(8),    Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Reg64>(200), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Xmm>(200), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Opmask>(8), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.mark_available<Tmm>(8),    Xbyak::RegManagerError);
 }
 
 // =============================================================================
@@ -1861,8 +1861,8 @@ CYBOZU_TEST_AUTO(prologueEpilogueThrowsNoCG)
         v_regs.push_back(rm.alloc<Reg64>());
     Reg64 r_pres = rm.alloc<Reg64>();
 
-    CYBOZU_TEST_EXCEPTION(rm.emit_prologue(), Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(rm.emit_epilogue(), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.emit_prologue(), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.emit_epilogue(), Xbyak::RegManagerError);
 
     for (auto &r : v_regs) rm.free(r);
     rm.free(r_pres);
@@ -2004,7 +2004,7 @@ CYBOZU_TEST_AUTO(emitCall)
         CYBOZU_TEST_EXCEPTION(
             rm.emit_call(reinterpret_cast<uint64_t>(
                 &call_function_that_clobbers_registers)),
-            Xbyak::Error);
+            Xbyak::RegManagerError);
     }
 
     // emit_call() respects managed_push_count_ from emit_prologue(): when
@@ -2088,8 +2088,8 @@ CYBOZU_TEST_AUTO(resetClearsAllocation)
     CYBOZU_TEST_NO_EXCEPTION(auto rbx = rm.alloc<Reg64>(3); rm.free(rbx);)
 
     // Previously in-use indices are gone from in_use.
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(r0));
-    CYBOZU_TEST_ASSERT(!rm.reg_in_use(r1));
+    CYBOZU_TEST_ASSERT(!rm.reg_live(r0));
+    CYBOZU_TEST_ASSERT(!rm.reg_live(r1));
 }
 
 
@@ -2111,7 +2111,7 @@ CYBOZU_TEST_AUTO(resetClearsPrologueHistory)
     // reset() implicitly returns all registers to their pools.  Calling free()
     // on a register that was in-use before reset() is an error — it is no
     // longer in in_use after the reset.
-    CYBOZU_TEST_EXCEPTION(rm.free(rbx), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.free(rbx), Xbyak::RegManagerError);
     // After reset, index 3 (rbx) is back in the preserved pool (not the free pool).
     const auto preserved = rm.get_preserved_gps();
     const auto free_gps  = rm.get_free_gps();
@@ -2211,7 +2211,7 @@ CYBOZU_TEST_AUTO(resetReEmit)
 CYBOZU_TEST_AUTO(stackLayoutNoCg)
 {
     RegPoolManager rm(g_cpu);  // no CG
-    CYBOZU_TEST_EXCEPTION(rm.make_stack_layout().build(), Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(rm.make_stack_layout().build(), Xbyak::RegManagerError);
 }
 
 // =============================================================================
@@ -2228,10 +2228,10 @@ CYBOZU_TEST_AUTO(stackLayoutNegativeArgs)
     };
 
     Kernel k;
-    CYBOZU_TEST_EXCEPTION(k.build_negative_gp(),       Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(k.build_negative_vec(),      Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(k.build_negative_scratch(),  Xbyak::Error);
-    CYBOZU_TEST_EXCEPTION(k.build_empty(),             Xbyak::Error);
+    CYBOZU_TEST_EXCEPTION(k.build_negative_gp(),       Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(k.build_negative_vec(),      Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(k.build_negative_scratch(),  Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(k.build_empty(),             Xbyak::RegManagerError);
 }
 
 // =============================================================================
@@ -2320,8 +2320,8 @@ CYBOZU_TEST_AUTO(stackLayoutScratchOob)
         void build() {
             emit_prologue();
             auto cl = make_stack_layout().scratch(8).build();
-            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(8), Xbyak::Error);   // == size → OOB
-            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(-1), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(8), Xbyak::RegManagerError);   // == size → OOB
+            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(-1), Xbyak::RegManagerError);
             cl.destroy();
             emit_epilogue();
             ret();
@@ -2342,8 +2342,8 @@ CYBOZU_TEST_AUTO(stackLayoutSlotOob)
             emit_prologue();
             auto cl = make_stack_layout().gp_parks(1).build();
             auto r = alloc<Reg64>();
-            CYBOZU_TEST_EXCEPTION(cl.park(static_cast<const Reg64&>(r), 1), Xbyak::Error);  // OOB
-            CYBOZU_TEST_EXCEPTION(cl.reload<Reg64>(1), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(cl.park(static_cast<const Reg64&>(r), 1), Xbyak::RegManagerError);  // OOB
+            CYBOZU_TEST_EXCEPTION(cl.reload<Reg64>(1), Xbyak::RegManagerError);
             free(r);
             cl.destroy();
             emit_epilogue();
@@ -2364,8 +2364,8 @@ CYBOZU_TEST_AUTO(stackLayoutSaveNotDeclared)
         void build() {
             emit_prologue();
             auto cl = make_stack_layout().scratch(8).build();  // no with_volatile_save()
-            CYBOZU_TEST_EXCEPTION(cl.save_volatiles(), Xbyak::Error);
-            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(cl.save_volatiles(), Xbyak::RegManagerError);
+            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::RegManagerError);
             cl.destroy();
             emit_epilogue();
             ret();
@@ -2387,7 +2387,7 @@ CYBOZU_TEST_AUTO(stackLayoutRestoreWithoutSave)
             auto cl = make_stack_layout()
                 .with_volatile_save()
                 .build();
-            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::Error);
+            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::RegManagerError);
             cl.destroy();
             emit_epilogue();
             ret();
@@ -2580,7 +2580,7 @@ CYBOZU_TEST_AUTO(stackLayoutParkConstNoFree)
             const Reg64 &cr = r;
             cl.park(cr, 0);             // const overload — should NOT free r
 
-            CYBOZU_TEST_ASSERT(reg_in_use(r));   // r still allocated
+            CYBOZU_TEST_ASSERT(reg_live(r));   // r still allocated
 
             free(r);
             cl.destroy();
@@ -3030,8 +3030,8 @@ CYBOZU_TEST_AUTO(stackLayoutOutgoingStackArgs)
             void build() {
                 emit_prologue();
                 auto cl = make_stack_layout().with_outgoing_args(2).build();
-                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(2),  Xbyak::Error); // n == count
-                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(-1), Xbyak::Error);
+                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(2),  Xbyak::RegManagerError); // n == count
+                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(-1), Xbyak::RegManagerError);
                 cl.destroy();
                 emit_epilogue();
                 ret();

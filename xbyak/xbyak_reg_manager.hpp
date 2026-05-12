@@ -32,6 +32,102 @@
 #include "xbyak/xbyak_util.h"
 
 namespace Xbyak {
+
+
+// RegManager-specific error codes.
+enum class RmError {
+    GP_IN_USE = 0,
+    GP_NOT_IN_USE,
+    GP_NOT_AVAILABLE,
+    NO_FREE_GP,
+    VEC_IN_USE,
+    VEC_NOT_IN_USE,
+    VEC_NOT_AVAILABLE,
+    NO_FREE_VEC,
+    OPMASK_IN_USE,
+    OPMASK_NOT_IN_USE,
+    OPMASK_NOT_AVAILABLE,
+    NO_FREE_OPMASK,
+    TILE_IN_USE,
+    TILE_NOT_IN_USE,
+    TILE_NOT_AVAILABLE,
+    NO_FREE_TILE,
+    REG_IDX_OUT_OF_RANGE,
+    REG_ALREADY_TRACKED,
+    SCOPED_REG_NOT_IN_USE,
+    SPILL_NOT_IN_USE,
+    NO_CG,
+    STACK_FRAME_SIZE_INVALID,
+    STACK_FRAME_OFFSET_OOB,
+    RESTORE_WITHOUT_SAVE,
+    LAYOUT_SLOT_OOB,
+    LAYOUT_SCRATCH_OOB,
+    LAYOUT_SAVE_NOT_DECLARED,
+    LAYOUT_ALREADY_ACTIVE,
+};
+
+// RegManager-specific exception.  Carries a typed RmError code and a
+// descriptive message, independent of Xbyak's error table.
+class RegManagerError : public std::exception {
+    RmError rm_err_;
+    static const char *rm_what(RmError e) noexcept {
+        static const char * const tbl[] = {
+            "reg manager: GP register already in use",
+            "reg manager: GP register not in use",
+            "reg manager: GP register not in free/preserved pool",
+            "reg manager: no free GP registers available",
+            "reg manager: Vec register already in use",
+            "reg manager: Vec register not in use",
+            "reg manager: Vec register not in free/preserved pool",
+            "reg manager: no free Vec registers available",
+            "reg manager: Opmask register already in use",
+            "reg manager: Opmask register not in use",
+            "reg manager: Opmask register not in free/preserved pool",
+            "reg manager: no free Opmask registers available",
+            "reg manager: Tile register already in use",
+            "reg manager: Tile register not in use",
+            "reg manager: Tile register not in free pool",
+            "reg manager: no free Tile registers available",
+            "reg manager: register index out of range",
+            "reg manager: register already tracked in a pool",
+            "reg manager: makeScoped called on a register not in use",
+            "reg manager: spill called on a register not in use",
+            "reg manager: operation requires a CodeGenerator",
+            "reg manager: stack frame size invalid",
+            "reg manager: stack frame offset out of bounds",
+            "reg manager: restore_volatiles called without a preceding save_volatiles",
+            "reg manager: stack layout slot index out of bounds",
+            "reg manager: stack layout scratch offset out of bounds",
+            "reg manager: save_volatiles called but with_volatile_save() was not declared",
+            "reg manager: a CommittedLayout is already active on this manager",
+        };
+        const int idx = static_cast<int>(e);
+        return (idx >= 0 && idx < static_cast<int>(sizeof(tbl) / sizeof(*tbl)))
+               ? tbl[idx] : "reg manager: unknown error";
+    }
+public:
+    explicit RegManagerError(RmError e) : rm_err_(e) {}
+    RmError error() const noexcept { return rm_err_; }
+    const char *what() const noexcept override { return rm_what(rm_err_); }
+};
+
+#ifdef XBYAK_NO_EXCEPTION
+namespace rm_local {
+inline int &GetRmErrRef() { static XBYAK_TLS int e = 0; return e; }
+inline void SetRmError(RmError e) {
+    if (!GetRmErrRef()) GetRmErrRef() = static_cast<int>(e) + 1;
+}
+} // namespace rm_local
+inline void ClearRmError() { rm_local::GetRmErrRef() = 0; }
+inline bool HasRmError()    { return rm_local::GetRmErrRef() != 0; }
+inline RmError GetRmError() { return static_cast<RmError>(rm_local::GetRmErrRef() - 1); }
+#  define RM_THROW(e)       { Xbyak::rm_local::SetRmError(e); return; }
+#  define RM_THROW_RET(e,r) { Xbyak::rm_local::SetRmError(e); return r; }
+#else
+#  define RM_THROW(e)       { throw Xbyak::RegManagerError(e); }
+#  define RM_THROW_RET(e,r) { throw Xbyak::RegManagerError(e); }
+#endif
+
 // Static definitions for different types of registers in relation to which family they belong to.
 enum class RegFamily { GP, Vec, Opmask, Tile };
 
@@ -444,7 +540,7 @@ public:
     // such as ABI argument registers or registers dedicated to a runtime helper.
     //
     // The register must not be currently allocated. Reserving an already-in-use register,
-    // or calling mark_unavailable() twice on the same register, throws Xbyak::Error.
+    // or calling mark_unavailable() twice on the same register, throws Xbyak::RegManagerError.
     // Reserved registers are not visible to get_live_gps() / get_live_vecs() etc.
     // Call mark_available() to return the register to the normal allocation pool.
     //
@@ -483,7 +579,7 @@ public:
     }
 
     // Returns a previously reserved register to the allocation pool so that alloc() may
-    // return it again. Throws Xbyak::Error if the register is not currently reserved.
+    // return it again. Throws Xbyak::RegManagerError if the register is not currently reserved.
     template <class RegT>
     void mark_available(const RegT &reg) { mark_available<RegT>(reg.getIdx()); }
 
@@ -521,25 +617,25 @@ public:
     // from the opmask pool but must never be allocated — using it as a write
     // mask silently disables masking.)
     //
-    // Throws Xbyak::Error if the index is out of range, or if the register is
+    // Throws Xbyak::RegManagerError if the index is out of range, or if the register is
     // already tracked (free, preserved, in-use, or reserved).
     void add_to_gp_pool(const Reg64 &reg) { add_to_gp_pool(reg.getIdx()); }
     void add_to_gp_pool(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         const bool in_free = free_gp_regs.count(idx) != 0;
         const bool in_preserved = preserved_gp.count(idx) != 0;
         const bool in_use = live_gp_.count(idx) != 0;
         const bool in_reserved = reserved_gp.count(idx) != 0;
         if (in_free || in_preserved || in_use || in_reserved)
-            XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+            RM_THROW(RmError::REG_ALREADY_TRACKED)
         free_gp_regs.insert(idx);
     }
 
     // helper function - returns true if a register object is currently in the used set of registers
     template <class RegT>
-    bool reg_in_use(const RegT &reg) const {
-        return reg_in_use_idx(reg.getIdx(), reg_family<RegT>::value);
+    bool reg_live(const RegT &reg) const {
+        return reg_live_idx(reg.getIdx(), reg_family<RegT>::value);
     }
 
     // scoped register handling with RAII
@@ -718,7 +814,7 @@ public:
 
         // Commit: compute the total frame size, emit sub rsp, <total>, and
         // return a CommittedLayout owning the frame.
-        // Throws Xbyak::Error if no CodeGenerator has been provided, or if a
+        // Throws Xbyak::RegManagerError if no CodeGenerator has been provided, or if a
         // CommittedLayout is already active on this manager.
         CommittedLayout build() {
             return rm_->build_layout(gp_count_, vec_count_,
@@ -770,7 +866,7 @@ public:
                   vol_save_armed_(false),
                   outgoing_arg_base_(outgoing_arg_base),
                   n_outgoing_args_(n_outgoing_args) {
-            if (!rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
+            if (!rm_->cg_) RM_THROW(RmError::NO_CG)
             rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
             rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
             rm_->allocated_stack_space_ += total_;
@@ -871,7 +967,7 @@ public:
         // declared.  Does not move rsp.  The set saved here is exactly the set
         // that restore_volatiles() will reload.
         void save_volatiles() {
-            if (!vol_save_declared_) XBYAK_THROW(ERR_RM_LAYOUT_SAVE_NOT_DECLARED)
+            if (!vol_save_declared_) RM_THROW(RmError::LAYOUT_SAVE_NOT_DECLARED)
             actually_saved_gp_indices_.clear();
             for (int i = 0; i < (int)volatile_gps_.size(); ++i) {
                 if (!rm_->live_gp_.count(volatile_gps_[i])) continue;
@@ -896,8 +992,8 @@ public:
         // in reverse order.  Only the registers that were actually stored are
         // reloaded.  Must be called after save_volatiles().
         void restore_volatiles() {
-            if (!vol_save_declared_) XBYAK_THROW(ERR_RM_LAYOUT_SAVE_NOT_DECLARED)
-            if (!vol_save_armed_) XBYAK_THROW(ERR_RM_RESTORE_WITHOUT_SAVE)
+            if (!vol_save_declared_) RM_THROW(RmError::LAYOUT_SAVE_NOT_DECLARED)
+            if (!vol_save_armed_) RM_THROW(RmError::RESTORE_WITHOUT_SAVE)
             for (int i = (int)actually_saved_vec_indices_.size() - 1; i >= 0; --i) {
                 const int slot_i = actually_saved_vec_indices_[i];
                 const ptrdiff_t off = vol_vec_base_ + static_cast<ptrdiff_t>(slot_i) * vol_vec_slot_bytes_;
@@ -921,7 +1017,7 @@ public:
         // byte_offset must be in [0, scratch_bytes).
         Xbyak::Address scratch_addr(ptrdiff_t byte_offset = 0) const {
             if (byte_offset < 0 || byte_offset >= scratch_bytes_)
-                XBYAK_THROW_RET(ERR_RM_LAYOUT_SCRATCH_OOB,
+                RM_THROW_RET(RmError::LAYOUT_SCRATCH_OOB,
                                 rm_->cg_->qword[rm_->cg_->rsp])
             return rm_->cg_->ptr[rm_->cg_->rsp + scratch_base_ + byte_offset];
         }
@@ -946,7 +1042,7 @@ public:
         // n must be in [0, with_outgoing_args count).
         Xbyak::Address outgoing_arg_addr(int n) const {
             if (n < 0 || n >= n_outgoing_args_)
-                XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
+                RM_THROW_RET(RmError::LAYOUT_SLOT_OOB,
                                 rm_->cg_->qword[rm_->cg_->rsp])
             return rm_->cg_->ptr[rm_->cg_->rsp
                                  + outgoing_arg_base_
@@ -972,7 +1068,7 @@ public:
         //
         // rax will be clobbered in both cases (used to hold the function address).
         void emit_call(uint64_t func_ptr) {
-            if (!rm_ || !rm_->cg_) XBYAK_THROW(ERR_RM_NO_CG)
+            if (!rm_ || !rm_->cg_) RM_THROW(RmError::NO_CG)
             if (n_outgoing_args_ > 0) {
                 // Bare call — rsp already aligned by build().
 #ifndef NDEBUG
@@ -1024,11 +1120,11 @@ public:
 
         void check_gp_slot(int idx) const {
             if (idx < 0 || idx >= gp_count_)
-                XBYAK_THROW(ERR_RM_LAYOUT_SLOT_OOB)
+                RM_THROW(RmError::LAYOUT_SLOT_OOB)
         }
         void check_vec_slot(int idx) const {
             if (idx < 0 || idx >= vec_count_)
-                XBYAK_THROW(ERR_RM_LAYOUT_SLOT_OOB)
+                RM_THROW(RmError::LAYOUT_SLOT_OOB)
         }
 
         static void do_store(Xbyak::CodeGenerator *cg, const Reg64 &r, ptrdiff_t off) {
@@ -1099,7 +1195,7 @@ public:
     //       .scratch(32)
     //       .build();
     //
-    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    // Throws Xbyak::RegManagerError if no CodeGenerator has been provided.
     StackLayout make_stack_layout() {
         return StackLayout(*this);
     }
@@ -1109,16 +1205,16 @@ public:
     CommittedLayout build_layout(int gp_count, int vec_count,
                                  ptrdiff_t scratch_bytes, bool with_vol,
                                  int outgoing_args = 0) {
-        if (!cg_) XBYAK_THROW_RET(ERR_RM_NO_CG, CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+        if (!cg_) RM_THROW_RET(RmError::NO_CG, CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         // Nested layouts are not allowed: only one CommittedLayout may be open
         // at a time.  Destroy the current layout before building a new one.
-        if (layout_active_) XBYAK_THROW_RET(ERR_RM_LAYOUT_ALREADY_ACTIVE,
+        if (layout_active_) RM_THROW_RET(RmError::LAYOUT_ALREADY_ACTIVE,
                 CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         if (gp_count < 0 || vec_count < 0)
-            XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
+            RM_THROW_RET(RmError::LAYOUT_SLOT_OOB,
                             CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         if (scratch_bytes < 0)
-            XBYAK_THROW_RET(ERR_RM_LAYOUT_SCRATCH_OOB,
+            RM_THROW_RET(RmError::LAYOUT_SCRATCH_OOB,
                             CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         // Round scratch up to the nearest 8-byte boundary so callers can
         // request an arbitrary byte count without caring about alignment.
@@ -1216,7 +1312,7 @@ public:
             total = (cursor + 15) & ~ptrdiff_t(15);
         }
         if (total == 0)
-            XBYAK_THROW_RET(ERR_RM_LAYOUT_SLOT_OOB,
+            RM_THROW_RET(RmError::LAYOUT_SLOT_OOB,
                             CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
 
         return CommittedLayout(*this, gp_base, gp_count, vec_base, vec_count,
@@ -1331,9 +1427,9 @@ public:
     // registers (xmm6-xmm15) promoted since the last call.
     //
     // Pair with emit_epilogue() just before ret to emit the matching restore
-    // sequence.  Throws Xbyak::Error if no CodeGenerator was provided.
+    // sequence.  Throws Xbyak::RegManagerError if no CodeGenerator was provided.
     void emit_prologue() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (!cg_) RM_THROW(RmError::NO_CG)
         const int n_new = (int)allocated_preserved_gp_.size() - prologue_gp_cursor_;
         for (int i = prologue_gp_cursor_; i < (int)allocated_preserved_gp_.size(); ++i)
             cg_->push(Reg64(allocated_preserved_gp_[i]));
@@ -1362,9 +1458,9 @@ public:
     //     allocation order, matching the push sequence from emit_prologue()
     //
     // Call this once just before ret.
-    // Throws Xbyak::Error if no CodeGenerator was provided.
+    // Throws Xbyak::RegManagerError if no CodeGenerator was provided.
     void emit_epilogue() {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (!cg_) RM_THROW(RmError::NO_CG)
 #ifdef _WIN32
         if (!allocated_preserved_vec_.empty()) {
             const int n = (int)allocated_preserved_vec_.size();
@@ -1394,9 +1490,9 @@ public:
     // In debug builds (NDEBUG not defined): asserts that rax is not currently
     //                allocated and prints a diagnostic to stderr if it is.
     //
-    // Throws Xbyak::Error if no CodeGenerator has been provided.
+    // Throws Xbyak::RegManagerError if no CodeGenerator has been provided.
     void emit_call(uint64_t func_ptr) {
-        if (!cg_) XBYAK_THROW(ERR_RM_NO_CG)
+        if (!cg_) RM_THROW(RmError::NO_CG)
 #ifndef NDEBUG
         if (live_gp_.count(0)) {
             fprintf(stderr,
@@ -1463,20 +1559,20 @@ private:
     //private helpers — reserve / unreserve for each family
     void reserve_reg_gp(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (live_gp_.count(idx))   XBYAK_THROW(ERR_RM_GP_IN_USE)
-        if (reserved_gp.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
+        if (live_gp_.count(idx))   RM_THROW(RmError::GP_IN_USE)
+        if (reserved_gp.count(idx)) RM_THROW(RmError::REG_ALREADY_TRACKED)
         // Remove from whichever pool currently holds it.
         if (!free_gp_regs.erase(idx) && !preserved_gp.erase(idx))
-            XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
+            RM_THROW(RmError::GP_NOT_AVAILABLE)
         reserved_gp.insert(idx);
     }
 
     void unreserve_reg_gp(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         if (!reserved_gp.erase(idx))
-            XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
+            RM_THROW(RmError::GP_NOT_AVAILABLE)
         // Return to original pool based on ABI classification.
         // APX extended regs (r16-r31) are always volatile.
         if (idx <= max_gp_reg_idx_ && base_preserved_gp().count(idx))
@@ -1487,19 +1583,19 @@ private:
 
     void reserve_reg_vec(int idx) {
         if (idx < 0 || idx > max_vec_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (live_vec_.count(idx))   XBYAK_THROW(ERR_RM_VEC_IN_USE)
-        if (reserved_vec.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
+        if (live_vec_.count(idx))   RM_THROW(RmError::VEC_IN_USE)
+        if (reserved_vec.count(idx)) RM_THROW(RmError::REG_ALREADY_TRACKED)
         if (!free_vec_regs.erase(idx) && !preserved_vec.erase(idx))
-            XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
+            RM_THROW(RmError::VEC_NOT_AVAILABLE)
         reserved_vec.insert(idx);
     }
 
     void unreserve_reg_vec(int idx) {
         if (idx < 0 || idx > max_vec_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         if (!reserved_vec.erase(idx))
-            XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
+            RM_THROW(RmError::VEC_NOT_AVAILABLE)
         if (base_preserved_vec().count(idx))
             preserved_vec.insert(idx);
         else
@@ -1508,38 +1604,38 @@ private:
 
     void reserve_reg_opmask(int idx) {
         if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (live_opmask_.count(idx))   XBYAK_THROW(ERR_RM_OPMASK_IN_USE)
-        if (reserved_opmask.count(idx)) XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
+        if (live_opmask_.count(idx))   RM_THROW(RmError::OPMASK_IN_USE)
+        if (reserved_opmask.count(idx)) RM_THROW(RmError::REG_ALREADY_TRACKED)
         if (!free_opmask_regs.erase(idx) && !preserved_opmask.erase(idx))
-            XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
+            RM_THROW(RmError::OPMASK_NOT_AVAILABLE)
         reserved_opmask.insert(idx);
     }
 
     void unreserve_reg_opmask(int idx) {
         if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         if (!reserved_opmask.erase(idx))
-            XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
+            RM_THROW(RmError::OPMASK_NOT_AVAILABLE)
         // All opmask registers are volatile; return to free pool.
         free_opmask_regs.insert(idx);
     }
 
     void reserve_reg_tile(int idx) {
         if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
-        if (live_tile_.count(idx))    XBYAK_THROW(ERR_RM_TILE_IN_USE)
-        if (reserved_tile.count(idx))  XBYAK_THROW(ERR_RM_REG_ALREADY_TRACKED)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
+        if (live_tile_.count(idx))    RM_THROW(RmError::TILE_IN_USE)
+        if (reserved_tile.count(idx))  RM_THROW(RmError::REG_ALREADY_TRACKED)
         if (!free_tile_regs.erase(idx))
-            XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
+            RM_THROW(RmError::TILE_NOT_AVAILABLE)
         reserved_tile.insert(idx);
     }
 
     void unreserve_reg_tile(int idx) {
         if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         if (!reserved_tile.erase(idx))
-            XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
+            RM_THROW(RmError::TILE_NOT_AVAILABLE)
         // All tile registers are volatile; return to free pool.
         free_tile_regs.insert(idx);
     }
@@ -1547,28 +1643,28 @@ private:
     // helper method - checks reg in use before scoping
     template <class RegT>
     static void validate_scoped_reg(RegPoolManager *rm, RegT reg) {
-        if (!rm->reg_in_use(reg))
-            XBYAK_THROW(ERR_RM_SCOPED_REG_NOT_IN_USE)
+        if (!rm->reg_live(reg))
+            RM_THROW(RmError::SCOPED_REG_NOT_IN_USE)
     }
 
     // helper method - checks if a register index for a given family is currently in use
-    bool reg_in_use_idx(int idx, RegFamily family) const {
+    bool reg_live_idx(int idx, RegFamily family) const {
         switch (family) {
             case RegFamily::GP:
                 if (idx < 0 || idx > max_gp_reg_idx_)
-                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
+                    RM_THROW_RET(RmError::REG_IDX_OUT_OF_RANGE, false)
                 return live_gp_.find(idx) != live_gp_.end();
             case RegFamily::Vec:
                 if (idx < 0 || idx > max_vec_reg_idx_)
-                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
+                    RM_THROW_RET(RmError::REG_IDX_OUT_OF_RANGE, false)
                 return live_vec_.find(idx) != live_vec_.end();
             case RegFamily::Opmask:
                 if (idx < 0 || idx > 7)
-                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
+                    RM_THROW_RET(RmError::REG_IDX_OUT_OF_RANGE, false)
                 return live_opmask_.find(idx) != live_opmask_.end();
             case RegFamily::Tile:
                 if (idx < 0 || idx > 7)
-                    XBYAK_THROW_RET(ERR_RM_REG_IDX_OUT_OF_RANGE, false)
+                    RM_THROW_RET(RmError::REG_IDX_OUT_OF_RANGE, false)
                 return live_tile_.find(idx) != live_tile_.end();
             default: XBYAK_THROW_RET(ERR_INTERNAL, false)
         }
@@ -1578,27 +1674,27 @@ private:
     int next_gp_idx() const {
         if (!free_gp_regs.empty()) return *free_gp_regs.begin();
         if (!preserved_gp.empty()) return *preserved_gp.begin();
-        XBYAK_THROW_RET(ERR_RM_NO_FREE_GP, 0)
+        RM_THROW_RET(RmError::NO_FREE_GP, 0)
     }
     int next_vec_idx() const {
         if (!free_vec_regs.empty()) return *free_vec_regs.begin();
         if (!preserved_vec.empty()) return *preserved_vec.begin();
-        XBYAK_THROW_RET(ERR_RM_NO_FREE_VEC, 0)
+        RM_THROW_RET(RmError::NO_FREE_VEC, 0)
     }
     int next_opmask_idx() const {
         if (!free_opmask_regs.empty()) return *free_opmask_regs.begin();
         if (!preserved_opmask.empty()) return *preserved_opmask.begin();
-        XBYAK_THROW_RET(ERR_RM_NO_FREE_OPMASK, 0)
+        RM_THROW_RET(RmError::NO_FREE_OPMASK, 0)
     }
     int next_tile_idx() const {
         if (!free_tile_regs.empty()) return *free_tile_regs.begin();
-        XBYAK_THROW_RET(ERR_RM_NO_FREE_TILE, 0)
+        RM_THROW_RET(RmError::NO_FREE_TILE, 0)
     }
 
     // tracking for in-use indices for a given register family
     void gp_reg(int idx) {
-        if (reg_in_use_idx(idx, RegFamily::GP))
-            XBYAK_THROW(ERR_RM_GP_IN_USE)
+        if (reg_live_idx(idx, RegFamily::GP))
+            RM_THROW(RmError::GP_IN_USE)
         auto it = free_gp_regs.find(idx);
         auto pres_it = preserved_gp.find(idx);
         if (it != free_gp_regs.end()) {
@@ -1609,12 +1705,12 @@ private:
             preserved_gp.erase(pres_it);
             allocated_preserved_gp_.push_back(idx);
         } else {
-            XBYAK_THROW(ERR_RM_GP_NOT_AVAILABLE)
+            RM_THROW(RmError::GP_NOT_AVAILABLE)
         }
     }
     void vec_reg(int idx) {
-        if (reg_in_use_idx(idx, RegFamily::Vec))
-            XBYAK_THROW(ERR_RM_VEC_IN_USE)
+        if (reg_live_idx(idx, RegFamily::Vec))
+            RM_THROW(RmError::VEC_IN_USE)
         auto it = free_vec_regs.find(idx);
         auto pres_it = preserved_vec.find(idx);
         if (it != free_vec_regs.end()) {
@@ -1625,12 +1721,12 @@ private:
             preserved_vec.erase(pres_it);
             allocated_preserved_vec_.push_back(idx);
         } else {
-            XBYAK_THROW(ERR_RM_VEC_NOT_AVAILABLE)
+            RM_THROW(RmError::VEC_NOT_AVAILABLE)
         }
     }
     void opmask_reg(int idx) {
-        if (reg_in_use_idx(idx, RegFamily::Opmask))
-            XBYAK_THROW(ERR_RM_OPMASK_IN_USE)
+        if (reg_live_idx(idx, RegFamily::Opmask))
+            RM_THROW(RmError::OPMASK_IN_USE)
         auto it = free_opmask_regs.find(idx);
         auto pres_it = preserved_opmask.find(idx);
         if (it != free_opmask_regs.end()) {
@@ -1640,28 +1736,28 @@ private:
             live_opmask_.insert(idx);
             preserved_opmask.erase(pres_it);
         } else {
-            XBYAK_THROW(ERR_RM_OPMASK_NOT_AVAILABLE)
+            RM_THROW(RmError::OPMASK_NOT_AVAILABLE)
         }
     }
     void tile_reg(int idx) {
-        if (reg_in_use_idx(idx, RegFamily::Tile))
-            XBYAK_THROW(ERR_RM_TILE_IN_USE)
+        if (reg_live_idx(idx, RegFamily::Tile))
+            RM_THROW(RmError::TILE_IN_USE)
         auto it = free_tile_regs.find(idx);
         if (it != free_tile_regs.end()) {
             live_tile_.insert(idx);
             free_tile_regs.erase(it);
         } else {
-            XBYAK_THROW(ERR_RM_TILE_NOT_AVAILABLE)
+            RM_THROW(RmError::TILE_NOT_AVAILABLE)
         }
     }
 
     // member function - moves given index from in-use set to free set for given family
     void release_gp(int idx) {
         if (idx < 0 || idx > max_gp_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         auto it = live_gp_.find(idx);
         if (it == live_gp_.end())
-            XBYAK_THROW(ERR_RM_GP_NOT_IN_USE)
+            RM_THROW(RmError::GP_NOT_IN_USE)
         live_gp_.erase(it);
         if (base_preserved_gp().count(idx))
             preserved_gp.insert(idx);
@@ -1670,10 +1766,10 @@ private:
     }
     void release_vec(int idx) {
         if (idx < 0 || idx > max_vec_reg_idx_)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         auto it = live_vec_.find(idx);
         if (it == live_vec_.end())
-            XBYAK_THROW(ERR_RM_VEC_NOT_IN_USE)
+            RM_THROW(RmError::VEC_NOT_IN_USE)
         live_vec_.erase(it);
         if (base_preserved_vec().count(idx))
             preserved_vec.insert(idx);
@@ -1682,19 +1778,19 @@ private:
     }
     void release_opmask(int idx) {
         if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         auto it = live_opmask_.find(idx);
         if (it == live_opmask_.end())
-            XBYAK_THROW(ERR_RM_OPMASK_NOT_IN_USE)
+            RM_THROW(RmError::OPMASK_NOT_IN_USE)
         live_opmask_.erase(it);
         free_opmask_regs.insert(idx);
     }
     void release_tile(int idx) {
         if (idx < 0 || idx > 7)
-            XBYAK_THROW(ERR_RM_REG_IDX_OUT_OF_RANGE)
+            RM_THROW(RmError::REG_IDX_OUT_OF_RANGE)
         auto it = live_tile_.find(idx);
         if (it == live_tile_.end())
-            XBYAK_THROW(ERR_RM_TILE_NOT_IN_USE)
+            RM_THROW(RmError::TILE_NOT_IN_USE)
         live_tile_.erase(it);
         free_tile_regs.insert(idx);
     }
