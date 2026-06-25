@@ -38,9 +38,9 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 20. [Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`](#20-saverestore-live-volatile-registers-savevolatiles--restorevolatiles)
 21. [Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc.](#21-pool-count-queries-free_gp_count-free_vec_count-etc)
 22. [Rename `in_use` to `live` in Getter Names](#22-rename-in_use-to-live-in-getter-names)
-23. [Unified Stack Layout: `StackLayout` / `CommittedLayout` (Replaces §7 and §8)](#23-unified-stack-layout-stacklayout--committedlayout-replaces-7-and-8)
+23. [Unified Stack Layout: `StackFrameBuilder` / `StackFrame` (Replaces §7 and §8)](#23-unified-stack-layout-stackframebuilder--stackframe-replaces-7-and-8)
 24. [Open Task: ABI-portable argument register mapping (Future Work)](#24-open-task-abi-portable-argument-register-mapping-future-work)
-25. [Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`](#25-stack-overflow-arguments-with_outgoing_args--committedlayoutemit_call)
+25. [Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`](#25-stack-overflow-arguments-with_outgoing_args--stackframeemit_call)
 26. [Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`](#26-named-alias-register-lifecycle-declare_alias--managedalias)
 ---
 
@@ -81,11 +81,11 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
 - [x] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc. *(REJECTED — see §21)*
 - [x] 22. Rename `in_use` to `live` in Getter Names
-- [x] 23. Unified Stack Layout: `StackLayout` / `CommittedLayout`
+- [x] 23. Unified Stack Layout: `StackFrameBuilder` / `StackFrame`
 - [ ] 24. Open Task: ABI-portable argument register mapping (Future Work)
-- [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
+- [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`
 - [x] 26. Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`
-- [ ] 27. Allow `make_stack_layout().build()` with no slots (empty layout)
+- [ ] 27. Allow `make_stack_frame().build()` with no slots (empty layout)
 
 ---
 
@@ -2730,7 +2730,7 @@ auto live = rm.get_live_volatile_gps();
 
 ---
 
-## 23. Unified Stack Layout: `StackLayout` / `CommittedLayout` (Replaces §7 and §8)
+## 23. Unified Stack Layout: `StackFrameBuilder` / `StackFrame` (Replaces §7 and §8)
 
 ### Motivation
 
@@ -2759,22 +2759,22 @@ arithmetic that the user is expected to perform manually. Real compilers never m
 them: they choose one `sub rsp, total` at function entry and use fixed offsets
 everywhere, or they use no local frame at all. This design should follow that model.
 
-The proposed `StackLayout` / `CommittedLayout` pair replaces both §7 and §8 with a
+The proposed `StackFrameBuilder` / `StackFrame` pair replaces both §7 and §8 with a
 two-phase design that eliminates the incompatibility by construction.
 
 ### Why This Is Better Than §7 (`spill()`/`restore()`)
 
 1. **No silent address drift.** `spill()` shifts every open `StackFrame`'s slot
-   addresses invisibly. `CommittedLayout` fixes all offsets at `build()` and never
+   addresses invisibly. `StackFrame` fixes all offsets at `build()` and never
    moves rsp again until `destroy()`. There is nothing to drift.
 
 2. **All register families supported.** `spill()` is GP-only (§7 review note §7a).
-   `CommittedLayout::park<T>()` accepts `Reg64`, `Ymm`, `Zmm`, and any other type
+   `StackFrame::park<T>()` accepts `Reg64`, `Ymm`, `Zmm`, and any other type
    with a `do_store` overload — the same set `StackFrame` already supports.
 
 3. **No LIFO ordering constraint.** `restore()` must be called in exact reverse
    spill order because `pop` targets the top of the physical hardware stack.
-   `CommittedLayout` uses `mov [rsp + fixed]` / `mov reg, [rsp + fixed]`, so slots
+   `StackFrame` uses `mov [rsp + fixed]` / `mov reg, [rsp + fixed]`, so slots
    can be parked and reloaded in any order at any time.
 
 4. **No interleaving hazard.** The §7 / §8 incompatibility is resolved by removing
@@ -2785,75 +2785,75 @@ two-phase design that eliminates the incompatibility by construction.
 
 1. **Fixed offsets require no mental arithmetic.** `StackFrame` exposes raw `ptrdiff_t`
    offsets. The caller must manually compute and maintain slot positions, ensure slots
-   do not overlap, and keep the total within `size`. `StackLayout` issues typed
+   do not overlap, and keep the total within `size`. `StackFrameBuilder` issues typed
    `ParkSlot` handles at declaration time that encapsulate their own fixed offset.
    Off-by-8 mistakes are impossible.
 
 2. **Volatile-save integration.** `StackFrame` has no knowledge of volatile registers.
    `save_gp_volatiles()` (§20) and `save_vec_volatiles()` still use push/sub rsp,
    which conflicts with an open `StackFrame` for the same reason `spill()` does.
-   `StackLayout` pre-declares volatile-save slots at build time so the emit methods
+   `StackFrameBuilder` pre-declares volatile-save slots at build time so the emit methods
    use fixed offsets rather than additional rsp movement.
 
-3. **Single rsp movement enforced by design.** Because `CommittedLayout` is the *only*
+3. **Single rsp movement enforced by design.** Because `StackFrame` is the *only*
    way to interact with the stack frame, `managed_push_count_` becomes stable after
    `emit_prologue()` and `build()`. `emit_call()` alignment is then trivially correct;
    the `extra_pushes` escape hatch (§18) can be removed entirely.
 
 4. **Aligned total computed automatically.** `StackFrame` requires the caller to pass
-   an already-aligned size. `StackLayout` accumulates declared slot requirements and
+   an already-aligned size. `StackFrameBuilder` accumulates declared slot requirements and
    rounds the total up to the nearest 16 bytes at `build()` time, preventing
    misalignment silently.
 
 ### Proposed API
 
-#### Phase 1 — Declaration (`StackLayout` builder, no code emitted)
+#### Phase 1 — Declaration (`StackFrameBuilder` builder, no code emitted)
 
 ```cpp
-class StackLayout {
+class StackFrameBuilder {
 public:
     // Reserve n GP-sized (8-byte) named park slots.
     // Returns *this for chaining.
-    StackLayout &gp_parks(int n);
+    StackFrameBuilder &gp_parks(int n);
 
     // Reserve n vector-sized park slots.
     // Slot size is 64 bytes (ZMM) when AVX-512 is present, 32 bytes (YMM) otherwise.
     // Returns *this for chaining.
-    StackLayout &vec_parks(int n);
+    StackFrameBuilder &vec_parks(int n);
 
     // Reserve a raw scratch area of 'bytes' bytes.
     // Must be a positive multiple of 8.
     // Returns *this for chaining.
-    StackLayout &scratch(ptrdiff_t bytes);
+    StackFrameBuilder &scratch(ptrdiff_t bytes);
 
     // Reserve fixed-offset stack slots for every ABI-volatile GP and vector
-    // register.  save_volatiles() on the CommittedLayout will store only those
+    // register.  save_volatiles() on the StackFrame will store only those
     // that are live at the time of the call; restore_volatiles() reloads exactly
     // that set.  The slot map is independent of which registers are allocated at
     // build() time, so registration order does not matter.
     // Returns *this for chaining.
-    StackLayout &with_volatile_save();
+    StackFrameBuilder &with_volatile_save();
 
-    // Emit sub rsp, <aligned_total> and return a CommittedLayout owning the frame.
-    // After this call rsp will not move until CommittedLayout::destroy() or its
+    // Emit sub rsp, <aligned_total> and return a StackFrame owning the frame.
+    // After this call rsp will not move until StackFrame::destroy() or its
     // destructor. Throws if no CodeGenerator has been provided.
-    CommittedLayout build();
+    StackFrame build();
 };
 
 // Factory on RegPoolManager:
-StackLayout make_stack_layout();
+StackFrameBuilder make_stack_frame();
 ```
 
-#### Phase 2 — Committed layout (`CommittedLayout`, owns the stack space)
+#### Phase 2 — Committed layout (`StackFrame`, owns the stack space)
 
 ```cpp
-class CommittedLayout {
+class StackFrame {
 public:
     // Move-only; destructor emits add rsp, total if destroy() was not called.
-    CommittedLayout(const CommittedLayout &) = delete;
-    CommittedLayout &operator=(const CommittedLayout &) = delete;
-    CommittedLayout(CommittedLayout &&) noexcept;
-    ~CommittedLayout() noexcept;
+    StackFrame(const StackFrame &) = delete;
+    StackFrame &operator=(const StackFrame &) = delete;
+    StackFrame(StackFrame &&) noexcept;
+    ~StackFrame() noexcept;
 
     // Emits add rsp, total immediately and disarms the destructor.
     void destroy();
@@ -2912,12 +2912,12 @@ void restore(const Reg64 &reg);             // §7
 void restore(const std::vector<Reg64> &);  // §7
 bool spill_stack_empty() const;             // §19 — only meaningful for push spills
 void assert_spill_stack_empty() const;      // §19
-StackFrame make_stack_frame(ptrdiff_t);     // §8 — replaced by make_stack_layout()
-void save_gp_volatiles();                   // §20 — absorbed into CommittedLayout
+StackFrame make_stack_frame(ptrdiff_t);     // §8 — replaced by make_stack_frame()
+void save_gp_volatiles();                   // §20 — absorbed into StackFrame
 void restore_gp_volatiles();                // §20
 void save_vec_volatiles();                  // §20
 void restore_vec_volatiles();               // §20
-void save_volatiles();                      // §20 — absorbed into CommittedLayout
+void save_volatiles();                      // §20 — absorbed into StackFrame
 void restore_volatiles();                   // §20
 ```
 
@@ -2931,13 +2931,13 @@ void restore_volatiles();                   // §20
 //           saved_volatile_vec_bytes_, saved_volatiles_armed_, allocated_stack_space_
 
 // managed_push_count_ is now only modified by emit_prologue() and
-// CommittedLayout::build() / destroy(). It is never modified mid-kernel.
+// StackFrame::build() / destroy(). It is never modified mid-kernel.
 ```
 
-The `StackLayout` builder is a lightweight value type that accumulates sizing data
+The `StackFrameBuilder` builder is a lightweight value type that accumulates sizing data
 (counts and byte totals) in local variables before `build()` is called. No new
 persistent data members are needed on `RegPoolManager` beyond tracking whether a
-`CommittedLayout` is currently active (for debug assertions).
+`StackFrame` is currently active (for debug assertions).
 
 ### Usage Example — Typical oneDNN Kernel Pattern
 
@@ -2963,7 +2963,7 @@ public:
         emit_prologue();  // push rbx etc. if any preserved regs were promoted
 
         // Step 2: declare all stack needs upfront — nothing is emitted yet
-        auto cl = make_stack_layout()
+        auto cl = make_stack_frame()
             .gp_parks(3)       // 3 x 8-byte slots for the pointer/length arguments
             .vec_parks(1)      // 1 x 64-byte slot for zmm_bias (AVX-512 kernel)
             .with_volatile_save()  // snapshot live volatiles for pre-call save
@@ -3028,14 +3028,14 @@ cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
   `emit_prologue()` and `emit_epilogue()`, the `extra_pushes` parameter becomes
   unnecessary and can be removed.
 - **`assert_clean_stack()`** can be simplified: it only needs to check that no
-  `CommittedLayout` is currently open, rather than also checking `spill_stack_gp_`.
+  `StackFrame` is currently open, rather than also checking `spill_stack_gp_`.
 - **No impact on prologue/epilogue:** `emit_prologue()` / `emit_epilogue()` operate
   on callee-saved push/pop sequences which are fully outside and orthogonal to any
-  `CommittedLayout`. A kernel that only uses callee-saved GP registers with no stack
-  parking needs neither `StackLayout` nor any of the removed APIs.
+  `StackFrame`. A kernel that only uses callee-saved GP registers with no stack
+  parking needs neither `StackFrameBuilder` nor any of the removed APIs.
 - **Migration path:** The `StackFrame`, `spill()`, and `save_volatiles()` family can
   be kept as deprecated thin wrappers during a transition period, each calling the
-  new `StackLayout` / `CommittedLayout` primitives internally, before being removed
+  new `StackFrameBuilder` / `StackFrame` primitives internally, before being removed
   in a subsequent release.
 
 ---
@@ -3046,7 +3046,7 @@ cl.restore_volatiles();     // emits: mov reg, [rsp+slot_N] in reverse order
 so `alloc<Reg8>()`, `free(Reg8(...))`, and `mark_unavailable<Reg8>(idx)` all compile
 and function correctly for pool tracking purposes.
 
-However, `CommittedLayout::park()` and `reload()` dispatch via `do_store`/`do_load`,
+However, `StackFrame::park()` and `reload()` dispatch via `do_store`/`do_load`,
 which have overloads for `Reg64`, `Reg32`, and `Reg16` but **not** `Reg8`.  Calling
 `cl.park(Reg8(...), slot)` therefore fails to compile.
 
@@ -3186,7 +3186,7 @@ auto arg1 = alloc<Reg64>(gp_arg_reg_index(1));   // rsi / rdx
 auto fp0  = alloc<Xmm>(fp_arg_reg_index(0));     // xmm0 on both ABIs
 
 emit_prologue();
-auto cl = make_stack_layout().gp_parks(2).build();
+auto cl = make_stack_frame().gp_parks(2).build();
 cl.park(arg0, 0);
 cl.park(arg1, 1);
 // ... kernel body ...
@@ -3224,7 +3224,7 @@ constants.  No new member variables or constructor changes are required.
 
 ---
 
-## 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
+## 25. Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`
 
 ### Motivation
 
@@ -3259,12 +3259,12 @@ The fundamental mismatch is:
 | Method | When rsp moves | Stack-arg writes |
 |--------|---------------|-----------------|
 | `emit_call()` | At call, transiently | Must be *after* the sub |
-| `CommittedLayout` | Once at `build()`, stable | Can be written at *any time* before the call |
+| `StackFrame` | Once at `build()`, stable | Can be written at *any time* before the call |
 
 §23's commitment — that rsp does not move between `build()` and `destroy()` —
 provides exactly the stability needed for fixed-offset pre-call writes.  The
 missing piece is a way to (a) declare the overflow-arg slots inside the
-`StackLayout` builder so they are placed at the correct ABI position, and (b)
+`StackFrameBuilder` builder so they are placed at the correct ABI position, and (b)
 make `build()` absorb the required alignment adjustment into the frame total so
 the call itself needs no further rsp movement.
 
@@ -3272,7 +3272,7 @@ the call itself needs no further rsp movement.
 
 Two additions are required:
 
-**1. `StackLayout::with_outgoing_args(n)`** — declares `n` stack-overflow argument
+**1. `StackFrameBuilder::with_outgoing_args(n)`** — declares `n` stack-overflow argument
 slots.  The builder records this count; `build()` places the slots at the
 ABI-correct base:
 
@@ -3301,9 +3301,9 @@ P odd  → total ≡  0 (mod 16)   ← standard nearest-16 rounding (same as def
 where `P = managed_push_count_` at the time `build()` is called (i.e. after
 `emit_prologue()`).
 
-**3. `CommittedLayout::emit_call()` — unified call method.**  Rather than
+**3. `StackFrame::emit_call()` — unified call method.**  Rather than
 introducing a separate `emit_layout_call()` method that callers must remember to
-use, `CommittedLayout` gains its own `emit_call()` that automatically selects the
+use, `StackFrame` gains its own `emit_call()` that automatically selects the
 correct behaviour:
 
 - `with_outgoing_args(n)` was declared → bare `mov rax, func; call rax`.  rsp is
@@ -3312,12 +3312,12 @@ correct behaviour:
   standard `sub rsp, adj; call; add rsp, adj` sequence.
 
 From the caller's perspective there is exactly **one call method** inside a
-`CommittedLayout`.  The same `cl.emit_call(&func)` works for both register-only
+`StackFrame`.  The same `cl.emit_call(&func)` works for both register-only
 calls and overflow-arg calls in the same layout.
 
 ### Proposed API
 
-#### On `StackLayout` (builder additions)
+#### On `StackFrameBuilder` (builder additions)
 
 ```cpp
 // Reserve n outgoing stack-overflow argument slots.
@@ -3330,10 +3330,10 @@ calls and overflow-arg calls in the same layout.
 // build() adjusts the frame total so that rsp is 16-aligned at the subsequent
 // emit_call() instruction, absorbing alignment compensation into the sub rsp.
 // Returns *this for chaining.
-StackLayout &with_outgoing_args(int n);
+StackFrameBuilder &with_outgoing_args(int n);
 ```
 
-#### On `CommittedLayout` (new methods)
+#### On `StackFrame` (new methods)
 
 ```cpp
 // Returns the number of outgoing stack-overflow argument slots declared
@@ -3377,7 +3377,7 @@ void emit_call(FuncT *func_ptr);
 ### Internal State Changes
 
 ```cpp
-// Added to CommittedLayout:
+// Added to StackFrame:
 ptrdiff_t outgoing_arg_base_;   // rsp-relative base of the first overflow-arg slot
 int       n_outgoing_args_;     // 0 if with_outgoing_args() was not declared
 ```
@@ -3407,9 +3407,9 @@ struct MyKernel : CodeGenerator, RegPoolManager {
         // Declare overflow slots.  build() reserves Win64 shadow space
         // automatically and aligns the frame total for a bare call.
 #ifdef _WIN32
-        auto cl = make_stack_layout().with_outgoing_args(4).build(); // e,f,g,h
+        auto cl = make_stack_frame().with_outgoing_args(4).build(); // e,f,g,h
 #else
-        auto cl = make_stack_layout().with_outgoing_args(2).build(); // g,h
+        auto cl = make_stack_frame().with_outgoing_args(2).build(); // g,h
 #endif
 
         // Write stack-overflow arguments to their pre-reserved fixed slots.
@@ -3451,9 +3451,9 @@ auto r_pres = alloc<Reg64>(3);  // rbx — survives every call
 emit_prologue();                 // push rbx → P = 1 (odd)
 
 #ifdef _WIN32
-auto cl = make_stack_layout().with_outgoing_args(4).build();
+auto cl = make_stack_frame().with_outgoing_args(4).build();
 #else
-auto cl = make_stack_layout().with_outgoing_args(2).build();
+auto cl = make_stack_frame().with_outgoing_args(2).build();
 #endif
 
 // Call 1: register-only.  Overflow slots untouched.
@@ -3478,7 +3478,7 @@ ret();
 
 - **`emit_call()` vs `RegPoolManager::emit_call()`** — inside a layout the user
   always calls `cl.emit_call()`.  `RegPoolManager::emit_call()` should generally
-  not be used inside an active `CommittedLayout`; in debug builds an assertion
+  not be used inside an active `StackFrame`; in debug builds an assertion
   could guard against this, though the current implementation does not require it.
 - **Overflow slot count must be declared upfront** — the count is fixed at
   `build()` time and reflects the worst case across all calls made inside the
@@ -3489,7 +3489,7 @@ ret();
   calls within the same layout also have shadow space available.
 - **`emit_layout_call()` (interim name)** — during development a separate method
   `emit_layout_call()` was briefly used for the bare-call path before being merged
-  into `CommittedLayout::emit_call()`.  The unified single-method design is the
+  into `StackFrame::emit_call()`.  The unified single-method design is the
   intended final form.
 
 ---
@@ -3504,7 +3504,7 @@ hardware registers at the same time.  The standard pattern is to spill a value
 to the stack and reload it when needed.  With only `alloc<Reg64>()` / `free()`
 / `park()` / `reload()` this requires the programmer to:
 
-1. Manually allocate a stack slot via `CommittedLayout`.
+1. Manually allocate a stack slot via `StackFrame`.
 2. Track which slot holds which named value.
 3. Manually call `park(reg, slot)` and `reload<Reg64>(slot)` at each use site.
 4. Remember which register currently holds a given value.
@@ -3583,7 +3583,7 @@ bool is_available_gp(int idx) const;
 
 `pending_aliases_` is cleared by `reset()` along with all other manager state.
 
-**`CommittedLayout` additions:**
+**`StackFrame` additions:**
 
 ```cpp
 // Emit: mov [rsp + alias_slot_offset(alias_id)], reg
@@ -3596,7 +3596,7 @@ void alias_load(int alias_id, Xbyak::Reg64 &reg);
 **`ManagedAlias` internal fields:**
 
 ```cpp
-int            alias_id_;     // index into CommittedLayout alias offset table
+int            alias_id_;     // index into StackFrame alias offset table
 int            desired_idx_;  // -1 for anonymous
 bool           needs_slot_;
 bool           is_active_;
@@ -3640,8 +3640,8 @@ ManagedAlias declare_alias();
 ```
 
 All overloads append an `AliasPendingDecl` to `pending_aliases_` and return a
-`ManagedAlias`.  Stack slots are assigned when `make_stack_layout().build()` is
-called, exactly as with other `CommittedLayout` resources.
+`ManagedAlias`.  Stack slots are assigned when `make_stack_frame().build()` is
+called, exactly as with other `StackFrame` resources.
 
 Exception: the two-argument overload and the three-argument overload with
 `use_alt=true` call `alloc<Reg64>(desired_idx)` immediately when
@@ -3675,12 +3675,12 @@ public:
     // DORMANT -> ACTIVE: allocate register and load value from slot.
     // Use to retrieve a value that was previously saved.
     // No-op when has_stack_slot() == false.
-    void restore(CommittedLayout &cl);
+    void restore(StackFrame &cl);
 
     // ACTIVE -> DORMANT: emit store to slot and free register.
     // Use when the value in the register was modified and must be persisted.
     // No-op when has_stack_slot() == false.
-    void save(CommittedLayout &cl);
+    void save(StackFrame &cl);
 
     // ACTIVE -> DORMANT: free register without emitting a store.
     // Use when the value is unchanged since the last save(); the slot is
@@ -3743,7 +3743,7 @@ Three outcomes for the named path:
 #### `restore` pseudocode
 
 ```cpp
-void ManagedAlias::restore(CommittedLayout &cl) {
+void ManagedAlias::restore(StackFrame &cl) {
     if (!needs_slot_) return;
     assert(!is_active_);
     if (desired_idx_ >= 0)
@@ -3758,7 +3758,7 @@ void ManagedAlias::restore(CommittedLayout &cl) {
 #### `save` pseudocode
 
 ```cpp
-void ManagedAlias::save(CommittedLayout &cl) {
+void ManagedAlias::save(StackFrame &cl) {
     if (!needs_slot_) return;
     assert(is_active_);
     cl.alias_store(alias_id_, reg_);  // emit: mov [rsp+offset], reg_
@@ -3797,9 +3797,9 @@ For no-slot aliases `is_active_` is always true after `prime()`, so the
 For slotted aliases in DORMANT state the `if (is_active_)` guard short-circuits
 since the register is already back in the free pool.
 
-#### `build_layout` / `CommittedLayout` interaction
+#### `build_layout` / `StackFrame` interaction
 
-`pending_aliases_` is iterated during `make_stack_layout().build()`.  Each
+`pending_aliases_` is iterated during `make_stack_frame().build()`.  Each
 entry with `needs_slot == true` gets an 8-byte slot in the frame, placed before
 anonymous `gp_park` slots:
 
@@ -3832,7 +3832,7 @@ class MultiBufferKernel : public CodeGenerator, public RegPoolManager {
     ManagedAlias bias_ptr_  = declare_alias<Reg64>();
 
     void generate() {
-        auto layout = make_stack_layout().build();
+        auto layout = make_stack_frame().build();
         emit_prologue();
 
         auto param = alloc<Reg64>();
@@ -3897,7 +3897,7 @@ ManagedAlias out_ptr = declare_alias(rax, r22);
 //                 except free().
 //   non-APX path: rax used with a stack slot; full lifecycle applies.
 
-auto layout = make_stack_layout().build();
+auto layout = make_stack_frame().build();
 
 // Initialization -- identical code on both paths.
 out_ptr.prime();
@@ -3925,7 +3925,7 @@ code is uniform across both paths.
 bool const use_rbp = !needs_frame_pointer();
 ManagedAlias loop_var = declare_alias(rcx, rbp, use_rbp);
 
-auto layout = make_stack_layout().build();
+auto layout = make_stack_frame().build();
 loop_var.prime();
 xor_(loop_var.reg(), loop_var.reg());    // initialize counter to 0
 
@@ -3951,7 +3951,7 @@ emit on every read-only use.
 ```cpp
 ManagedAlias cfg = declare_alias<Reg64>();
 
-auto layout = make_stack_layout().build();
+auto layout = make_stack_frame().build();
 cfg.prime();
 mov(cfg.reg(), ptr[rdi + 8]);    // load config pointer from params
 cfg.save(layout);                // store to slot, free register
@@ -3990,8 +3990,8 @@ cfg.free();
   still free; if another allocation has taken it, `prime()` throws.  This is
   not the intended usage pattern; `free()` is an end-of-lifetime call.
 
-- **`CommittedLayout` dependency** -- `save()` and `restore()` require the
-  `CommittedLayout` built from the same `make_stack_layout()` invocation that
+- **`StackFrame` dependency** -- `save()` and `restore()` require the
+  `StackFrame` built from the same `make_stack_frame()` invocation that
   the alias was registered under.
 
 - **Anonymous aliases and physical register identity** -- for anonymous aliases,
@@ -4044,7 +4044,7 @@ manager to assign r16, r17, r18 automatically), this overload would eliminate
 the need to manually assign specific indices.  Add it then, together with an
 `alloc_extended<RegT>()` primitive on `RegPoolManager`.
 
-## 27. Allow `make_stack_layout().build()` with no slots (empty layout)
+## 27. Allow `make_stack_frame().build()` with no slots (empty layout)
 
 **Status:** Open
 
@@ -4053,7 +4053,7 @@ the need to manually assign specific indices.  Add it then, together with an
 `build()` currently throws `LAYOUT_SLOT_OOB` when the computed frame size is
 zero (i.e. no GP park, vec park, scratch, outgoing-args, or alias slots were
 declared).  This means callers must always add at least one slot just to get a
-valid `CommittedLayout` -- even when the only purpose of the layout is, for
+valid `StackFrame` -- even when the only purpose of the layout is, for
 example, to use `emit_call()` with correct alignment, or to hold a
 `ManagedAlias` slot that was the sole reason for calling `build()`.
 
@@ -4065,7 +4065,7 @@ the non-zero check, not because the test logic requires a park slot.
 **Proposed change:**
 
 Remove the `if (total == 0)` guard that throws, and instead allow an empty
-layout with `total = 0` and a no-op `CommittedLayout`.  `destroy()` on an
+layout with `total = 0` and a no-op `StackFrame`.  `destroy()` on an
 empty layout should emit no `add rsp` instruction (nothing was subtracted).
 
 **Impact on existing tests:**

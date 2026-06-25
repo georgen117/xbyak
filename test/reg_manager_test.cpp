@@ -36,7 +36,7 @@
  *   vecVolatilePreserved    – get_live_volatile/preserved_vecs() correctness
  *   comprehensiveSaveRestore – multi-family volatile/preserved queries agree with totals
  *   (mark_unavailable/allFree/setCodeGenerator/prologue/emitCall groups)
- *   stackLayout*            – StackLayout / CommittedLayout two-phase stack management
+ *   stackLayout*            – StackFrameBuilder / StackFrame two-phase stack management
  *   managedAliasPatterns    – declare_alias overloads, has_stack_slot(), is_active()
  *   managedAliasPrime       – prime() allocates named/anonymous register; conflict throws
  *   managedAliasNoSlotActive – no-slot alias active immediately; prime() is a no-op
@@ -2272,25 +2272,25 @@ CYBOZU_TEST_AUTO(resetReEmit)
 
 
 // =============================================================================
-// Test – StackLayout: make_stack_layout() throws without a CodeGenerator
+// Test – StackFrameBuilder: make_stack_frame() throws without a CodeGenerator
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutNoCg)
 {
     RegPoolManager rm(g_cpu);  // no CG
-    CYBOZU_TEST_EXCEPTION(rm.make_stack_layout().build(), Xbyak::RegManagerError);
+    CYBOZU_TEST_EXCEPTION(rm.make_stack_frame().build(), Xbyak::RegManagerError);
 }
 
 // =============================================================================
-// Test – StackLayout: negative / misaligned builder arguments are rejected
+// Test – StackFrameBuilder: negative / misaligned builder arguments are rejected
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutNegativeArgs)
 {
     struct Kernel : CodeGenerator, RegPoolManager {
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
-        void build_negative_gp()      { make_stack_layout().gp_parks(-1).build(); }
-        void build_negative_vec()     { make_stack_layout().vec_parks(-1).build(); }
-        void build_negative_scratch() { make_stack_layout().scratch(-8).build(); }
-        void build_empty()            { make_stack_layout().build(); }
+        void build_negative_gp()      { make_stack_frame().gp_parks(-1).build(); }
+        void build_negative_vec()     { make_stack_frame().vec_parks(-1).build(); }
+        void build_negative_scratch() { make_stack_frame().scratch(-8).build(); }
+        void build_empty()            { make_stack_frame().build(); }
     };
 
     Kernel k;
@@ -2301,7 +2301,7 @@ CYBOZU_TEST_AUTO(stackLayoutNegativeArgs)
 }
 
 // =============================================================================
-// Test – StackLayout: gp_parks: park/reload round-trip via JIT execution
+// Test – StackFrameBuilder: gp_parks: park/reload round-trip via JIT execution
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutGpParkReload)
 {
@@ -2315,21 +2315,21 @@ CYBOZU_TEST_AUTO(stackLayoutGpParkReload)
 
             emit_prologue();
 
-            auto cl = make_stack_layout()
+            auto sf = make_stack_frame()
                 .gp_parks(2)
                 .build();
 
             // Explicitly zero reg_b so the round-trip value is 0 on all
             // platforms (RDI is callee-saved on Windows and may not be 0).
             xor_(reg_b, reg_b);
-            cl.park(reg_b, 0);
+            sf.park(reg_b, 0);
 
             // Now reload it into a fresh register and return it
-            auto r = cl.reload<Reg64>(0);
+            auto r = sf.reload<Reg64>(0);
             mov(rax, r);
             free(r);
 
-            cl.destroy();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2344,7 +2344,7 @@ CYBOZU_TEST_AUTO(stackLayoutGpParkReload)
 }
 
 // =============================================================================
-// Test – StackLayout: scratch_addr returns a valid address; write/read via JIT
+// Test – StackFrameBuilder: scratch_addr returns a valid address; write/read via JIT
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutScratch)
 {
@@ -2353,7 +2353,7 @@ CYBOZU_TEST_AUTO(stackLayoutScratch)
         void build() {
             emit_prologue();
 
-            auto cl = make_stack_layout()
+            auto sf = make_stack_frame()
                 .scratch(16)
                 .build();
 
@@ -2361,11 +2361,11 @@ CYBOZU_TEST_AUTO(stackLayoutScratch)
 
             // Store 0xDEAD into scratch slot 0 and read it back
             mov(tmp, 0xDEADUL);
-            mov(cl.scratch_addr(0), tmp);    // [rsp + scratch_base + 0] = 0xDEAD
-            mov(rax, cl.scratch_addr(0));    // rax = [rsp + scratch_base + 0]
+            mov(sf.scratch_addr(0), tmp);    // [rsp + scratch_base + 0] = 0xDEAD
+            mov(rax, sf.scratch_addr(0));    // rax = [rsp + scratch_base + 0]
 
             free(tmp);
-            cl.destroy();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2377,7 +2377,7 @@ CYBOZU_TEST_AUTO(stackLayoutScratch)
 }
 
 // =============================================================================
-// Test – StackLayout: scratch_addr offset out of bounds throws
+// Test – StackFrameBuilder: scratch_addr offset out of bounds throws
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutScratchOob)
 {
@@ -2385,10 +2385,10 @@ CYBOZU_TEST_AUTO(stackLayoutScratchOob)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout().scratch(8).build();
-            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(8), Xbyak::RegManagerError);   // == size → OOB
-            CYBOZU_TEST_EXCEPTION(cl.scratch_addr(-1), Xbyak::RegManagerError);
-            cl.destroy();
+            auto sf = make_stack_frame().scratch(8).build();
+            CYBOZU_TEST_EXCEPTION(sf.scratch_addr(8), Xbyak::RegManagerError);   // == size → OOB
+            CYBOZU_TEST_EXCEPTION(sf.scratch_addr(-1), Xbyak::RegManagerError);
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2398,7 +2398,7 @@ CYBOZU_TEST_AUTO(stackLayoutScratchOob)
 }
 
 // =============================================================================
-// Test – StackLayout: slot index out of bounds throws
+// Test – StackFrameBuilder: slot index out of bounds throws
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutSlotOob)
 {
@@ -2406,12 +2406,12 @@ CYBOZU_TEST_AUTO(stackLayoutSlotOob)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout().gp_parks(1).build();
+            auto sf = make_stack_frame().gp_parks(1).build();
             auto r = alloc<Reg64>();
-            CYBOZU_TEST_EXCEPTION(cl.park(static_cast<const Reg64&>(r), 1), Xbyak::RegManagerError);  // OOB
-            CYBOZU_TEST_EXCEPTION(cl.reload<Reg64>(1), Xbyak::RegManagerError);
+            CYBOZU_TEST_EXCEPTION(sf.park(static_cast<const Reg64&>(r), 1), Xbyak::RegManagerError);  // OOB
+            CYBOZU_TEST_EXCEPTION(sf.reload<Reg64>(1), Xbyak::RegManagerError);
             free(r);
-            cl.destroy();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2421,7 +2421,7 @@ CYBOZU_TEST_AUTO(stackLayoutSlotOob)
 }
 
 // =============================================================================
-// Test – StackLayout: save_volatiles throws if not declared
+// Test – StackFrameBuilder: save_volatiles throws if not declared
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutSaveNotDeclared)
 {
@@ -2429,10 +2429,10 @@ CYBOZU_TEST_AUTO(stackLayoutSaveNotDeclared)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout().scratch(8).build();  // no with_volatile_save()
-            CYBOZU_TEST_EXCEPTION(cl.save_volatiles(), Xbyak::RegManagerError);
-            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::RegManagerError);
-            cl.destroy();
+            auto sf = make_stack_frame().scratch(8).build();  // no with_volatile_save()
+            CYBOZU_TEST_EXCEPTION(sf.save_volatiles(), Xbyak::RegManagerError);
+            CYBOZU_TEST_EXCEPTION(sf.restore_volatiles(), Xbyak::RegManagerError);
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2442,7 +2442,7 @@ CYBOZU_TEST_AUTO(stackLayoutSaveNotDeclared)
 }
 
 // =============================================================================
-// Test – StackLayout: restore_volatiles without preceding save throws
+// Test – StackFrameBuilder: restore_volatiles without preceding save throws
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutRestoreWithoutSave)
 {
@@ -2450,11 +2450,11 @@ CYBOZU_TEST_AUTO(stackLayoutRestoreWithoutSave)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout()
+            auto sf = make_stack_frame()
                 .with_volatile_save()
                 .build();
-            CYBOZU_TEST_EXCEPTION(cl.restore_volatiles(), Xbyak::RegManagerError);
-            cl.destroy();
+            CYBOZU_TEST_EXCEPTION(sf.restore_volatiles(), Xbyak::RegManagerError);
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2464,7 +2464,7 @@ CYBOZU_TEST_AUTO(stackLayoutRestoreWithoutSave)
 }
 
 // =============================================================================
-// Test – StackLayout: with_volatile_save() works for registers allocated after build()
+// Test – StackFrameBuilder: with_volatile_save() works for registers allocated after build()
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutVolatileSaveOrderIndependent)
 {
@@ -2476,7 +2476,7 @@ CYBOZU_TEST_AUTO(stackLayoutVolatileSaveOrderIndependent)
         void build() {
             emit_prologue();
             // Declare volatile save BEFORE any volatile register is allocated.
-            auto cl = make_stack_layout()
+            auto sf = make_stack_frame()
                 .with_volatile_save()
                 .build();   // no volatile regs live yet — slots pre-reserved for all
 
@@ -2485,12 +2485,12 @@ CYBOZU_TEST_AUTO(stackLayoutVolatileSaveOrderIndependent)
             auto r = alloc<Reg64>(7);   // rdi — volatile on SysV and Windows
 
             // save_volatiles() must save rdi even though it was not live at build().
-            CYBOZU_TEST_NO_EXCEPTION(cl.save_volatiles());
+            CYBOZU_TEST_NO_EXCEPTION(sf.save_volatiles());
             CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers, 0));
-            CYBOZU_TEST_NO_EXCEPTION(cl.restore_volatiles());
+            CYBOZU_TEST_NO_EXCEPTION(sf.restore_volatiles());
 
             free(r);
-            cl.destroy();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2500,7 +2500,7 @@ CYBOZU_TEST_AUTO(stackLayoutVolatileSaveOrderIndependent)
 }
 
 // =============================================================================
-// Test – StackLayout: destroy() is idempotent (double-destroy is a no-op)
+// Test – StackFrameBuilder: destroy() is idempotent (double-destroy is a no-op)
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutDoubleDestroy)
 {
@@ -2508,9 +2508,9 @@ CYBOZU_TEST_AUTO(stackLayoutDoubleDestroy)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout().scratch(8).build();
-            cl.destroy();                   // first destroy — emits add rsp
-            CYBOZU_TEST_NO_EXCEPTION(cl.destroy());  // second — no-op, no throw
+            auto sf = make_stack_frame().scratch(8).build();
+            sf.destroy();                   // first destroy — emits add rsp
+            CYBOZU_TEST_NO_EXCEPTION(sf.destroy());  // second — no-op, no throw
             emit_epilogue();
             ret();
         }
@@ -2520,7 +2520,7 @@ CYBOZU_TEST_AUTO(stackLayoutDoubleDestroy)
 }
 
 // =============================================================================
-// Test – StackLayout: managed_push_count_ updated so emit_call stays aligned
+// Test – StackFrameBuilder: managed_push_count_ updated so emit_call stays aligned
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutEmitCallAlignment)
 {
@@ -2532,14 +2532,14 @@ CYBOZU_TEST_AUTO(stackLayoutEmitCallAlignment)
             auto rbx_r = alloc<Reg64>(3);   // forces one callee-save push
             emit_prologue();                 // push rbx  → managed_push_count_ = 1
 
-            auto cl = make_stack_layout().scratch(8).build();
+            auto sf = make_stack_frame().scratch(8).build();
             // scratch(8) → total = 16 → managed_push_count_ += 2  (total = 3 now, odd)
             // emit_call must add 8 bytes padding to align to 16.
 
             // Just verify it emits without throwing.
             CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers, 0));
 
-            cl.destroy();
+            sf.destroy();
             free(rbx_r);
             emit_epilogue();
             ret();
@@ -2550,7 +2550,7 @@ CYBOZU_TEST_AUTO(stackLayoutEmitCallAlignment)
 }
 
 // =============================================================================
-// Test – StackLayout: total always a multiple of 16
+// Test – StackFrameBuilder: total always a multiple of 16
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutTotalAlignment)
 {
@@ -2559,12 +2559,12 @@ CYBOZU_TEST_AUTO(stackLayoutTotalAlignment)
         Probe() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build(int gp_n, int scratch_n) {
             emit_prologue();
-            auto cl = make_stack_layout()
+            auto sf = make_stack_frame()
                 .gp_parks(gp_n)
                 .scratch(scratch_n)
                 .build();
-            recorded_total = cl.total_size();
-            cl.destroy();
+            recorded_total = sf.total_size();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2588,7 +2588,7 @@ CYBOZU_TEST_AUTO(stackLayoutTotalAlignment)
 }
 
 // =============================================================================
-// Test – StackLayout: assert_clean_stack() passes after destroy()
+// Test – StackFrameBuilder: assert_clean_stack() passes after destroy()
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutCleanStack)
 {
@@ -2596,9 +2596,9 @@ CYBOZU_TEST_AUTO(stackLayoutCleanStack)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout().scratch(16).build();
+            auto sf = make_stack_frame().scratch(16).build();
             CYBOZU_TEST_ASSERT(!clean_stack());   // frame is open
-            cl.destroy();
+            sf.destroy();
             CYBOZU_TEST_ASSERT(clean_stack());    // frame closed
             emit_epilogue();
             ret();
@@ -2609,7 +2609,7 @@ CYBOZU_TEST_AUTO(stackLayoutCleanStack)
 }
 
 // =============================================================================
-// Test – StackLayout: reset() clears layout_active_ flag
+// Test – StackFrameBuilder: reset() clears layout_active_ flag
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutReset)
 {
@@ -2617,8 +2617,8 @@ CYBOZU_TEST_AUTO(stackLayoutReset)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             emit_prologue();
-            auto cl = make_stack_layout().scratch(8).build();
-            cl.destroy();
+            auto sf = make_stack_frame().scratch(8).build();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2632,7 +2632,7 @@ CYBOZU_TEST_AUTO(stackLayoutReset)
 }
 
 // =============================================================================
-// Test – StackLayout: park (non-freeing const overload) does not free register
+// Test – StackFrameBuilder: park (non-freeing const overload) does not free register
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutParkConstNoFree)
 {
@@ -2641,15 +2641,15 @@ CYBOZU_TEST_AUTO(stackLayoutParkConstNoFree)
         void build() {
             auto r = alloc<Reg64>(8);   // r8
             emit_prologue();
-            auto cl = make_stack_layout().gp_parks(1).build();
+            auto sf = make_stack_frame().gp_parks(1).build();
 
             const Reg64 &cr = r;
-            cl.park(cr, 0);             // const overload — should NOT free r
+            sf.park(cr, 0);             // const overload — should NOT free r
 
             CYBOZU_TEST_ASSERT(reg_live(r));   // r still allocated
 
             free(r);
-            cl.destroy();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2659,7 +2659,7 @@ CYBOZU_TEST_AUTO(stackLayoutParkConstNoFree)
 }
 
 // =============================================================================
-// Test – StackLayout: end-to-end value round-trip using GP park/reload in JIT
+// Test – StackFrameBuilder: end-to-end value round-trip using GP park/reload in JIT
 // =============================================================================
 CYBOZU_TEST_AUTO(stackLayoutEndToEnd)
 {
@@ -2675,14 +2675,14 @@ CYBOZU_TEST_AUTO(stackLayoutEndToEnd)
 #endif
             emit_prologue();
 
-            auto cl = make_stack_layout().gp_parks(1).build();
-            cl.park(arg, 0);             // mov [rsp+base], rdi; free arg
+            auto sf = make_stack_frame().gp_parks(1).build();
+            sf.park(arg, 0);             // mov [rsp+base], rdi; free arg
 
-            auto res = cl.reload<Reg64>(0);  // mov res, [rsp+base]; alloc res
+            auto res = sf.reload<Reg64>(0);  // mov res, [rsp+base]; alloc res
             mov(rax, res);
             free(res);
 
-            cl.destroy();
+            sf.destroy();
             emit_epilogue();
             ret();
         }
@@ -2730,7 +2730,7 @@ extern "C" uint64_t spill_test_sum8(
 }
 
 // =============================================================================
-// Test – CommittedLayout as replacement for spill() / restore()
+// Test – StackFrame as replacement for spill() / restore()
 //
 //  Three scenarios that together cover every use-case spill/restore addressed:
 //
@@ -2751,7 +2751,7 @@ extern "C" uint64_t spill_test_sum8(
 //
 //  Scenario 3 – "Extra arguments beyond register count" via scratch + pointer:
 //    The old compiler model: push extra values onto the stack before the call,
-//    pop them after.  The CommittedLayout model: store the extra values in a
+//    pop them after.  The StackFrame model: store the extra values in a
 //    pre-declared scratch area (fixed offset, no rsp movement), then pass the
 //    scratch address as a normal register argument.  The callee receives a
 //    pointer and reads the extras from there.
@@ -2780,13 +2780,13 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
                 emit_prologue();
 
                 // One GP park slot for r2.
-                auto cl = make_stack_layout().gp_parks(1).build();
+                auto sf = make_stack_frame().gp_parks(1).build();
 
                 mov(r0, 111); mov(r1, 222); mov(r2, 333);
 
                 // park(r2, 0): emits  mov [rsp+slot], r2
                 //              frees  r2's hardware register back to the pool.
-                cl.park(r2, 0);
+                sf.park(r2, 0);
 
                 // The freed slot is now available.  Use it for something else.
                 auto r_tmp = alloc<Reg64>();
@@ -2795,12 +2795,12 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
 
                 // reload<Reg64>(0): allocs a register, emits  mov reg, [rsp+slot]
                 //                   r2 now refers to the reloaded register.
-                r2 = cl.reload<Reg64>(0);
+                r2 = sf.reload<Reg64>(0);
 
                 mov(rax, r0); add(rax, r1); add(rax, r2);
                 free(r0); free(r1); free(r2);
 
-                cl.destroy();
+                sf.destroy();
                 emit_epilogue();
                 ret();
             }
@@ -2831,14 +2831,14 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
                 // Two GP park slots: one for r_ka, one for r_kb.
                 // No with_volatile_save() needed — we handle preservation manually
                 // via explicit park/reload.
-                auto cl = make_stack_layout().gp_parks(2).build();
+                auto sf = make_stack_frame().gp_parks(2).build();
 
                 mov(r_ka, 100); mov(r_kb, 200);
 
                 // Park both live values.  Their hardware registers are freed and
                 // become available for loading call arguments.
-                cl.park(r_ka, 0);
-                cl.park(r_kb, 1);
+                sf.park(r_ka, 0);
+                sf.park(r_kb, 1);
 
                 // Load call arguments into the now-free hardware registers.
                 // Argument registers differ between Win64 and SysV.
@@ -2850,13 +2850,13 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
                 emit_call(&spill_test_sum4, 0); // rax = 10+20+30+40 = 100
 
                 // Reload the preserved values.
-                r_ka = cl.reload<Reg64>(0);
-                r_kb = cl.reload<Reg64>(1);
+                r_ka = sf.reload<Reg64>(0);
+                r_kb = sf.reload<Reg64>(1);
 
                 add(rax, r_ka); add(rax, r_kb);
                 free(r_ka); free(r_kb);
 
-                cl.destroy();
+                sf.destroy();
                 emit_epilogue();
                 ret();
             }
@@ -2875,7 +2875,7 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
     //   call func(a, b, [stack]);     // callee reads extras from [rsp+8]
     //   restore(r_x1); restore(r_x0); // pop; pop
     //
-    // New model (CommittedLayout):
+    // New model (StackFrame):
     //   mov [rsp+scratch+0], r_x0    // store into pre-declared scratch area
     //   mov [rsp+scratch+8], r_x1    // rsp never moves between build/destroy
     //   lea r_ptr, [rsp+scratch+0]   // form pointer to the scratch block
@@ -2906,18 +2906,18 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
 
                 // Reserve 2 × 8 bytes of scratch for the extra values.
                 // This replaces the two push instructions of the old model.
-                auto cl = make_stack_layout().scratch(2 * 8).build();
+                auto sf = make_stack_frame().scratch(2 * 8).build();
 
                 mov(r_x0, 300); mov(r_x1, 400);
 
                 // Store extras into scratch (no rsp movement).
-                mov(cl.scratch_addr(0), r_x0); // scratch[0] = 300
-                mov(cl.scratch_addr(8), r_x1); // scratch[1] = 400
+                mov(sf.scratch_addr(0), r_x0); // scratch[0] = 300
+                mov(sf.scratch_addr(8), r_x1); // scratch[1] = 400
                 free(r_x0); free(r_x1);
 
                 // Form a pointer to the scratch block.
                 auto r_ptr = alloc<Reg64>();
-                lea(r_ptr, cl.scratch_addr(0)); // r_ptr = &scratch[0]
+                lea(r_ptr, sf.scratch_addr(0)); // r_ptr = &scratch[0]
 
                 // Move the pointer into its ABI arg register first, before any
                 // other argument is written.  This prevents clobbering r_ptr if
@@ -2938,7 +2938,7 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
                 // rax = 100 + 200 + 300 + 400 = 1000
                 emit_call(&spill_test_sum_indirect, 0);
 
-                cl.destroy();
+                sf.destroy();
                 emit_epilogue();
                 ret();
             }
@@ -2951,7 +2951,7 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
 }
 
 // =============================================================================
-// Test – with_outgoing_args() / CommittedLayout::emit_call() for stack-overflow arguments
+// Test – with_outgoing_args() / StackFrame::emit_call() for stack-overflow arguments
 //
 // Demonstrates the correct way to call a function whose argument count exceeds
 // the ABI register limit:
@@ -2963,11 +2963,11 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
 //   stack args written to [rsp+X] before this sub would be at [rsp+X+adj] at
 //   call time — the wrong offsets.
 //
-// Why with_outgoing_args() + CommittedLayout::emit_call() work:
+// Why with_outgoing_args() + StackFrame::emit_call() work:
 //   with_outgoing_args(n) reserves the overflow-arg slots at [rsp+0] (SysV) or
 //   [rsp+32] (Win64, above the shadow space that is also pre-reserved).
 //   build() adjusts the frame total so that rsp is already 16-aligned at the
-//   call instruction, so CommittedLayout::emit_call() can be a bare
+//   call instruction, so StackFrame::emit_call() can be a bare
 //   "mov rax; call rax".
 //
 // Two sub-scenarios: P=0 (even pushes) and P=1 (odd push), covering both
@@ -2994,35 +2994,35 @@ CYBOZU_TEST_AUTO(stackLayoutOutgoingStackArgs)
                 // Win64 shadow space ([rsp+0..31]) automatically.
 #ifdef _WIN32
                 // Win64: args 5-8 overflow (e,f,g,h) → 4 slots
-                auto cl = make_stack_layout().with_outgoing_args(4).build();
+                auto sf = make_stack_frame().with_outgoing_args(4).build();
 #else
                 // SysV:  args 7-8 overflow (g,h)     → 2 slots
-                auto cl = make_stack_layout().with_outgoing_args(2).build();
+                auto sf = make_stack_frame().with_outgoing_args(2).build();
 #endif
                 auto r_tmp = alloc<Reg64>();
 
 #ifdef _WIN32
                 // outgoing_arg_addr(n) = [rsp + 32 + n*8]  (above shadow space).
-                mov(r_tmp, 50); mov(cl.outgoing_arg_addr(0), r_tmp); // e
-                mov(r_tmp, 60); mov(cl.outgoing_arg_addr(1), r_tmp); // f
-                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(2), r_tmp); // g
-                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(3), r_tmp); // h
+                mov(r_tmp, 50); mov(sf.outgoing_arg_addr(0), r_tmp); // e
+                mov(r_tmp, 60); mov(sf.outgoing_arg_addr(1), r_tmp); // f
+                mov(r_tmp, 70); mov(sf.outgoing_arg_addr(2), r_tmp); // g
+                mov(r_tmp, 80); mov(sf.outgoing_arg_addr(3), r_tmp); // h
                 free(r_tmp);
                 mov(rcx, 10); mov(rdx, 20); mov(r8, 30); mov(r9, 40);
 #else
                 // outgoing_arg_addr(n) = [rsp + n*8].
-                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(0), r_tmp); // g
-                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(1), r_tmp); // h
+                mov(r_tmp, 70); mov(sf.outgoing_arg_addr(0), r_tmp); // g
+                mov(r_tmp, 80); mov(sf.outgoing_arg_addr(1), r_tmp); // h
                 free(r_tmp);
                 mov(rdi, 10); mov(rsi, 20); mov(rdx, 30);
                 mov(rcx, 40); mov(r8,  50); mov(r9,  60);
 #endif
                 // Bare call — no sub/add rsp.  rsp is already 16-aligned because
                 // build() absorbed the required adjustment into the frame total.
-                cl.emit_call(&spill_test_sum8);
+                sf.emit_call(&spill_test_sum8);
                 // rax = 10+20+30+40+50+60+70+80 = 360
 
-                cl.destroy();
+                sf.destroy();
                 emit_epilogue();
                 ret();
             }
@@ -3052,30 +3052,30 @@ CYBOZU_TEST_AUTO(stackLayoutOutgoingStackArgs)
                 emit_prologue();               // push rbx
 
 #ifdef _WIN32
-                auto cl = make_stack_layout().with_outgoing_args(4).build();
+                auto sf = make_stack_frame().with_outgoing_args(4).build();
 #else
-                auto cl = make_stack_layout().with_outgoing_args(2).build();
+                auto sf = make_stack_frame().with_outgoing_args(2).build();
 #endif
                 auto r_tmp = alloc<Reg64>();
 
 #ifdef _WIN32
-                mov(r_tmp, 50); mov(cl.outgoing_arg_addr(0), r_tmp); // e
-                mov(r_tmp, 60); mov(cl.outgoing_arg_addr(1), r_tmp); // f
-                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(2), r_tmp); // g
-                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(3), r_tmp); // h
+                mov(r_tmp, 50); mov(sf.outgoing_arg_addr(0), r_tmp); // e
+                mov(r_tmp, 60); mov(sf.outgoing_arg_addr(1), r_tmp); // f
+                mov(r_tmp, 70); mov(sf.outgoing_arg_addr(2), r_tmp); // g
+                mov(r_tmp, 80); mov(sf.outgoing_arg_addr(3), r_tmp); // h
                 free(r_tmp);
                 mov(rcx, 10); mov(rdx, 20); mov(r8, 30); mov(r9, 40);
 #else
-                mov(r_tmp, 70); mov(cl.outgoing_arg_addr(0), r_tmp); // g
-                mov(r_tmp, 80); mov(cl.outgoing_arg_addr(1), r_tmp); // h
+                mov(r_tmp, 70); mov(sf.outgoing_arg_addr(0), r_tmp); // g
+                mov(r_tmp, 80); mov(sf.outgoing_arg_addr(1), r_tmp); // h
                 free(r_tmp);
                 mov(rdi, 10); mov(rsi, 20); mov(rdx, 30);
                 mov(rcx, 40); mov(r8,  50); mov(r9,  60);
 #endif
-                cl.emit_call(&spill_test_sum8);
+                sf.emit_call(&spill_test_sum8);
 
                 free(r_pres);
-                cl.destroy();
+                sf.destroy();
                 emit_epilogue(); // pop rbx
                 ret();
             }
@@ -3095,10 +3095,10 @@ CYBOZU_TEST_AUTO(stackLayoutOutgoingStackArgs)
             Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
             void build() {
                 emit_prologue();
-                auto cl = make_stack_layout().with_outgoing_args(2).build();
-                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(2),  Xbyak::RegManagerError); // n == count
-                CYBOZU_TEST_EXCEPTION(cl.outgoing_arg_addr(-1), Xbyak::RegManagerError);
-                cl.destroy();
+                auto sf = make_stack_frame().with_outgoing_args(2).build();
+                CYBOZU_TEST_EXCEPTION(sf.outgoing_arg_addr(2),  Xbyak::RegManagerError); // n == count
+                CYBOZU_TEST_EXCEPTION(sf.outgoing_arg_addr(-1), Xbyak::RegManagerError);
+                sf.destroy();
                 emit_epilogue();
                 ret();
             }
@@ -3111,16 +3111,16 @@ CYBOZU_TEST_AUTO(stackLayoutOutgoingStackArgs)
 // =============================================================================
 // Test – multiple calls in one with_outgoing_args layout, mixing call styles
 //
-// A single CommittedLayout built with with_outgoing_args() can serve both a
-// register-only call and an overflow-arg call.  cl.emit_call() is used for
+// A single StackFrame built with with_outgoing_args() can serve both a
+// register-only call and an overflow-arg call.  sf.emit_call() is used for
 // both: the frame alignment guarantee from build() is correct for any call,
 // not just ones that use the overflow slots.
 //
 // Sequence:
-//   1. cl.emit_call(&call_function_that_clobbers_registers)
+//   1. sf.emit_call(&call_function_that_clobbers_registers)
 //        — all args in registers; overflow slots left untouched.
 //        — returns 210, held in rbx (callee-saved) across the second call.
-//   2. cl.emit_call(&spill_test_sum8(1,2,3,4,5,6,7,8))
+//   2. sf.emit_call(&spill_test_sum8(1,2,3,4,5,6,7,8))
 //        — uses overflow slots for the args that spill past the register limit.
 //        — returns 36.
 //   3. add rax, rbx  → 246.
@@ -3134,47 +3134,47 @@ CYBOZU_TEST_AUTO(stackLayoutMixedCalls)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             // rbx (index 3) is callee-saved on every x86-64 ABI.
-            // emit_prologue() will push it; it survives cl.emit_call() calls.
+            // emit_prologue() will push it; it survives sf.emit_call() calls.
             auto r_pres = alloc<Reg64>(3); // rbx
             emit_prologue();               // push rbx — managed_push_count_ = 1 (odd)
 
 #ifdef _WIN32
-            auto cl = make_stack_layout().with_outgoing_args(4).build();
+            auto sf = make_stack_frame().with_outgoing_args(4).build();
 #else
-            auto cl = make_stack_layout().with_outgoing_args(2).build();
+            auto sf = make_stack_frame().with_outgoing_args(2).build();
 #endif
 
             // ---- Call 1: register-only ----
             // call_function_that_clobbers_registers() needs no stack args.
             // Overflow slots exist in the frame but are simply not written.
-            cl.emit_call(&call_function_that_clobbers_registers); // rax = 210
+            sf.emit_call(&call_function_that_clobbers_registers); // rax = 210
             mov(r_pres, rax); // rbx = 210 — survives call 2 unchanged
 
             // ---- Call 2: overflow-arg call ----
             // spill_test_sum8(1,2,3,4,5,6,7,8) = 36.
             // Write stack-overflow args to outgoing_arg_addr(), populate
-            // register args, then call.  Same cl.emit_call(), different path.
+            // register args, then call.  Same sf.emit_call(), different path.
             auto r_tmp = alloc<Reg64>();
 #ifdef _WIN32
-            mov(r_tmp, 5); mov(cl.outgoing_arg_addr(0), r_tmp); // e
-            mov(r_tmp, 6); mov(cl.outgoing_arg_addr(1), r_tmp); // f
-            mov(r_tmp, 7); mov(cl.outgoing_arg_addr(2), r_tmp); // g
-            mov(r_tmp, 8); mov(cl.outgoing_arg_addr(3), r_tmp); // h
+            mov(r_tmp, 5); mov(sf.outgoing_arg_addr(0), r_tmp); // e
+            mov(r_tmp, 6); mov(sf.outgoing_arg_addr(1), r_tmp); // f
+            mov(r_tmp, 7); mov(sf.outgoing_arg_addr(2), r_tmp); // g
+            mov(r_tmp, 8); mov(sf.outgoing_arg_addr(3), r_tmp); // h
             free(r_tmp);
             mov(rcx, 1); mov(rdx, 2); mov(r8, 3); mov(r9, 4);
 #else
-            mov(r_tmp, 7); mov(cl.outgoing_arg_addr(0), r_tmp); // g
-            mov(r_tmp, 8); mov(cl.outgoing_arg_addr(1), r_tmp); // h
+            mov(r_tmp, 7); mov(sf.outgoing_arg_addr(0), r_tmp); // g
+            mov(r_tmp, 8); mov(sf.outgoing_arg_addr(1), r_tmp); // h
             free(r_tmp);
             mov(rdi, 1); mov(rsi, 2); mov(rdx, 3);
             mov(rcx, 4); mov(r8,  5); mov(r9,  6);
 #endif
-            cl.emit_call(&spill_test_sum8); // rax = 1+2+3+4+5+6+7+8 = 36
+            sf.emit_call(&spill_test_sum8); // rax = 1+2+3+4+5+6+7+8 = 36
 
             add(rax, r_pres); // 36 + 210 = 246
 
             free(r_pres);
-            cl.destroy();
+            sf.destroy();
             emit_epilogue(); // pop rbx
             ret();
         }
@@ -3401,8 +3401,8 @@ CYBOZU_TEST_AUTO(managedAliasReset)
     // gp_parks(1) provides the minimum frame content (build() throws on an
     // empty layout when no alias or park slots exist).
     CYBOZU_TEST_NO_EXCEPTION(
-        auto cl = k.make_stack_layout().gp_parks(1).build();
-        cl.destroy();
+        auto sf = k.make_stack_frame().gp_parks(1).build();
+        sf.destroy();
     )
     (void)a;
 }
@@ -3418,11 +3418,11 @@ CYBOZU_TEST_AUTO(managedAliasNoSlotNoop)
             auto a = declare_alias(Reg64(10), Reg64(11), true);
             CYBOZU_TEST_ASSERT(!a.has_stack_slot());
 
-            auto cl = make_stack_layout().gp_parks(1).build();
+            auto sf = make_stack_frame().gp_parks(1).build();
 
             const size_t sz_before = getSize();
-            a.save(cl);     // must emit no instructions
-            a.restore(cl);  // must emit no instructions
+            a.save(sf);     // must emit no instructions
+            a.restore(sf);  // must emit no instructions
             const size_t sz_after = getSize();
 
             CYBOZU_TEST_EQUAL(sz_before, sz_after);
@@ -3430,7 +3430,7 @@ CYBOZU_TEST_AUTO(managedAliasNoSlotNoop)
             CYBOZU_TEST_ASSERT(a.is_active());
 
             a.free();
-            cl.destroy();
+            sf.destroy();
             ret();
         }
     };
@@ -3448,12 +3448,12 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
         void build() {
             // r10 is volatile on SysV and Microsoft x64; no prologue/epilogue needed.
             auto a = declare_alias(Reg64(10));
-            auto cl = make_stack_layout().build();
+            auto sf = make_stack_frame().build();
 
             a.prime();                          // allocate r10
             mov(a.reg(), 0xABCD1234ULL);        // r10 = 0xABCD1234
 
-            a.save(cl);                         // [rsp+<off>] = r10; free r10
+            a.save(sf);                         // [rsp+<off>] = r10; free r10
             CYBOZU_TEST_ASSERT(!a.is_active());
 
             // r10 is free; use it temporarily with a different value.
@@ -3461,14 +3461,14 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
             mov(r_tmp, 0xDEADBEEFULL);
             free(r_tmp);
 
-            a.restore(cl);                      // allocate r10; load from slot
+            a.restore(sf);                      // allocate r10; load from slot
             CYBOZU_TEST_ASSERT(a.is_active());
             CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
 
             mov(rax, a.reg());                  // rax = 0xABCD1234
             a.release();
 
-            cl.destroy();
+            sf.destroy();
             ret();
         }
     };
@@ -3486,7 +3486,7 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             auto a = declare_alias(Reg64(10));
-            auto cl = make_stack_layout().gp_parks(1).build();
+            auto sf = make_stack_frame().gp_parks(1).build();
 
             a.prime();
 
@@ -3497,8 +3497,8 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
             mov(park_reg, 0x2222222222222222ULL);
 
             // Save both independently.
-            a.save(cl);               // alias slot <- r10
-            cl.park(park_reg, 0);     // gp park slot 0 <- r11; frees r11
+            a.save(sf);               // alias slot <- r10
+            sf.park(park_reg, 0);     // gp park slot 0 <- r11; frees r11
 
             // Clobber r10 (currently free) and r11 with different values.
             auto r10_tmp = alloc<Reg64>(10);
@@ -3509,8 +3509,8 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
             free(r11_tmp);
 
             // Restore both.
-            a.restore(cl);                       // r10 = 0x1111...
-            park_reg = cl.reload<Reg64>(0);      // r11 = 0x2222...
+            a.restore(sf);                       // r10 = 0x1111...
+            park_reg = sf.reload<Reg64>(0);      // r11 = 0x2222...
 
             // Return sum: must equal 0x1111... + 0x2222... = 0x3333...
             // Use park_reg as base so that if reload allocated rax, the
@@ -3520,7 +3520,7 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
 
             a.release();
             free(park_reg);
-            cl.destroy();
+            sf.destroy();
             ret();
         }
     };
@@ -3539,7 +3539,7 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             auto a = declare_alias<Reg64>();
-            auto cl = make_stack_layout().build();
+            auto sf = make_stack_frame().build();
 
             CYBOZU_TEST_ASSERT(!a.is_active());
             a.prime();
@@ -3548,18 +3548,18 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
             // Write a known value, save to slot, clobber, restore, read back.
             const int idx = a.reg().getIdx();
             mov(a.reg(), 0xCAFEBABEULL);
-            a.save(cl);
+            a.save(sf);
 
             // Use the same physical register with a different value.
             auto r_tmp = alloc<Reg64>(idx);
             mov(r_tmp, 0ULL);
             free(r_tmp);
 
-            a.restore(cl);
+            a.restore(sf);
             mov(rax, a.reg());
             a.release();
 
-            cl.destroy();
+            sf.destroy();
             ret();
         }
     };
@@ -3577,15 +3577,15 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
             auto a = declare_alias(Reg64(10));
-            auto cl = make_stack_layout().build();
+            auto sf = make_stack_frame().build();
 
             a.prime();
             mov(a.reg(), 0xBEEFCAFEULL);
 
-            a.save(cl);                  // slot = 0xBEEFCAFE; r10 freed
+            a.save(sf);                  // slot = 0xBEEFCAFE; r10 freed
             CYBOZU_TEST_ASSERT(!a.is_active());
 
-            a.restore(cl);               // r10 = 0xBEEFCAFE
+            a.restore(sf);               // r10 = 0xBEEFCAFE
             CYBOZU_TEST_ASSERT(a.is_active());
 
             // Value not modified; release instead of save -- no store emitted.
@@ -3593,14 +3593,14 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
             CYBOZU_TEST_ASSERT(!a.is_active());
 
             // Slot must still hold the value written by save().
-            a.restore(cl);
+            a.restore(sf);
             CYBOZU_TEST_ASSERT(a.is_active());
             CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
 
             mov(rax, a.reg());           // rax = 0xBEEFCAFE
             a.release();
 
-            cl.destroy();
+            sf.destroy();
             ret();
         }
     };

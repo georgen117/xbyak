@@ -93,7 +93,7 @@ class RegManagerError : public std::exception {
             "reg manager: stack layout slot index out of bounds",
             "reg manager: stack layout scratch offset out of bounds",
             "reg manager: save_volatiles called but with_volatile_save() was not declared",
-            "reg manager: a CommittedLayout is already active on this manager",
+            "reg manager: a StackFrame is already active on this manager",
         };
         const int idx = static_cast<int>(e);
         return (idx >= 0 && idx < static_cast<int>(sizeof(tbl) / sizeof(*tbl)))
@@ -184,7 +184,7 @@ public:
     //         MyKernelB b(cpu);
     //
     // cg  — optional pointer to the CodeGenerator into which instructions will be
-    //       emitted by emit_prologue(), emit_epilogue(), and make_stack_layout().
+    //       emitted by emit_prologue(), emit_epilogue(), and make_stack_frame().
     //       Pass NULL (default) when only register tracking is
     //       required; the manager then operates with no emission overhead.
     //
@@ -499,18 +499,18 @@ public:
 #endif
     }
 
-    // Returns true if no CommittedLayout is currently open.
+    // Returns true if no StackFrame is currently open.
     // Use this to inspect state programmatically.  For a hard stop in debug
     // builds, use assert_clean_stack() instead.
     bool clean_stack() const {
         return allocated_stack_space_ == 0;
     }
 
-    // Checks that the hardware stack is fully balanced: no CommittedLayout is
+    // Checks that the hardware stack is fully balanced: no StackFrame is
     // currently open.
     //
-    // Call this just before ret() to confirm every CommittedLayout opened with
-    // make_stack_layout().build() has been destroyed.  An open layout leaves
+    // Call this just before ret() to confirm every StackFrame opened with
+    // make_stack_frame().build() has been destroyed.  An open layout leaves
     // rsp pointing into allocated frame space, making the return address
     // unreachable.
     //
@@ -522,10 +522,10 @@ public:
 #ifndef NDEBUG
         if (allocated_stack_space_ != 0)
             fprintf(stderr,
-                    "assert_clean_stack: CommittedLayout not destroyed (%td bytes still allocated)\n",
+                    "assert_clean_stack: StackFrame not destroyed (%td bytes still allocated)\n",
                     allocated_stack_space_);
         assert(clean_stack() &&
-               "assert_clean_stack: unbalanced stack — open CommittedLayout");
+               "assert_clean_stack: unbalanced stack — open StackFrame");
 #endif
     }
 
@@ -709,7 +709,7 @@ public:
     inline Scoped<RegT> allocScoped(int idx) & { return makeScoped(alloc<RegT>(idx)); }
 
     // -------------------------------------------------------------------------
-    // StackLayout / CommittedLayout — two-phase unified stack management
+    // StackFrameBuilder / StackFrame — two-phase unified stack management
     //
     // Guarantees rsp moves exactly once (at build()) and never again until
     // destroy().  All slot offsets are fixed at build() time, so park,
@@ -722,10 +722,10 @@ public:
     //  2. emit_prologue() — pushes callee-saved GP registers onto the stack.
     //     Must come before build() so that stack alignment is correctly
     //     computed for any emit_call() within the layout.
-    //  3. build() — emits sub rsp, <total> and opens the CommittedLayout.
+    //  3. build() — emits sub rsp, <total> and opens the StackFrame.
     //     Must come after emit_prologue() (see above).
     //  4. ... use park/reload/save_volatiles/emit_call as needed ...
-    //  5. destroy() (or let CommittedLayout go out of scope) — emits
+    //  5. destroy() (or let StackFrame go out of scope) — emits
     //     add rsp, <total>.  Must come before emit_epilogue() so that rsp
     //     points back to the return-address slot before the pop sequence.
     //  6. emit_epilogue() — pops callee-saved GP registers in reverse order.
@@ -738,27 +738,27 @@ public:
     //
     //   emit_prologue();                        // push callee-saves first
     //
-    //   auto cl = make_stack_layout()
+    //   auto sf = make_stack_frame()
     //       .gp_parks(2)                        // two 8-byte GP slots
     //       .vec_parks(1)                       // one ZMM/YMM slot
     //       .scratch(64)                        // 64 bytes of raw scratch
     //       .with_volatile_save()               // snapshot live volatiles now
     //       .build();                           // emits: sub rsp, <total>
     //
-    //   cl.park(rdi, 0);                        // mov [rsp+0], rdi; free rdi
-    //   cl.park_vec(zmm0, 0);                   // vmovdqu32 [rsp+N], zmm0; free zmm0
-    //   cl.save_volatiles();                    // mov [rsp+..], live_vol_reg ...
+    //   sf.park(rdi, 0);                        // mov [rsp+0], rdi; free rdi
+    //   sf.park_vec(zmm0, 0);                   // vmovdqu32 [rsp+N], zmm0; free zmm0
+    //   sf.save_volatiles();                    // mov [rsp+..], live_vol_reg ...
     //   emit_call(&my_func);
-    //   cl.restore_volatiles();
-    //   auto r = cl.reload<Reg64>(0);           // mov r, [rsp+0]; alloc r
+    //   sf.restore_volatiles();
+    //   auto r = sf.reload<Reg64>(0);           // mov r, [rsp+0]; alloc r
     //
-    //   cl.destroy();                           // emits: add rsp, <total>
+    //   sf.destroy();                           // emits: add rsp, <total>
     //   emit_epilogue();
     //   ret();
     // -------------------------------------------------------------------------
 
     // Forward declarations for the builder and committed types.
-    class CommittedLayout;
+    class StackFrame;
 
     // A register alias managed by RegPoolManager.
     //
@@ -767,12 +767,12 @@ public:
     //                             for slot-backed aliases; allocated immediately for
     //                             no-slot aliases)
     //   2. prime()             -- allocates the register (no-op for active no-slot aliases)
-    //   3. save(cl)            -- spill to stack slot and release register (slot path only)
-    //   4. restore(cl)         -- reload from slot and re-acquire register (slot path only)
+    //   3. save(sf)            -- spill to stack slot and release register (slot path only)
+    //   4. restore(sf)         -- reload from slot and re-acquire register (slot path only)
     //   5a. release()          -- release register without saving (slot path only)
     //   5b. free()             -- release register (no-slot path; call before assert_all_free)
     //
-    // save/restore are defined out-of-line after CommittedLayout is complete.
+    // save/restore are defined out-of-line after StackFrame is complete.
     class ManagedAlias {
     public:
         // Returns the allocated register.  Asserts active state.
@@ -806,12 +806,12 @@ public:
         }
 
         // Spill to the stack slot and release the register.  Slot-backed only.
-        // Defined out-of-line after CommittedLayout.
-        void save(CommittedLayout &cl);
+        // Defined out-of-line after StackFrame.
+        void save(StackFrame &sf);
 
         // Reload from the stack slot and re-acquire the register.  Slot-backed only.
-        // Defined out-of-line after CommittedLayout.
-        void restore(CommittedLayout &cl);
+        // Defined out-of-line after StackFrame.
+        void restore(StackFrame &sf);
 
         // Release the register back to the pool without saving.  Slot-backed only.
         void release() {
@@ -847,30 +847,30 @@ public:
     // Builder -- accumulates slot requirements before any code is emitted.
     // All methods return *this for chaining.  No machine code is emitted until
     // build() is called.
-    class StackLayout {
+    class StackFrameBuilder {
     public:
-        explicit StackLayout(RegPoolManager &rm)
+        explicit StackFrameBuilder(RegPoolManager &rm)
                 : rm_(&rm), gp_count_(0), vec_count_(0),
                   scratch_bytes_(0), with_volatile_save_(false),
                   outgoing_arg_count_(0) {}
 
         // Reserve n GP-sized (8-byte) park slots.
-        StackLayout &gp_parks(int n) { gp_count_ = n; return *this; }
+        StackFrameBuilder &gp_parks(int n) { gp_count_ = n; return *this; }
 
         // Reserve n vector park slots.
         // Each slot is 64 bytes when AVX-512 is present, 32 bytes otherwise.
-        StackLayout &vec_parks(int n) { vec_count_ = n; return *this; }
+        StackFrameBuilder &vec_parks(int n) { vec_count_ = n; return *this; }
 
         // Reserve a raw scratch area of at least 'bytes' bytes.
         // The value is rounded up to the nearest 8-byte boundary automatically.
-        StackLayout &scratch(ptrdiff_t bytes) { scratch_bytes_ = bytes; return *this; }
+        StackFrameBuilder &scratch(ptrdiff_t bytes) { scratch_bytes_ = bytes; return *this; }
 
         // Reserve fixed-offset slots for all ABI-volatile GP and vector registers.
         // save_volatiles() will store only those that are live at call time;
         // restore_volatiles() reloads exactly the same set.  Because slots are
         // sized for every possible volatile register, the set of live registers
         // at save_volatiles() time does not need to match the set at build() time.
-        StackLayout &with_volatile_save() { with_volatile_save_ = true; return *this; }
+        StackFrameBuilder &with_volatile_save() { with_volatile_save_ = true; return *this; }
 
         // Reserve n stack-overflow argument slots at [rsp+0] (SysV) or
         // [rsp+32] (Win64, above the 32-byte shadow space that is also reserved).
@@ -878,23 +878,23 @@ public:
         // Use this when calling a C function whose argument count exceeds the
         // ABI register limit (SysV: more than 6 GP args; Win64: more than 4 GP
         // args).  After build(), write each overflow argument to
-        // outgoing_arg_addr(n) on the CommittedLayout, load the register
-        // arguments, then call emit_call() on the CommittedLayout instead of
+        // outgoing_arg_addr(n) on the StackFrame, load the register
+        // arguments, then call emit_call() on the StackFrame instead of
         // RegPoolManager::emit_call().
         //
-        // CommittedLayout::emit_call() emits only "mov rax, func; call rax" — no sub/add
+        // StackFrame::emit_call() emits only "mov rax, func; call rax" — no sub/add
         // rsp — because build() adjusts the frame total so that rsp is already
         // 16-byte aligned (at the call instruction) without any extra adjustment.
-        StackLayout &with_outgoing_args(int n) {
+        StackFrameBuilder &with_outgoing_args(int n) {
             outgoing_arg_count_ = n;
             return *this;
         }
 
         // Commit: compute the total frame size, emit sub rsp, <total>, and
-        // return a CommittedLayout owning the frame.
+        // return a StackFrame owning the frame.
         // Throws Xbyak::RegManagerError if no CodeGenerator has been provided, or if a
-        // CommittedLayout is already active on this manager.
-        CommittedLayout build() {
+        // StackFrame is already active on this manager.
+        StackFrame build() {
             return rm_->build_layout(gp_count_, vec_count_,
                                      scratch_bytes_, with_volatile_save_,
                                      outgoing_arg_count_);
@@ -909,13 +909,13 @@ public:
         int    outgoing_arg_count_;
     };
 
-    // Committed layout — owns the stack frame opened by StackLayout::build().
+    // Committed layout — owns the stack frame opened by StackFrameBuilder::build().
     // Construction emits sub rsp, <total>.
     // Destruction emits add rsp, <total> (unless destroy() was called first).
     // Move-only.
-    class CommittedLayout {
+    class StackFrame {
     public:
-        CommittedLayout(RegPoolManager &rm,
+        StackFrame(RegPoolManager &rm,
                         ptrdiff_t      gp_base,
                         int            gp_count,
                         ptrdiff_t      vec_base,
@@ -953,12 +953,12 @@ public:
             rm_->layout_active_ = true;
         }
 
-        ~CommittedLayout() noexcept { do_destroy(); }
+        ~StackFrame() noexcept { do_destroy(); }
 
-        CommittedLayout(const CommittedLayout &) = delete;
-        CommittedLayout &operator=(const CommittedLayout &) = delete;
+        StackFrame(const StackFrame &) = delete;
+        StackFrame &operator=(const StackFrame &) = delete;
 
-        CommittedLayout(CommittedLayout &&other) noexcept
+        StackFrame(StackFrame &&other) noexcept
                 : rm_(other.rm_), gp_base_(other.gp_base_),
                   gp_count_(other.gp_count_), vec_base_(other.vec_base_),
                   vec_count_(other.vec_count_),
@@ -1273,7 +1273,7 @@ public:
                 rm_->layout_active_ = false;
             } catch (...) {
 #ifndef NDEBUG
-                fprintf(stderr, "CommittedLayout::~CommittedLayout: exception swallowed\n");
+                fprintf(stderr, "StackFrame::~StackFrame: exception swallowed\n");
 #endif
             }
 #else
@@ -1286,22 +1286,22 @@ public:
         }
     };
 
-    // Create a StackLayout builder.  Chain declarations on the returned object
+    // Create a StackFrameBuilder builder.  Chain declarations on the returned object
     // then call build() to commit the frame.
     //
-    //   auto cl = make_stack_layout()
+    //   auto sf = make_stack_frame()
     //       .gp_parks(2)
     //       .scratch(32)
     //       .build();
     //
     // Throws Xbyak::RegManagerError if no CodeGenerator has been provided.
-    StackLayout make_stack_layout() {
-        return StackLayout(*this);
+    StackFrameBuilder make_stack_frame() {
+        return StackFrameBuilder(*this);
     }
 
     // Declare a named alias on a specific register, always backed by a stack slot.
     // The register is not allocated until prime() is called.
-    // Call save(cl)/restore(cl) to spill/reload across time-sharing boundaries.
+    // Call save(sf)/restore(sf) to spill/reload across time-sharing boundaries.
     ManagedAlias declare_alias(const Xbyak::Reg64 &reg) {
         const int id = static_cast<int>(pending_aliases_.size());
         pending_aliases_.push_back({true, reg.getIdx()});
@@ -1347,22 +1347,22 @@ public:
         return ManagedAlias(id, -1, true, this);
     }
 
-    // build() is defined here so it can reference CommittedLayout's constructor.
-    // Called by StackLayout::build() which delegates here after computing layout.
-    CommittedLayout build_layout(int gp_count, int vec_count,
+    // build() is defined here so it can reference StackFrame's constructor.
+    // Called by StackFrameBuilder::build() which delegates here after computing layout.
+    StackFrame build_layout(int gp_count, int vec_count,
                                  ptrdiff_t scratch_bytes, bool with_vol,
                                  int outgoing_args = 0) {
-        if (!cg_) RM_THROW_RET(RmError::NO_CG, CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
-        // Nested layouts are not allowed: only one CommittedLayout may be open
+        if (!cg_) RM_THROW_RET(RmError::NO_CG, StackFrame(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+        // Nested layouts are not allowed: only one StackFrame may be open
         // at a time.  Destroy the current layout before building a new one.
         if (layout_active_) RM_THROW_RET(RmError::LAYOUT_ALREADY_ACTIVE,
-                CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+                StackFrame(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         if (gp_count < 0 || vec_count < 0)
             RM_THROW_RET(RmError::LAYOUT_SLOT_OOB,
-                            CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+                            StackFrame(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         if (scratch_bytes < 0)
             RM_THROW_RET(RmError::LAYOUT_SCRATCH_OOB,
-                            CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+                            StackFrame(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
         // Round scratch up to the nearest 8-byte boundary so callers can
         // request an arbitrary byte count without caring about alignment.
         scratch_bytes = (scratch_bytes + 7) & ~ptrdiff_t(7);
@@ -1449,7 +1449,7 @@ public:
         //   at emission time when managed_push_count_ is even.
         //
         // Outgoing-args case (use emit_layout_call()):
-        //   CommittedLayout::emit_call() is a bare "mov rax; call rax" with no sub/add.
+        //   StackFrame::emit_call() is a bare "mov rax; call rax" with no sub/add.
         //   For rsp to be 16-aligned at the call instruction:
         //     rsp_at_call = rsp_entry − 8·P − total   (P = managed_push_count_)
         //     rsp_entry = 16k - 8  (caller's call pushed 8-byte return addr)
@@ -1473,9 +1473,9 @@ public:
         }
         if (total == 0)
             RM_THROW_RET(RmError::LAYOUT_SLOT_OOB,
-                            CommittedLayout(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
+                            StackFrame(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
 
-        return CommittedLayout(*this, gp_base, gp_count, vec_base, vec_count,
+        return StackFrame(*this, gp_base, gp_count, vec_base, vec_count,
                                vec_slot, scratch_base, scratch_bytes, total,
                                std::move(vol_gps), vol_gp_base,
                                std::move(vol_vecs), vol_vec_base, vec_slot,
@@ -2108,11 +2108,11 @@ private:
     // emit_epilogue).  Used by emit_call to compute 16-byte stack alignment.
     size_t managed_push_count_;
 
-    // Total bytes currently reserved by live CommittedLayout objects.
+    // Total bytes currently reserved by live StackFrame objects.
     ptrdiff_t allocated_stack_space_;
 
-    // Set by CommittedLayout construction, cleared by destroy()/destructor.
-    // Guards against nested build() calls: only one CommittedLayout may be
+    // Set by StackFrame construction, cleared by destroy()/destructor.
+    // Guards against nested build() calls: only one StackFrame may be
     // open at a time on a given RegPoolManager.
     bool layout_active_ = false;
 
@@ -2129,26 +2129,26 @@ private:
 
 } // namespace Xbyak
 
-// Out-of-line definitions for ManagedAlias methods that reference CommittedLayout.
-// These must appear after the full definition of RegPoolManager::CommittedLayout.
+// Out-of-line definitions for ManagedAlias methods that reference StackFrame.
+// These must appear after the full definition of RegPoolManager::StackFrame.
 
 inline void Xbyak::RegPoolManager::ManagedAlias::save(
-        Xbyak::RegPoolManager::CommittedLayout &cl) {
+        Xbyak::RegPoolManager::StackFrame &sf) {
     if (!needs_slot_) return;
-    cl.alias_store(alias_id_, reg_);
+    sf.alias_store(alias_id_, reg_);
     rm_->free(reg_);
     is_active_ = false;
 }
 
 inline void Xbyak::RegPoolManager::ManagedAlias::restore(
-        Xbyak::RegPoolManager::CommittedLayout &cl) {
+        Xbyak::RegPoolManager::StackFrame &sf) {
     if (!needs_slot_) return;
     if (desired_idx_ >= 0)
         reg_ = rm_->alloc<Xbyak::Reg64>(desired_idx_);
     else
         reg_ = rm_->alloc<Xbyak::Reg64>();
     is_active_ = true;
-    cl.alias_load(alias_id_, reg_);
+    sf.alias_load(alias_id_, reg_);
 }
 
 #endif // XBYAK_REG_MANAGER_HPP
