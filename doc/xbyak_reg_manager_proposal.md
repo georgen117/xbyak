@@ -41,6 +41,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 23. [Unified Stack Layout: `StackLayout` / `CommittedLayout` (Replaces §7 and §8)](#23-unified-stack-layout-stacklayout--committedlayout-replaces-7-and-8)
 24. [Open Task: ABI-portable argument register mapping (Future Work)](#24-open-task-abi-portable-argument-register-mapping-future-work)
 25. [Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`](#25-stack-overflow-arguments-with_outgoing_args--committedlayoutemit_call)
+26. [Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`](#26-named-alias-register-lifecycle-declare_alias--managedalias)
 ---
 
 ## Implementation Status
@@ -83,6 +84,8 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 23. Unified Stack Layout: `StackLayout` / `CommittedLayout`
 - [ ] 24. Open Task: ABI-portable argument register mapping (Future Work)
 - [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `CommittedLayout::emit_call()`
+- [x] 26. Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`
+- [ ] 27. Allow `make_stack_layout().build()` with no slots (empty layout)
 
 ---
 
@@ -3496,3 +3499,595 @@ ret();
   `emit_layout_call()` was briefly used for the bare-call path before being merged
   into `CommittedLayout::emit_call()`.  The unified single-method design is the
   intended final form.
+
+---
+
+## 26. Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`
+
+### Motivation
+
+Many JIT kernels hold several named values simultaneously -- input pointers,
+output pointers, loop bounds, scale factors -- where not all values can live in
+hardware registers at the same time.  The standard pattern is to spill a value
+to the stack and reload it when needed.  With only `alloc<Reg64>()` / `free()`
+/ `park()` / `reload()` this requires the programmer to:
+
+1. Manually allocate a stack slot via `CommittedLayout`.
+2. Track which slot holds which named value.
+3. Manually call `park(reg, slot)` and `reload<Reg64>(slot)` at each use site.
+4. Remember which register currently holds a given value.
+
+There is no abstraction that ties a named logical value to its stack slot and
+its current register.  Mistakes are silent: a slot written by one value can be
+overwritten by another if the programmer uses the wrong slot index, and there
+is no collision detection when two names try to activate the same physical
+register simultaneously.
+
+`ManagedAlias` binds a logical name, a stack slot, and a hardware register
+together under a five-operation lifecycle.  The register manager enforces
+correct use, detects simultaneous-activation collisions, and emits the
+load/store instructions automatically.
+
+**Additional motivation for APX kernels:** On APX-capable hardware, registers
+r16-r31 are not caller- or callee-saved and require no stack slot at all.
+`declare_alias(rax, r22)` expresses "use r22 on APX (no stack slot needed),
+fall back to rax with a stack slot otherwise."  The same kernel source compiles
+and runs correctly on both APX and non-APX hardware with no conditional
+compilation at the call sites.
+
+### Design
+
+Each `ManagedAlias` is always in one of two states:
+
+```
+  DORMANT                                      ACTIVE
+  (no register allocated;      ---------->    (register live in live_gp_;
+   slot may hold a value)      <----------     reg() is valid)
+```
+
+Transitions from DORMANT to ACTIVE:
+
+| Operation | Register action | Stack slot action | When to use |
+|-----------|-----------------|-------------------|-------------|
+| `prime()` | `alloc<Reg64>()` | no load emitted | First activation. Caller writes the initial value after calling prime(). |
+| `restore(cl)` | `alloc<Reg64>()` | emit `mov reg, [slot]` | Retrieve a value that was previously saved. |
+
+Transitions from ACTIVE to DORMANT:
+
+| Operation | Register action | Stack slot action | When to use |
+|-----------|-----------------|-------------------|-------------|
+| `save(cl)` | `free(reg)` | emit `mov [slot], reg` | Value was modified and must be persisted to the slot. |
+| `release()` | `free(reg)` | nothing | Value is unchanged since the last `save()`; slot is still valid; extra store is avoided. |
+
+`free()` is a terminal operation callable from either DORMANT or ACTIVE state.
+It frees the register if currently held and ends the alias lifetime.  It is
+symmetric with calling `rm.free(reg)` on a directly allocated register.
+
+For aliases with `needs_slot_ == false` (APX extended-register path): the
+register is allocated at `declare_alias` time and stays live for the full
+kernel duration.  `save`, `restore`, and `release` are all no-ops.  `prime()`
+must still be called for portability (the same call site works on non-APX
+systems where the alias resolves to the slotted path) but has no effect on
+the no-slot path.  `free()` is NOT a no-op -- it is the required call at
+end-of-kernel to return the register to the pool before `assert_all_free()`.
+
+### Internal State Changes
+
+**Additions to `RegPoolManager`:**
+
+```cpp
+struct AliasPendingDecl {
+    bool  needs_slot;
+    int   desired_idx;  // -1: anonymous (manager picks); >= 0: named register index
+};
+
+std::vector<AliasPendingDecl> pending_aliases_;
+
+// Returns true if register idx is currently in free_gp_regs.
+// Used by ManagedAlias::prime() to distinguish "pool owns it" from
+// "we own it in live_gp_".
+bool is_available_gp(int idx) const;
+```
+
+`pending_aliases_` is cleared by `reset()` along with all other manager state.
+
+**`CommittedLayout` additions:**
+
+```cpp
+// Emit: mov [rsp + alias_slot_offset(alias_id)], reg
+void alias_store(int alias_id, const Xbyak::Reg64 &reg);
+
+// Emit: mov reg, [rsp + alias_slot_offset(alias_id)]
+void alias_load(int alias_id, Xbyak::Reg64 &reg);
+```
+
+**`ManagedAlias` internal fields:**
+
+```cpp
+int            alias_id_;     // index into CommittedLayout alias offset table
+int            desired_idx_;  // -1 for anonymous
+bool           needs_slot_;
+bool           is_active_;
+Xbyak::Reg64   reg_;          // valid only when is_active_ == true
+RegPoolManager *rm_;          // back-pointer set at declare_alias time
+```
+
+`reg_` is mutable: for anonymous aliases it is updated on each `restore` call
+because the manager may assign a different physical register depending on what
+is currently free.
+
+### Proposed API
+
+#### `declare_alias` overloads (on `RegPoolManager`)
+
+```cpp
+// Named, always backed by a stack slot.
+// Register is not allocated at declaration time.
+// Collision detected at the first prime() or restore() call.
+ManagedAlias declare_alias(Xbyak::Reg64 reg);
+
+// Named, APX-aware: uses ext_reg on APX hardware (no stack slot);
+// falls back to primary_reg with a stack slot on non-APX hardware.
+// On the APX path, ext_reg is allocated immediately at declare time.
+ManagedAlias declare_alias(Xbyak::Reg64 primary_reg, Xbyak::Reg64 ext_reg);
+
+// Named, conditional: use_alt==true picks alt_reg (no slot);
+//                     use_alt==false picks primary_reg (slot).
+// Useful when the kernel can optionally use an unconstrained register
+// (e.g. rbp when no frame pointer is needed).
+ManagedAlias declare_alias(Xbyak::Reg64 primary_reg,
+                           Xbyak::Reg64 alt_reg,
+                           bool         use_alt);
+
+// Anonymous, always backed by a stack slot.
+// Manager picks the first free GP register at prime()/restore() time.
+// Required when multiple aliases must share the same physical register
+// in a time-multiplexed pattern (one active at a time, rest dormant).
+template <class RegT>
+ManagedAlias declare_alias();
+```
+
+All overloads append an `AliasPendingDecl` to `pending_aliases_` and return a
+`ManagedAlias`.  Stack slots are assigned when `make_stack_layout().build()` is
+called, exactly as with other `CommittedLayout` resources.
+
+Exception: the two-argument overload and the three-argument overload with
+`use_alt=true` call `alloc<Reg64>(desired_idx)` immediately when
+`needs_slot_=false`.  The register enters `live_gp_` at declaration time.
+
+#### `ManagedAlias` class
+
+```cpp
+class ManagedAlias {
+public:
+    // Returns the currently active register.
+    // Precondition: is_active() == true. Asserts or throws otherwise.
+    const Xbyak::Reg64 &reg() const;
+
+    // True when a stack slot was reserved for this alias.
+    // False on the APX no-slot path.
+    bool has_stack_slot() const;
+
+    // True when a register is currently allocated (ACTIVE state).
+    bool is_active() const;
+
+    // DORMANT -> ACTIVE: allocate register, emit no load.
+    // Use for first-time initialization; write the value to reg() after calling.
+    // No-op when has_stack_slot() == false and the register is already live
+    // in live_gp_ (i.e. prime() was already called and free() has not been
+    // called since).
+    // Re-allocates if has_stack_slot() == false and free() was previously
+    // called (desired_idx is re-allocated when it returns to free_gp_regs).
+    void prime();
+
+    // DORMANT -> ACTIVE: allocate register and load value from slot.
+    // Use to retrieve a value that was previously saved.
+    // No-op when has_stack_slot() == false.
+    void restore(CommittedLayout &cl);
+
+    // ACTIVE -> DORMANT: emit store to slot and free register.
+    // Use when the value in the register was modified and must be persisted.
+    // No-op when has_stack_slot() == false.
+    void save(CommittedLayout &cl);
+
+    // ACTIVE -> DORMANT: free register without emitting a store.
+    // Use when the value is unchanged since the last save(); the slot is
+    // still valid and the extra store is avoided.
+    // No-op when has_stack_slot() == false.
+    void release();
+
+    // Terminal: free register (if currently active) and end alias lifetime.
+    // Symmetric with rm.free(reg) for directly allocated registers.
+    // Callable from ACTIVE or DORMANT state.
+    // After free(), the alias must not be used without first re-calling prime().
+    // No-slot aliases (has_stack_slot() == false) MUST call free() before
+    // rm.assert_all_free() since their register stays in live_gp_ until
+    // explicitly freed here.
+    void free();
+};
+```
+
+### Implementation
+
+#### `prime` pseudocode
+
+Named aliases (both slotted and no-slot) use `is_available_gp()` as the branch
+condition rather than `needs_slot_`.  This handles re-prime after `free()` for
+no-slot aliases, where the register has been returned to `free_gp_regs` and
+must be re-allocated.
+
+```cpp
+void ManagedAlias::prime() {
+    if (desired_idx_ >= 0) {
+        // Named path: use pool membership to determine action.
+        if (rm_->is_available_gp(desired_idx_)) {
+            // Register is free -- allocate it.
+            // Covers: normal slotted first-use, and re-prime after free().
+            reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
+            is_active_ = true;
+            return;
+        }
+        // Register is not in the free pool.
+        if (!needs_slot_) return;  // no-slot: we own it in live_gp_ -- no-op
+        // Named slotted and register is live: double-prime or conflict.
+        RM_THROW(REG_IN_USE);
+    } else {
+        // Anonymous (always slotted): pick next free register.
+        assert(!is_active_);
+        reg_       = rm_->alloc<Xbyak::Reg64>();
+        is_active_ = true;
+        // No load emitted -- caller writes the initial value.
+    }
+}
+```
+
+Three outcomes for the named path:
+1. Register in free pool: allocate -- normal slotted first-use or re-prime
+   after `free()`.
+2. Register not in free pool, `needs_slot_=false`: the alias owns it in
+   `live_gp_` from `declare_alias` time -- no-op.
+3. Register not in free pool, `needs_slot_=true`: conflict -- throw.
+
+#### `restore` pseudocode
+
+```cpp
+void ManagedAlias::restore(CommittedLayout &cl) {
+    if (!needs_slot_) return;
+    assert(!is_active_);
+    if (desired_idx_ >= 0)
+        reg_ = rm_->alloc<Xbyak::Reg64>(desired_idx_);
+    else
+        reg_ = rm_->alloc<Xbyak::Reg64>();
+    is_active_ = true;
+    cl.alias_load(alias_id_, reg_);   // emit: mov reg_, [rsp+offset]
+}
+```
+
+#### `save` pseudocode
+
+```cpp
+void ManagedAlias::save(CommittedLayout &cl) {
+    if (!needs_slot_) return;
+    assert(is_active_);
+    cl.alias_store(alias_id_, reg_);  // emit: mov [rsp+offset], reg_
+    rm_->free(reg_);
+    is_active_ = false;
+}
+```
+
+#### `release` pseudocode
+
+```cpp
+void ManagedAlias::release() {
+    if (!needs_slot_) return;
+    assert(is_active_);
+    rm_->free(reg_);
+    is_active_ = false;
+    // No store emitted. Slot retains the value from the last save().
+}
+```
+
+#### `free` pseudocode
+
+```cpp
+void ManagedAlias::free() {
+    if (is_active_) {
+        rm_->free(reg_);
+        is_active_ = false;
+    }
+    // Slot content, if any, is now undefined.
+    // Re-prime is possible but not the expected usage pattern.
+}
+```
+
+For no-slot aliases `is_active_` is always true after `prime()`, so the
+`rm_->free()` call always executes, returning the register to `free_gp_regs`.
+For slotted aliases in DORMANT state the `if (is_active_)` guard short-circuits
+since the register is already back in the free pool.
+
+#### `build_layout` / `CommittedLayout` interaction
+
+`pending_aliases_` is iterated during `make_stack_layout().build()`.  Each
+entry with `needs_slot == true` gets an 8-byte slot in the frame, placed before
+anonymous `gp_park` slots:
+
+```
+[rsp + 0  ]  alias slot 0          (first needs_slot==true alias)
+[rsp + 8  ]  alias slot 1
+              ...
+[rsp + N  ]  gp park slot 0        (park / reload)
+[rsp + N+8]  gp park slot 1
+              ...
+[rsp + M  ]  volatile GP saves     (with_volatile_save)
+[rsp + P  ]  volatile vec saves
+[rsp + Q  ]  scratch               (.scratch(n))
+```
+
+Aliases with `needs_slot==false` do not consume frame space.
+
+### Usage Examples
+
+#### Example 1: time-multiplexed pointer aliases
+
+A kernel loads several buffer addresses from a parameter struct.  Not all can
+live in registers simultaneously; each is used in a distinct phase.
+
+```cpp
+class MultiBufferKernel : public CodeGenerator, public RegPoolManager {
+    ManagedAlias src_ptr_   = declare_alias<Reg64>();
+    ManagedAlias dst_ptr_   = declare_alias<Reg64>();
+    ManagedAlias scale_ptr_ = declare_alias<Reg64>();
+    ManagedAlias bias_ptr_  = declare_alias<Reg64>();
+
+    void generate() {
+        auto layout = make_stack_layout().build();
+        emit_prologue();
+
+        auto param = alloc<Reg64>();
+        // param holds the pointer to the params struct (e.g. from ABI arg reg).
+
+        // Load all named values once into their slots.
+        src_ptr_.prime();
+        mov(src_ptr_.reg(), ptr[param + 0]);
+        src_ptr_.save(layout);        // store to slot, free register
+
+        dst_ptr_.prime();
+        mov(dst_ptr_.reg(), ptr[param + 8]);
+        dst_ptr_.save(layout);
+
+        scale_ptr_.prime();
+        mov(scale_ptr_.reg(), ptr[param + 16]);
+        scale_ptr_.save(layout);
+
+        bias_ptr_.prime();
+        mov(bias_ptr_.reg(), ptr[param + 24]);
+        bias_ptr_.save(layout);
+
+        free(param);
+
+        // Phase 1: process with src and scale.
+        scale_ptr_.restore(layout);
+        src_ptr_.restore(layout);
+        // ... use src_ptr_.reg() and scale_ptr_.reg() ...
+        src_ptr_.release();    // read-only: slot still valid, no store needed
+        scale_ptr_.release();
+
+        // Phase 2: write output using dst and bias.
+        bias_ptr_.restore(layout);
+        dst_ptr_.restore(layout);
+        // ... write output using dst_ptr_.reg() and bias_ptr_.reg() ...
+        dst_ptr_.save(layout);   // modified: must persist
+        bias_ptr_.release();
+
+        // End-of-kernel cleanup.
+        src_ptr_.free();
+        dst_ptr_.free();
+        scale_ptr_.free();
+        bias_ptr_.free();
+        layout.destroy();
+        emit_epilogue();
+        ret();
+        assert_all_free();
+    }
+};
+```
+
+#### Example 2: APX extended-register alias
+
+On APX-capable hardware use a dedicated extended register (no stack slot,
+zero save/restore overhead).  On non-APX, fall back to a named GP register
+with a stack slot.  The use-site code is identical for both platforms.
+
+```cpp
+// Declaration (class member or local):
+ManagedAlias out_ptr = declare_alias(rax, r22);
+//   APX path:     r22 allocated at declare time; all lifecycle ops are no-ops
+//                 except free().
+//   non-APX path: rax used with a stack slot; full lifecycle applies.
+
+auto layout = make_stack_layout().build();
+
+// Initialization -- identical code on both paths.
+out_ptr.prime();
+mov(out_ptr.reg(), ptr[rdi + 0]);
+out_ptr.save(layout);   // APX: no-op; non-APX: mov [slot], rax; free rax
+
+// Use site -- identical code on both paths.
+out_ptr.restore(layout);          // APX: no-op; non-APX: alloc rax, load slot
+vmovaps(ptr[out_ptr.reg()], zmm0);
+out_ptr.release();                // APX: no-op; non-APX: free rax
+
+// End of kernel.
+out_ptr.free();           // APX: frees r22; non-APX: no-op (already dormant)
+layout.destroy();
+assert_all_free();
+```
+
+#### Example 3: conditional no-slot register
+
+Use an unconstrained register (rbp, when not needed as a frame pointer) on
+some code paths; fall back to a slot-backed register otherwise.  The use-site
+code is uniform across both paths.
+
+```cpp
+bool const use_rbp = !needs_frame_pointer();
+ManagedAlias loop_var = declare_alias(rcx, rbp, use_rbp);
+
+auto layout = make_stack_layout().build();
+loop_var.prime();
+xor_(loop_var.reg(), loop_var.reg());    // initialize counter to 0
+
+loop_var.save(layout);  // rbp path: no-op; rcx path: store slot, free rcx
+
+L("loop_top");
+// ... body that uses rcx for other work ...
+loop_var.restore(layout);
+inc(loop_var.reg());
+cmp(loop_var.reg(), trip_count);
+loop_var.save(layout);
+jl("loop_top");
+
+loop_var.free();
+```
+
+#### Example 4: read-once value with `release()` optimisation
+
+A configuration value loaded once at kernel start, read multiple times,
+never modified.  `release()` avoids the redundant store that `save()` would
+emit on every read-only use.
+
+```cpp
+ManagedAlias cfg = declare_alias<Reg64>();
+
+auto layout = make_stack_layout().build();
+cfg.prime();
+mov(cfg.reg(), ptr[rdi + 8]);    // load config pointer from params
+cfg.save(layout);                // store to slot, free register
+
+// Read-only use 1.
+cfg.restore(layout);             // alloc reg, load from slot
+mov(rax, ptr[cfg.reg() + 0]);   // read first field
+cfg.release();                   // free reg; NO store emitted -- slot still valid
+
+// Read-only use 2, later in the kernel.
+cfg.restore(layout);
+vmovaps(zmm0, ptr[cfg.reg() + 64]);
+cfg.release();                   // again: free without store
+
+// Each restore/release pair costs one load and zero stores.
+// restore/save would emit a redundant store on every read-only use.
+cfg.free();
+```
+
+### Notes / Interactions
+
+- **`assert_all_free()` and no-slot aliases** -- no-slot aliases hold their
+  register in `live_gp_` for the full kernel duration.  `assert_all_free()`
+  checks `live_gp_` for leaks.  Every no-slot alias must therefore have
+  `free()` called before `assert_all_free()`.  Slotted aliases in DORMANT
+  state have already freed their register via `save()` or `release()` and
+  need no extra call.
+
+- **`release()` vs `save()`** -- use `release()` when the register value has
+  not changed since the last `save()`, to avoid a redundant store.  Using
+  `release()` when the value WAS modified will silently discard the change;
+  the programmer is responsible for choosing correctly.
+
+- **Re-prime after `free()`** -- calling `prime()` after `free()` re-allocates
+  the register.  For named aliases this re-allocates the same index if it is
+  still free; if another allocation has taken it, `prime()` throws.  This is
+  not the intended usage pattern; `free()` is an end-of-lifetime call.
+
+- **`CommittedLayout` dependency** -- `save()` and `restore()` require the
+  `CommittedLayout` built from the same `make_stack_layout()` invocation that
+  the alias was registered under.
+
+- **Anonymous aliases and physical register identity** -- for anonymous aliases,
+  `reg()` may return a different physical register on each `restore()` call
+  depending on what is currently free.  Code that requires a stable register
+  index (e.g. constructing addresses from a known base) must use a named
+  overload instead.
+
+- **Collision detection timing** -- named slotted aliases detect conflicts at
+  `prime()`/`restore()` time.  Named no-slot aliases detect conflicts at
+  `declare_alias` time (the second call attempts to `alloc()` an already-live
+  register).
+
+---
+
+### Not Implemented: Anonymous APX-aware Allocation
+
+A fifth `declare_alias` overload was considered during design:
+
+```cpp
+// NOT IMPLEMENTED
+template <class RegT>
+ManagedAlias declare_alias(bool prefer_extended);
+```
+
+When `prefer_extended=true` and APX is available, this would allocate from
+r16-r31 and set `needs_slot=false`.  On non-APX it would fall back to a
+slot-backed allocation.
+
+**Why it was not included:**
+
+1. The anonymous overload exists specifically for time-multiplexing -- aliases
+   that are dormant some of the time and borrow a register only when active.
+   A slotless anonymous alias (permanently live) defeats this purpose.
+
+2. For the permanently-live APX case, `alloc<Reg64>()` already provides the
+   same outcome with less API surface.
+
+3. The `needs_slot_=false && desired_idx_==-1` internal state combination it
+   would require does not arise from any other overload, adding a special
+   branch for a single narrow case.
+
+4. Named APX-aware aliases (`declare_alias(rax, r22)`) cover the important
+   real-world case: existing code that hardcodes a legacy register but should
+   use a specific APX register when available.
+
+**When to revisit:** if a kernel needs many APX-dedicated aliases and the
+specific extended register indices are not important (the kernel wants the
+manager to assign r16, r17, r18 automatically), this overload would eliminate
+the need to manually assign specific indices.  Add it then, together with an
+`alloc_extended<RegT>()` primitive on `RegPoolManager`.
+
+## 27. Allow `make_stack_layout().build()` with no slots (empty layout)
+
+**Status:** Open
+
+**Problem:**
+
+`build()` currently throws `LAYOUT_SLOT_OOB` when the computed frame size is
+zero (i.e. no GP park, vec park, scratch, outgoing-args, or alias slots were
+declared).  This means callers must always add at least one slot just to get a
+valid `CommittedLayout` -- even when the only purpose of the layout is, for
+example, to use `emit_call()` with correct alignment, or to hold a
+`ManagedAlias` slot that was the sole reason for calling `build()`.
+
+The `managedAliasReset` test hits this directly: after `reset()` clears
+`pending_aliases_`, the test needs a valid layout to verify that no stale alias
+data survives into the new build.  It must add `.gp_parks(1)` purely to satisfy
+the non-zero check, not because the test logic requires a park slot.
+
+**Proposed change:**
+
+Remove the `if (total == 0)` guard that throws, and instead allow an empty
+layout with `total = 0` and a no-op `CommittedLayout`.  `destroy()` on an
+empty layout should emit no `add rsp` instruction (nothing was subtracted).
+
+**Impact on existing tests:**
+
+The `stackLayoutNegativeArgs` test includes `build_empty()` and asserts it
+throws.  That assertion would need to be removed or changed to
+`CYBOZU_TEST_NO_EXCEPTION` once empty layouts are allowed.
+
+**Considerations:**
+
+- `emit_call()` on a zero-size layout must still emit correct alignment (the
+  existing `managed_push_count_`-based logic already handles this independently
+  of the frame size).
+- `scratch_addr()`, `park()`, `reload()`, `outgoing_arg_addr()`,
+  `save_volatiles()`, `restore_volatiles()` on an empty layout should continue
+  to throw (slot count is 0, so any index is OOB).
+- `clean_stack()` should return `true` on an empty layout (nothing was pushed).

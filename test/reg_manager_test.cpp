@@ -37,6 +37,15 @@
  *   comprehensiveSaveRestore – multi-family volatile/preserved queries agree with totals
  *   (mark_unavailable/allFree/setCodeGenerator/prologue/emitCall groups)
  *   stackLayout*            – StackLayout / CommittedLayout two-phase stack management
+ *   managedAliasPatterns    – declare_alias overloads, has_stack_slot(), is_active()
+ *   managedAliasPrime       – prime() allocates named/anonymous register; conflict throws
+ *   managedAliasNoSlotActive – no-slot alias active immediately; prime() is a no-op
+ *   managedAliasFreeAndReprime – free() then prime() re-acquires the register
+ *   managedAliasReset       – reset() clears pending_aliases_; register usable again
+ *   managedAliasNoSlotNoop  – save/restore emit no code when has_stack_slot()==false
+ *   managedAliasSaveRestoreJIT – save/restore slot round-trip via JIT execution
+ *   managedAliasMixedWithParks – alias slot and GP park slot coexist in one layout
+ *   managedAliasAnonymous   – declare_alias<Reg64>() anonymous slot round-trip
  *
  * Build:
  *   # via CMake (from xbyak/test/build/):
@@ -3132,4 +3141,437 @@ CYBOZU_TEST_AUTO(stackLayoutMixedCalls)
     k.build();
     CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
                       (uint64_t)(210 + 1+2+3+4+5+6+7+8));
+}
+
+// =============================================================================
+// ManagedAlias tests
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Test -- declare_alias overload properties: slot-backed vs no-slot
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasPatterns)
+{
+    // Named alias on a specific register, always slot-backed; inactive until prime().
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(10));
+        CYBOZU_TEST_ASSERT(a.has_stack_slot());
+        CYBOZU_TEST_ASSERT(!a.is_active());
+        // reg() must throw before prime().
+        CYBOZU_TEST_EXCEPTION(a.reg(), Xbyak::RegManagerError);
+        // r10 is not reserved -- declare_alias does not lock it from alloc().
+        CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(10));
+        // general alloc is free to return r10.
+        auto r = rm.alloc<Reg64>(10);
+        CYBOZU_TEST_EQUAL(r.getIdx(), 10);
+        rm.free(r);
+    }
+
+    // APX-aware two-register form: APX target -> alt register, no slot, active immediately.
+    //                              non-APX    -> primary register, slot-backed, inactive.
+    {
+        RegPoolManager rm(g_cpu);
+        if (rm.has_apx()) {
+            auto b = rm.declare_alias(Reg64(10), Reg64(16));
+            CYBOZU_TEST_ASSERT(!b.has_stack_slot());
+            CYBOZU_TEST_ASSERT(b.is_active());
+            CYBOZU_TEST_EQUAL(b.reg().getIdx(), 16);
+            b.free();
+        } else {
+            auto b = rm.declare_alias(Reg64(10), Reg64(16));
+            CYBOZU_TEST_ASSERT(b.has_stack_slot());
+            CYBOZU_TEST_ASSERT(!b.is_active());
+        }
+    }
+
+    // Conditional form: use_alt=true -> alt register, no slot, active immediately.
+    {
+        RegPoolManager rm(g_cpu);
+        auto c = rm.declare_alias(Reg64(10), Reg64(11), true);
+        CYBOZU_TEST_ASSERT(!c.has_stack_slot());
+        CYBOZU_TEST_ASSERT(c.is_active());
+        CYBOZU_TEST_EQUAL(c.reg().getIdx(), 11);
+        c.free();
+    }
+
+    // Conditional form: use_alt=false -> primary register, slot-backed, inactive.
+    {
+        RegPoolManager rm(g_cpu);
+        auto c = rm.declare_alias(Reg64(10), Reg64(11), false);
+        CYBOZU_TEST_ASSERT(c.has_stack_slot());
+        CYBOZU_TEST_ASSERT(!c.is_active());
+        c.prime();
+        CYBOZU_TEST_ASSERT(c.is_active());
+        CYBOZU_TEST_EQUAL(c.reg().getIdx(), 10);
+        c.release();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test -- prime() allocates the register for a slot-backed alias
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasPrime)
+{
+    // Named slot alias: prime() allocates the named register.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(10));
+        CYBOZU_TEST_ASSERT(!a.is_active());
+
+        a.prime();
+
+        CYBOZU_TEST_ASSERT(a.is_active());
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+
+        // r10 is now live; a second named alloc must throw.
+        CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), Xbyak::RegManagerError);
+
+        a.release();
+        CYBOZU_TEST_ASSERT(!a.is_active());
+
+        // After release, r10 is back in the free pool.
+        auto r = rm.alloc<Reg64>(10);
+        CYBOZU_TEST_EQUAL(r.getIdx(), 10);
+        rm.free(r);
+    }
+
+    // Named slot alias: prime() when register taken by another allocation throws.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(10));
+        auto r10 = rm.alloc<Reg64>(10);  // take r10 first
+        CYBOZU_TEST_EXCEPTION(a.prime(), Xbyak::RegManagerError);
+        rm.free(r10);
+    }
+
+    // Anonymous slot alias: prime() picks any available GP.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias<Reg64>();
+        CYBOZU_TEST_ASSERT(!a.is_active());
+        a.prime();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        // reg() returns a valid register (index in [0,15]).
+        CYBOZU_TEST_ASSERT(a.reg().getIdx() < 16);
+        a.release();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test -- no-slot alias is active immediately; prime() is a no-op when active
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasNoSlotActive)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(10), Reg64(11), true);
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+
+    // prime() on an already-active no-slot alias is a no-op.
+    a.prime();
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+
+    a.free();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}
+
+// -----------------------------------------------------------------------------
+// Test -- free() and re-prime() round-trip
+// Note: This is not the expected usage pattern for ManagedAlias, but it is supported.
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
+{
+    // Slot-backed: prime -> free -> prime again.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(10));
+        a.prime();
+        CYBOZU_TEST_ASSERT(a.is_active());
+
+        a.free();
+        CYBOZU_TEST_ASSERT(!a.is_active());
+        // r10 is back in the free pool; other code can use it.
+        auto r = rm.alloc<Reg64>(10);
+        CYBOZU_TEST_EQUAL(r.getIdx(), 10);
+        rm.free(r);
+
+        // Re-prime.
+        a.prime();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+        a.free();
+    }
+
+    // No-slot: free -> prime re-acquires the same register.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(10), Reg64(11), true);
+        CYBOZU_TEST_ASSERT(a.is_active());
+
+        a.free();
+        CYBOZU_TEST_ASSERT(!a.is_active());
+
+        a.prime();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+        a.free();
+    }
+
+    // free() on inactive alias is a no-op.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(10));
+        CYBOZU_TEST_ASSERT(!a.is_active());
+        CYBOZU_TEST_NO_EXCEPTION(a.free();)
+        CYBOZU_TEST_ASSERT(!a.is_active());
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test -- reset() clears pending_aliases_; register is usable again
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasReset)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+    };
+
+    Kernel k;
+    // Declare a no-slot alias (r11 enters live_gp_).
+    auto a = k.declare_alias(Reg64(10), Reg64(11), true);
+    CYBOZU_TEST_ASSERT(a.is_active());
+    // r11 is live; alloc(11) must throw.
+    CYBOZU_TEST_EXCEPTION(k.alloc<Reg64>(11), Xbyak::RegManagerError);
+
+    k.CodeGenerator::reset();
+    k.RegPoolManager::reset();
+
+    // After reset, r11 is free again.
+    CYBOZU_TEST_NO_EXCEPTION(
+        auto r11 = k.alloc<Reg64>(11);
+        k.free(r11);
+    )
+
+    // pending_aliases_ cleared: a new build_layout produces an empty alias set.
+    CYBOZU_TEST_NO_EXCEPTION(
+        auto cl = k.make_stack_layout().gp_parks(1).build();
+        cl.destroy();
+    )
+    (void)a;
+}
+
+// -----------------------------------------------------------------------------
+// Test -- save/restore are no-ops when has_stack_slot() == false
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasNoSlotNoop)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto a = declare_alias(Reg64(10), Reg64(11), true);
+            CYBOZU_TEST_ASSERT(!a.has_stack_slot());
+
+            auto cl = make_stack_layout().gp_parks(1).build();
+
+            const size_t sz_before = getSize();
+            a.save(cl);     // must emit no instructions
+            a.restore(cl);  // must emit no instructions
+            const size_t sz_after = getSize();
+
+            CYBOZU_TEST_EQUAL(sz_before, sz_after);
+            // is_active stays true through no-op save/restore.
+            CYBOZU_TEST_ASSERT(a.is_active());
+
+            a.free();
+            cl.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
+
+// -----------------------------------------------------------------------------
+// Test -- slot-backed save/restore round-trip via JIT execution
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            // r10 is volatile on SysV; no prologue/epilogue needed.
+            auto a = declare_alias(Reg64(10));
+            auto cl = make_stack_layout().build();
+
+            a.prime();                          // allocate r10
+            mov(a.reg(), 0xABCD1234ULL);        // r10 = 0xABCD1234
+
+            a.save(cl);                         // [rsp+<off>] = r10; free r10
+            CYBOZU_TEST_ASSERT(!a.is_active());
+
+            // r10 is free; use it temporarily with a different value.
+            auto r_tmp = alloc<Reg64>(10);
+            mov(r_tmp, 0xDEADBEEFULL);
+            free(r_tmp);
+
+            a.restore(cl);                      // allocate r10; load from slot
+            CYBOZU_TEST_ASSERT(a.is_active());
+            CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+
+            mov(rax, a.reg());                  // rax = 0xABCD1234
+            a.release();
+
+            cl.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xABCD1234ULL);
+}
+
+// -----------------------------------------------------------------------------
+// Test -- alias slot and GP park slot coexist in the same layout
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto a = declare_alias(Reg64(10));
+            auto cl = make_stack_layout().gp_parks(1).build();
+
+            a.prime();
+
+            // Use r11 for the park slot.
+            auto park_reg = alloc<Reg64>(11);
+
+            mov(a.reg(),  0x1111111111111111ULL);
+            mov(park_reg, 0x2222222222222222ULL);
+
+            // Save both independently.
+            a.save(cl);               // alias slot <- r10
+            cl.park(park_reg, 0);     // gp park slot 0 <- r11; frees r11
+
+            // Clobber r10 (currently free) and r11 with different values.
+            auto r10_tmp = alloc<Reg64>(10);
+            auto r11_tmp = alloc<Reg64>(11);
+            mov(r10_tmp, 0ULL);
+            mov(r11_tmp, 0ULL);
+            free(r10_tmp);
+            free(r11_tmp);
+
+            // Restore both.
+            a.restore(cl);                       // r10 = 0x1111...
+            park_reg = cl.reload<Reg64>(0);      // r11 = 0x2222...
+
+            // Return sum: must equal 0x1111... + 0x2222... = 0x3333...
+            // Use park_reg as base so that if reload allocated rax, the
+            // subsequent mov(rax, a.reg()) does not clobber it first.
+            mov(rax, park_reg);
+            add(rax, a.reg());
+
+            a.release();
+            free(park_reg);
+            cl.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()),
+                      (uint64_t)0x1111111111111111ULL + 0x2222222222222222ULL);
+}
+
+// -----------------------------------------------------------------------------
+// Test -- anonymous alias: prime() picks any available GP
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasAnonymous)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto a = declare_alias<Reg64>();
+            auto cl = make_stack_layout().build();
+
+            CYBOZU_TEST_ASSERT(!a.is_active());
+            a.prime();
+            CYBOZU_TEST_ASSERT(a.is_active());
+
+            // Write a known value, save to slot, clobber, restore, read back.
+            const int idx = a.reg().getIdx();
+            mov(a.reg(), 0xCAFEBABEULL);
+            a.save(cl);
+
+            // Use the same physical register with a different value.
+            auto r_tmp = alloc<Reg64>(idx);
+            mov(r_tmp, 0ULL);
+            free(r_tmp);
+
+            a.restore(cl);
+            mov(rax, a.reg());
+            a.release();
+
+            cl.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xCAFEBABEULL);
+}
+
+// -----------------------------------------------------------------------------
+// Test -- release() skips the store; slot value from last save() survives
+//
+// Sequence:
+//   prime()                         r10 = uninitialized
+//   mov r10, 0xBEEFCAFE             write initial value
+//   save(cl)                        slot = 0xBEEFCAFE; r10 freed
+//   restore(cl)                     r10 = 0xBEEFCAFE (from slot)
+//   (value unchanged -- do NOT modify r10)
+//   release()                       r10 freed; NO store emitted
+//   restore(cl)                     r10 = slot value = 0xBEEFCAFE (not corrupted)
+//   mov rax, r10
+//   a.release()
+// Expected: 0xBEEFCAFE
+// -----------------------------------------------------------------------------
+CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto a = declare_alias(Reg64(10));
+            auto cl = make_stack_layout().build();
+
+            a.prime();
+            mov(a.reg(), 0xBEEFCAFEULL);
+
+            a.save(cl);                  // slot = 0xBEEFCAFE; r10 freed
+            CYBOZU_TEST_ASSERT(!a.is_active());
+
+            a.restore(cl);               // r10 = 0xBEEFCAFE
+            CYBOZU_TEST_ASSERT(a.is_active());
+
+            // Value not modified; release instead of save -- no store emitted.
+            a.release();
+            CYBOZU_TEST_ASSERT(!a.is_active());
+
+            // Slot must still hold the value written by save().
+            a.restore(cl);
+            CYBOZU_TEST_ASSERT(a.is_active());
+            CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+
+            mov(rax, a.reg());           // rax = 0xBEEFCAFE
+            a.release();
+
+            cl.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xBEEFCAFEULL);
 }

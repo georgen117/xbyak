@@ -760,7 +760,91 @@ public:
     // Forward declarations for the builder and committed types.
     class CommittedLayout;
 
-    // Builder — accumulates slot requirements before any code is emitted.
+    // A register alias managed by RegPoolManager.
+    //
+    // Lifecycle:
+    //   1. declare_alias(...)  -- created by RegPoolManager (no register allocated yet
+    //                             for slot-backed aliases; allocated immediately for
+    //                             no-slot aliases)
+    //   2. prime()             -- allocates the register (no-op for active no-slot aliases)
+    //   3. save(cl)            -- spill to stack slot and release register (slot path only)
+    //   4. restore(cl)         -- reload from slot and re-acquire register (slot path only)
+    //   5a. release()          -- release register without saving (slot path only)
+    //   5b. free()             -- release register (no-slot path; call before assert_all_free)
+    //
+    // save/restore are defined out-of-line after CommittedLayout is complete.
+    class ManagedAlias {
+    public:
+        // Returns the allocated register.  Asserts active state.
+        const Xbyak::Reg64 &reg() const {
+            if (!is_active_) RM_THROW_RET(RmError::GP_NOT_AVAILABLE, reg_)
+            return reg_;
+        }
+        bool has_stack_slot() const { return needs_slot_; }
+        bool is_active()      const { return is_active_; }
+
+        // Allocate the register from the pool.
+        // - Slot-backed: allocates the desired register (or any GP if anonymous).
+        // - No-slot: no-op if already active; re-allocates if previously freed.
+        // Throws GP_IN_USE if a named slot-backed register is not available.
+        void prime() {
+            if (desired_idx_ >= 0) {
+                if (rm_->is_available_gp(desired_idx_)) {
+                    reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
+                    is_active_ = true;
+                    return;
+                }
+                // No-slot path: we already own the register in live_gp_.
+                if (!needs_slot_) return;
+                // Named slot-backed register taken by another allocation.
+                RM_THROW(RmError::GP_IN_USE)
+            } else {
+                // Anonymous alias: pick any available GP register.
+                reg_       = rm_->alloc<Xbyak::Reg64>();
+                is_active_ = true;
+            }
+        }
+
+        // Spill to the stack slot and release the register.  Slot-backed only.
+        // Defined out-of-line after CommittedLayout.
+        void save(CommittedLayout &cl);
+
+        // Reload from the stack slot and re-acquire the register.  Slot-backed only.
+        // Defined out-of-line after CommittedLayout.
+        void restore(CommittedLayout &cl);
+
+        // Release the register back to the pool without saving.  Slot-backed only.
+        void release() {
+            if (!needs_slot_) return;
+            rm_->free(reg_);
+            is_active_ = false;
+        }
+
+        // Release the register back to the pool.  No-slot path: call before
+        // assert_all_free() to satisfy the "no live registers" invariant.
+        // Also works for slot-backed aliases as an unconditional drop.
+        void free() {
+            if (is_active_) {
+                rm_->free(reg_);
+                is_active_ = false;
+            }
+        }
+
+    private:
+        friend class RegPoolManager;
+        ManagedAlias(int alias_id, int desired_idx, bool needs_slot, RegPoolManager *rm)
+            : alias_id_(alias_id), desired_idx_(desired_idx),
+              needs_slot_(needs_slot), is_active_(false), rm_(rm) {}
+
+        int             alias_id_;
+        int             desired_idx_;  // -1: anonymous; >= 0: named register index
+        bool            needs_slot_;
+        bool            is_active_;
+        Xbyak::Reg64    reg_{0};
+        RegPoolManager *rm_;
+    };
+
+    // Builder -- accumulates slot requirements before any code is emitted.
     // All methods return *this for chaining.  No machine code is emitted until
     // build() is called.
     class StackLayout {
@@ -847,7 +931,8 @@ public:
                         int            vol_vec_slot_bytes,
                         bool           vol_save_declared,
                 ptrdiff_t      outgoing_arg_base = 0,
-                int            n_outgoing_args = 0)
+                int            n_outgoing_args = 0,
+                std::vector<ptrdiff_t> alias_offsets = {})
                 : rm_(&rm), gp_base_(gp_base), gp_count_(gp_count),
                   vec_base_(vec_base), vec_count_(vec_count),
                   vec_slot_bytes_(vec_slot_bytes),
@@ -859,7 +944,8 @@ public:
                   vol_save_declared_(vol_save_declared),
                   vol_save_armed_(false),
                   outgoing_arg_base_(outgoing_arg_base),
-                  n_outgoing_args_(n_outgoing_args) {
+                  n_outgoing_args_(n_outgoing_args),
+                  alias_offsets_(std::move(alias_offsets)) {
             if (!rm_->cg_) RM_THROW(RmError::NO_CG)
             rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
             rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
@@ -889,7 +975,8 @@ public:
                   outgoing_arg_base_(other.outgoing_arg_base_),
                   n_outgoing_args_(other.n_outgoing_args_),
                   actually_saved_gp_indices_(std::move(other.actually_saved_gp_indices_)),
-                  actually_saved_vec_indices_(std::move(other.actually_saved_vec_indices_)) {
+                  actually_saved_vec_indices_(std::move(other.actually_saved_vec_indices_)),
+                  alias_offsets_(std::move(other.alias_offsets_)) {
             other.rm_ = NULL;
         }
 
@@ -1087,6 +1174,26 @@ public:
             emit_call(reinterpret_cast<uint64_t>(func_ptr));
         }
 
+        // Store reg to the alias stack slot identified by alias_id.
+        // Used by ManagedAlias::save().  No-op if id out of range or no slot.
+        void alias_store(int alias_id, const Xbyak::Reg64 &reg) {
+            if (alias_id < 0 || alias_id >= static_cast<int>(alias_offsets_.size()))
+                return;
+            const ptrdiff_t off = alias_offsets_[alias_id];
+            if (off < 0) return;
+            rm_->cg_->mov(rm_->cg_->qword[rm_->cg_->rsp + off], reg);
+        }
+
+        // Load reg from the alias stack slot identified by alias_id.
+        // Used by ManagedAlias::restore().  No-op if id out of range or no slot.
+        void alias_load(int alias_id, Xbyak::Reg64 &reg) {
+            if (alias_id < 0 || alias_id >= static_cast<int>(alias_offsets_.size()))
+                return;
+            const ptrdiff_t off = alias_offsets_[alias_id];
+            if (off < 0) return;
+            rm_->cg_->mov(reg, rm_->cg_->qword[rm_->cg_->rsp + off]);
+        }
+
     private:
         RegPoolManager *rm_;
         ptrdiff_t gp_base_;
@@ -1111,6 +1218,7 @@ public:
         // to emit loads for exactly the same set.
         std::vector<int> actually_saved_gp_indices_;
         std::vector<int> actually_saved_vec_indices_;
+        std::vector<ptrdiff_t> alias_offsets_;
 
         void check_gp_slot(int idx) const {
             if (idx < 0 || idx >= gp_count_)
@@ -1194,6 +1302,54 @@ public:
         return StackLayout(*this);
     }
 
+    // Declare a named alias on a specific register, always backed by a stack slot.
+    // The register is not allocated until prime() is called.
+    // Call save(cl)/restore(cl) to spill/reload across time-sharing boundaries.
+    ManagedAlias declare_alias(const Xbyak::Reg64 &reg) {
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({true, reg.getIdx()});
+        return ManagedAlias(id, reg.getIdx(), true, this);
+    }
+
+    // Declare a named alias selecting between two registers based on APX support.
+    // On APX-capable targets: use alt_reg with no stack slot (register allocated
+    // immediately and held for the kernel lifetime; free() before assert_all_free).
+    // On base targets: use primary_reg with a stack slot.
+    ManagedAlias declare_alias(const Xbyak::Reg64 &primary_reg,
+                               const Xbyak::Reg64 &alt_reg) {
+        return declare_alias(primary_reg, alt_reg, has_apx_);
+    }
+
+    // Declare a named alias with a caller-supplied selection flag.
+    // use_alt == true  -> alt_reg, no stack slot; register allocated immediately.
+    // use_alt == false -> primary_reg, stack-backed; allocated at prime().
+    ManagedAlias declare_alias(const Xbyak::Reg64 &primary_reg,
+                               const Xbyak::Reg64 &alt_reg,
+                               bool use_alt) {
+        const int id = static_cast<int>(pending_aliases_.size());
+        if (use_alt) {
+            pending_aliases_.push_back({false, alt_reg.getIdx()});
+            ManagedAlias a(id, alt_reg.getIdx(), false, this);
+            a.reg_       = alloc<Xbyak::Reg64>(alt_reg.getIdx());
+            a.is_active_ = true;
+            return a;
+        } else {
+            pending_aliases_.push_back({true, primary_reg.getIdx()});
+            return ManagedAlias(id, primary_reg.getIdx(), true, this);
+        }
+    }
+
+    // Declare an anonymous slot-backed alias.  RegT must be Xbyak::Reg64.
+    // The register is chosen at prime() time from whatever GP is free then.
+    template <class RegT>
+    ManagedAlias declare_alias() {
+        static_assert(std::is_same<RegT, Xbyak::Reg64>::value,
+                      "ManagedAlias only supports Xbyak::Reg64");
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({true, -1});
+        return ManagedAlias(id, -1, true, this);
+    }
+
     // build() is defined here so it can reference CommittedLayout's constructor.
     // Called by StackLayout::build() which delegates here after computing layout.
     CommittedLayout build_layout(int gp_count, int vec_count,
@@ -1243,6 +1399,19 @@ public:
             outgoing_arg_base = 0;      // overflow args start at [rsp+0]
 #endif
             cursor += static_cast<ptrdiff_t>(outgoing_args) * 8;
+        }
+
+        // Alias slots come next, one 8-byte slot per slot-backed alias.
+        // No-slot aliases (no-stack path) record offset -1.
+        std::vector<ptrdiff_t> alias_offsets;
+        alias_offsets.reserve(pending_aliases_.size());
+        for (const auto &decl : pending_aliases_) {
+            if (decl.needs_slot) {
+                alias_offsets.push_back(cursor);
+                cursor += 8;
+            } else {
+                alias_offsets.push_back(ptrdiff_t(-1));
+            }
         }
 
         const ptrdiff_t gp_base = cursor;
@@ -1313,7 +1482,8 @@ public:
                                vec_slot, scratch_base, scratch_bytes, total,
                                std::move(vol_gps), vol_gp_base,
                                std::move(vol_vecs), vol_vec_base, vec_slot,
-                               with_vol, outgoing_arg_base, outgoing_args);
+                               with_vol, outgoing_arg_base, outgoing_args,
+                               std::move(alias_offsets));
     }
 
     // helper methods to query APX support
@@ -1408,6 +1578,7 @@ public:
         managed_push_count_ = 0;
         allocated_stack_space_ = 0;
         layout_active_ = false;
+        pending_aliases_.clear();
     }
 
     // Emits a push instruction for each callee-saved GP register promoted by
@@ -1818,6 +1989,19 @@ private:
     }
 #endif
 
+    // Pending alias declarations recorded before build_layout() is called.
+    // Each element captures the needs_slot flag and the desired register index.
+    struct AliasPendingDecl {
+        bool needs_slot;
+        int  desired_idx;  // -1: anonymous; >= 0: named register index
+    };
+    std::vector<AliasPendingDecl> pending_aliases_;
+
+    // Returns true if the GP register at the given index is currently free.
+    bool is_available_gp(int idx) const {
+        return free_gp_regs.count(idx) != 0;
+    }
+
     std::set<int> live_gp_;
     std::set<int> free_gp_regs = base_free_gp();
     std::set<int> preserved_gp = base_preserved_gp();
@@ -1935,5 +2119,27 @@ private:
 };
 
 } // namespace Xbyak
+
+// Out-of-line definitions for ManagedAlias methods that reference CommittedLayout.
+// These must appear after the full definition of RegPoolManager::CommittedLayout.
+
+inline void Xbyak::RegPoolManager::ManagedAlias::save(
+        Xbyak::RegPoolManager::CommittedLayout &cl) {
+    if (!needs_slot_) return;
+    cl.alias_store(alias_id_, reg_);
+    rm_->free(reg_);
+    is_active_ = false;
+}
+
+inline void Xbyak::RegPoolManager::ManagedAlias::restore(
+        Xbyak::RegPoolManager::CommittedLayout &cl) {
+    if (!needs_slot_) return;
+    if (desired_idx_ >= 0)
+        reg_ = rm_->alloc<Xbyak::Reg64>(desired_idx_);
+    else
+        reg_ = rm_->alloc<Xbyak::Reg64>();
+    is_active_ = true;
+    cl.alias_load(alias_id_, reg_);
+}
 
 #endif // XBYAK_REG_MANAGER_HPP
