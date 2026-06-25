@@ -74,9 +74,9 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 15. ABI Configuration: Windows x64 vs SysV *(REJECTED — see §15)*
 - [x] 16. Manager `reset()` to Complement `CodeGenerator::reset()`
 - [x] 17. Accept External `Xbyak::util::Cpu` Reference
-- [x] 18. `emit_call()` — ABI-correct Outgoing Calls (Shadow Space + Alignment) *(REVIEW NOTES — see §18)*
-  - [x] 18a. Add debug assertion when `rax` is currently allocated at `emit_call()` invocation
-  - [o]18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented *(REJECTED — see §18)*
+- [x] 18. `emit_call()` -- ABI-correct Outgoing Calls (Shadow Space + Alignment)
+  - [o] 18a. Debug assertion for rax liveness at `emit_call()` *(REJECTED -- false positive; see §18)*
+  - [o] 18b. Deprecate `extra_pushes` once `save_volatiles()` (§20) is implemented *(REJECTED -- see §18)*
 - [x] 19. Stack Integrity Checks: `clean_stack()` / `assert_clean_stack()` / `spill_stack_empty()` / `assert_spill_stack_empty()`
 - [x] 20. Save/Restore Live Volatile Registers: `save_volatiles()` / `restore_volatiles()`
 - [x] 21. Pool Count Queries: `free_gp_count()`, `free_vec_count()`, etc. *(REJECTED — see §21)*
@@ -2145,27 +2145,25 @@ any additional pushes the manager has not seen.
 ```cpp
 // Emit an ABI-correct call to a runtime C function.
 //
-// func_ptr       — address of the target function (loaded into a scratch register
-//                  by the manager; rax is used as a scratch register internally).
-// extra_pushes   — number of manual push instructions the caller emitted that
-//                  the manager has not tracked (default: 0).  Used to compute
-//                  the correct alignment and shadow space adjustment.
+// func_ptr     -- address of the target function.
+// extra_pushes -- number of manual push instructions the caller emitted that
+//                 the manager has not tracked (default: 0).  Used to compute
+//                 the correct alignment and shadow space adjustment.
 //
-// What emit_call() emits (Win64):
-//   sub  rsp, adj        ; adj = 32 + (8 if alignment pad needed)
-//   mov  rax, func_ptr
-//   call rax
-//   add  rsp, adj
+// Near-call path (target within +-2 GB, or auto-grow mode):
+//   [sub rsp, adj]     ; only if alignment pad / shadow space needed
+//   call rel32         ; direct relative call -- no register consumed
+//   [add rsp, adj]
 //
-// What emit_call() emits (SysV):
-//   [sub rsp, 8]         ; only if alignment pad needed
-//   mov  rax, func_ptr
+// Far-call path (target > 2 GB away, fixed-size buffer only):
+//   [sub rsp, adj]
+//   mov  rax, func_ptr   ; rax holds the target address for the indirect call
 //   call rax
-//   [add rsp, 8]         ; matching restore
+//   [add rsp, adj]
 //
 // Returns: nothing.  The caller reads the return value from rax as usual.
 //
-// Throws ERR_RM_NO_CG if cg_ is null.
+// Throws RmError::NO_CG if cg_ is null.
 void emit_call(uint64_t func_ptr, size_t extra_pushes = 0);
 
 // Convenience overload: accept a typed function pointer directly.
@@ -2241,38 +2239,32 @@ of `emit_call()` is the acceptance criterion for completing §18.
 
 ### Notes
 
-- `emit_call()` uses `rax` as a scratch register to load the function address
-  (matching the pattern the tests already use). Since `rax` is volatile on both
-  ABIs, this is always safe — the callee is free to clobber it anyway.
+- The near-call path emits `call rel32` (the same encoding compilers produce for
+  `call my_func`) -- no register is consumed and `rax` is left untouched.
+  The far-call path (target > 2 GB from the JIT buffer, fixed-size buffers only)
+  loads `func_ptr` into `rax` then calls it; `rax` is volatile and always clobbered
+  by the return value in both SysV and Win64, so this is always safe.
 - If §9 (`emit_prologue`) is in use, the manager already knows how many callee-save
   pushes it emitted; `managed_push_count_` tracks this. The `extra_pushes` parameter
   covers any additional manual pushes the caller emits outside of manager control
   (e.g. `push(rbx)` to stash a return value).
 - On SysV, the most common call sites after `emit_prologue()` will have
   `extra_pushes == 0` and an odd `managed_push_count_`, meaning no adjustment is
-  needed at all and `emit_call()` reduces to a plain `call rax` with no `sub`/`add`.
-- The function pointer is loaded via `mov rax, imm64` even on SysV. For
-  position-independent code compiled with `-fPIC`, the target function must be
-  reachable via an absolute address; this is always the case for statically-linked
-  helper functions and PLT-resolved library symbols whose abs address is known at
-  JIT construction time.
+  needed at all and `emit_call()` reduces to a plain `call rel32` with no `sub`/`add`.
 
-> **REVIEW NOTES §18a / §18b — `extra_pushes` Is Fragile; `rax` Use Is Unguarded**
+> **REVIEW NOTES §18a / §18b**
 >
-> 1. `emit_call()` loads the function address with `mov rax, func_ptr`. If the
->    developer has allocated rax and has live data in it, this instruction silently
->    destroys that data. Since rax is volatile the ABI is not violated, but the
->    developer’s value is gone with no warning. A debug-build assertion when rax is
->    currently allocated at the point `emit_call()` is invoked would catch this.
+> **§18a -- Debug assertion for rax liveness (REJECTED -- false positive):**
+> Proposed: add a debug-build assertion that `rax` is not currently live when
+> `emit_call()` is invoked, since both ABIs guarantee the return value clobbers
+> `rax`. Attempted. Fires a false positive in `dynamicSaveRestore`, where `rax`
+> is validly allocated by the manager, pushed to the stack inside the caller's
+> save loop, then `emit_call()` is invoked. The manager cannot distinguish
+> "live and unsaved (bug)" from "live and saved on the stack (valid)" because
+> `extra_pushes` is a count, not a list of which registers were pushed.
+> Assertion removed.
 >
-> 2. `extra_pushes` exists because the developer may have manually emitted push
->    instructions that the manager did not observe. If the count is wrong by 1, the
->    stack is silently misaligned and the `call` lands at the wrong address. This is
->    strictly more dangerous than the current manual approach, which makes the alignment
->    computation visible. The correct fix is to eliminate the need for `extra_pushes`
->    entirely by routing all push-generating operations through the manager — which is
->    what `save_volatiles()` (§20) provides.
->    **§18b — REJECTED:**
+> **§18b -- `extra_pushes` deprecation (REJECTED):**
 >    `extra_pushes` cannot be deprecated because raw `CodeGenerator::push()` calls are
 >    always invisible to the manager. `extra_pushes` is a permanent escape hatch. Normal
 >    usage should route all pushes through `spill()`, `emit_prologue()`, or `save_volatiles()`

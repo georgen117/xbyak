@@ -864,8 +864,9 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             // Attach this code generator so emit_call can emit the platform-correct
             // alignment adjustment and Win64 shadow space into this code stream.
             rm.set_code_generator(this);
-            // Use rbx as a temporary to hold the function return value.
-            // rbx is callee-saved, so we must save/restore it ourselves.
+            // Exclude rbx from the manager so it cannot appear in get_live_gps();
+            // we manage it manually as a stash for the call return value.
+            rm.mark_unavailable(rbx);
             push(rbx);
 
             auto r1 = rm.alloc<Reg64>();
@@ -874,20 +875,13 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
             auto r4 = rm.alloc<Reg64>();
             mov(r1, 100);  mov(r2, 200);  mov(r3, 300);  mov(r4, 400);
 
-            // Ask the manager which registers are live — generate save code.
+            // Ask the manager which registers are live - generate save code.
             auto in_use = rm.get_live_gps();
             for (int idx : in_use) push(Reg64(idx));
 
-            // emit_call handles 16-byte alignment and the Win64 shadow space on all
-            // platforms.  managed_push_count_ accounts for the outer push(rbx).
-            // All live registers (including rax) are already pushed above.
-            // rax is free to use as a call-target scratch register.
-            // Do not use rm.emit_call() here because rax is tracked as live
-            // by the manager (it is one of r1..r4), which would trip the
-            // emit_call safety assert.  The test manages saves/restores
-            // manually so a direct call is correct.
-            mov(rax, reinterpret_cast<uint64_t>(&call_function_that_clobbers_registers));
-            call(rax);
+            // extra_pushes = 1 (push rbx above) + in_use.size() (save loop above)
+            // so emit_call computes the correct 16-byte alignment pad.
+            rm.emit_call(&call_function_that_clobbers_registers, 1 + in_use.size());
             mov(rbx, rax);  // stash the return value (210) in rbx
 
             // Generate restore code in reverse order.
@@ -900,8 +894,9 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
                 add(rax, Reg64(in_use[i]));
             add(rax, rbx);  // add the function's return value (210)
 
-            pop(rbx);  // restore original rbx
+            pop(rbx);
             rm.free(r1);  rm.free(r2);  rm.free(r3);  rm.free(r4);
+            rm.mark_available(rbx);
             ret();
         }
 
@@ -1198,7 +1193,10 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
 
         void gen(RegPoolManager &rm) {
             rm.set_code_generator(this);
-            push(rbx);  // rbx is callee-saved; we use it to stash the call result
+            // Exclude rbx from the manager so it cannot appear in get_live_volatile_gps();
+            // we manage it manually as a stash for the call return value.
+            rm.mark_unavailable(rbx);
+            push(rbx);
 
             auto r1 = rm.alloc<Reg64>();
             auto r2 = rm.alloc<Reg64>();
@@ -1206,18 +1204,13 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             mov(r1, 100);  mov(r2, 200);  mov(r3, 300);
 
             // Optionally grab one preserved register.
+            // (rbx is excluded via mark_unavailable above, so preserved_list will not contain it)
             auto preserved_list = rm.get_preserved_gps();
             Reg64 r4(0);
             bool have_preserved = false;
             if (!preserved_list.empty()) {
-                // skip rbx (idx 3) since we already pushed it manually
-                for (int idx : preserved_list) {
-                    if (idx != rbx.getIdx()) {
-                        r4 = rm.alloc<Reg64>(idx);
-                        have_preserved = true;
-                        break;
-                    }
-                }
+                r4 = rm.alloc<Reg64>(preserved_list[0]);
+                have_preserved = true;
             }
             if (have_preserved) mov(r4, 400);
 
@@ -1225,12 +1218,9 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             auto volatile_regs = rm.get_live_volatile_gps();
             for (int idx : volatile_regs) push(Reg64(idx));
 
-            // Volatile registers (including rax if allocated) are already pushed
-            // above.  Do not use rm.emit_call() because rax may be tracked as
-            // live by the manager, which would trip the emit_call safety assert.
-            // The test manages saves/restores manually, so a direct call is correct.
-            mov(rax, reinterpret_cast<uint64_t>(&call_function_that_clobbers_registers));
-            call(rax);
+            // extra_pushes = 1 (push rbx above) + volatile_regs.size() (save loop above)
+            // so emit_call computes the correct 16-byte alignment pad.
+            rm.emit_call(&call_function_that_clobbers_registers, 1 + volatile_regs.size());
             mov(rbx, rax);  // stash return value (210)
 
             // Restore only volatile registers (in reverse order).
@@ -1247,6 +1237,7 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             rm.free(r1);  rm.free(r2);  rm.free(r3);
             if (have_preserved) rm.free(r4);
             pop(rbx);
+            rm.mark_available(rbx);
             ret();
         }
     };
@@ -2044,13 +2035,12 @@ CYBOZU_TEST_AUTO(emitCall)
                 emit_prologue();
 
                 // Release volatile registers before emit_call.  Their values are
-                // not needed after the call, and emit_call asserts that rax
-                // (index 0) is not live so it can safely return a value there.
+                // not needed after the call; rax will hold the return value.
                 for (auto &r : v) RegPoolManager::free(r);
 
                 // total_pushes = 1 (odd) -> no alignment pad on SysV,
                 // 32-byte shadow space only on Win64.
-                emit_call(&call_function_that_clobbers_registers);
+                emit_call(&call_function_that_clobbers_registers, 0);
                 // rax = 210 on return.
 
                 RegPoolManager::free(r_pres);
@@ -2063,6 +2053,59 @@ CYBOZU_TEST_AUTO(emitCall)
         k.build();
         CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
     }
+
+    // Near-call path with execution verification:
+    // A tiny JIT-compiled callee is used instead of a C library function.
+    // Both the callee and the AutoGrowKernel caller are allocated by
+    // CodeGenerator (via the same OS allocator), so they occupy the same
+    // mmap / VirtualAlloc region.  The rel32 displacement is always
+    // within int32 range on any OS, making this test machine-independent.
+    //
+    // Note: any C function (in the test binary or in the C runtime) maybe
+    // too far from the JIT buffer to use as a near-call target.
+    // A JIT callee avoids that constraint entirely.
+    //
+    // The callee uses "mov eax, 210; ret" which is ABI-neutral: both
+    // Win64 and SysV AMD64 return integer values in rax, and the stub
+    // takes no arguments and touches no preserved registers.
+    {
+        // Callee: standalone JIT stub that returns 210.
+        struct SimpleCallee : CodeGenerator {
+            SimpleCallee() : CodeGenerator(256) {
+                mov(eax, 210);
+                ret();
+            }
+        };
+
+        struct AutoGrowKernel : CodeGenerator, RegPoolManager {
+            AutoGrowKernel()
+                : CodeGenerator(4096, Xbyak::AutoGrow),
+                  RegPoolManager(g_cpu, this) {}
+            void build(uint64_t callee_addr) {
+                emit_prologue();
+                // No scratch argument -- auto-grow mode always takes the
+                // near-call path (call rel32).  Does not consume any register.
+                emit_call(callee_addr);
+                emit_epilogue();
+                ret();
+                calcJmpAddress();  // patch call rel32 displacement
+            }
+        };
+
+        SimpleCallee callee;
+        AutoGrowKernel k;
+        CYBOZU_TEST_NO_EXCEPTION(
+            k.build(reinterpret_cast<uint64_t>(callee.getCode())));
+        // AUTO_GROW buffers are mmap'd RW only (no exec).  Make executable
+        // before calling into the generated code.
+        k.setProtectModeRE();
+        CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)210);
+    }
+
+    // NOTE: the far-call path (target > 2 GB from JIT buffer) is not tested
+    // here.  Whether that condition holds depends on where the OS places the
+    // JIT buffer relative to the C runtime, which cannot be relied on in a
+    // portable test.  The path is covered by code inspection.
 }
 
 
@@ -2443,7 +2486,7 @@ CYBOZU_TEST_AUTO(stackLayoutVolatileSaveOrderIndependent)
 
             // save_volatiles() must save rdi even though it was not live at build().
             CYBOZU_TEST_NO_EXCEPTION(cl.save_volatiles());
-            CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers));
+            CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers, 0));
             CYBOZU_TEST_NO_EXCEPTION(cl.restore_volatiles());
 
             free(r);
@@ -2494,7 +2537,7 @@ CYBOZU_TEST_AUTO(stackLayoutEmitCallAlignment)
             // emit_call must add 8 bytes padding to align to 16.
 
             // Just verify it emits without throwing.
-            CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers));
+            CYBOZU_TEST_NO_EXCEPTION(emit_call(&call_function_that_clobbers_registers, 0));
 
             cl.destroy();
             free(rbx_r);
@@ -2804,7 +2847,7 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
 #else
                 mov(rdi, 10); mov(rsi, 20); mov(rdx, 30); mov(rcx, 40);
 #endif
-                emit_call(&spill_test_sum4); // rax = 10+20+30+40 = 100
+                emit_call(&spill_test_sum4, 0); // rax = 10+20+30+40 = 100
 
                 // Reload the preserved values.
                 r_ka = cl.reload<Reg64>(0);
@@ -2893,7 +2936,7 @@ CYBOZU_TEST_AUTO(stackLayoutSpillEquivalent)
                 mov(rcx, 2);     // count (arg4)
 #endif
                 // rax = 100 + 200 + 300 + 400 = 1000
-                emit_call(&spill_test_sum_indirect);
+                emit_call(&spill_test_sum_indirect, 0);
 
                 cl.destroy();
                 emit_epilogue();
@@ -3354,7 +3397,9 @@ CYBOZU_TEST_AUTO(managedAliasReset)
         k.free(r11);
     )
 
-    // pending_aliases_ cleared: a new build_layout produces an empty alias set.
+    // pending_aliases_ cleared: build() succeeds without stale alias data.
+    // gp_parks(1) provides the minimum frame content (build() throws on an
+    // empty layout when no alias or park slots exist).
     CYBOZU_TEST_NO_EXCEPTION(
         auto cl = k.make_stack_layout().gp_parks(1).build();
         cl.destroy();
@@ -3401,7 +3446,7 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
     struct Kernel : CodeGenerator, RegPoolManager {
         Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
         void build() {
-            // r10 is volatile on SysV; no prologue/epilogue needed.
+            // r10 is volatile on SysV and Microsoft x64; no prologue/epilogue needed.
             auto a = declare_alias(Reg64(10));
             auto cl = make_stack_layout().build();
 
@@ -3525,18 +3570,6 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
 
 // -----------------------------------------------------------------------------
 // Test -- release() skips the store; slot value from last save() survives
-//
-// Sequence:
-//   prime()                         r10 = uninitialized
-//   mov r10, 0xBEEFCAFE             write initial value
-//   save(cl)                        slot = 0xBEEFCAFE; r10 freed
-//   restore(cl)                     r10 = 0xBEEFCAFE (from slot)
-//   (value unchanged -- do NOT modify r10)
-//   release()                       r10 freed; NO store emitted
-//   restore(cl)                     r10 = slot value = 0xBEEFCAFE (not corrupted)
-//   mov rax, r10
-//   a.release()
-// Expected: 0xBEEFCAFE
 // -----------------------------------------------------------------------------
 CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
 {

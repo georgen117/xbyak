@@ -1130,42 +1130,39 @@ public:
                                  + static_cast<ptrdiff_t>(n) * 8];
         }
 
-        // Emit a call to func_ptr with automatic ABI correctness.
+        // Emit an ABI-correct call to a runtime C function.
         //
         // Two behaviours depending on how the layout was built:
         //
-        // — with_outgoing_args(n) declared:
-        //     Emits only "mov rax, func; call rax" — no sub/add rsp.
-        //     build() computed the frame total so that rsp is already 16-byte
-        //     aligned at this call instruction.  Win64 shadow space is included
-        //     in the frame total.  Write overflow arguments to
-        //     outgoing_arg_addr(0..n-1) and load register arguments before
-        //     calling.
+        // -- with_outgoing_args(n) declared:
+        //     rsp is already 16-byte aligned (and Win64 shadow space allocated)
+        //     by build().  Emits only the call instruction itself.
         //
-        // — with_outgoing_args() not declared:
+        // -- with_outgoing_args() not declared:
         //     Delegates to RegPoolManager::emit_call(), which emits the standard
-        //     "sub rsp, adj; mov rax, func; call rax; add rsp, adj" sequence.
-        //     Use this form for calls whose arguments all fit in registers.
+        //     sub/call/add alignment sequence.
         //
-        // rax will be clobbered in both cases (used to hold the function address).
+        // Both paths prefer a direct near call (call rel32) that consumes no
+        // register.  On the rare far-call path (target > 2 GB from JIT buffer)
+        // rax is loaded with the target address for the indirect call; it is
+        // volatile and always clobbered by the return value in both SysV and Win64.
         void emit_call(uint64_t func_ptr) {
             if (!rm_ || !rm_->cg_) RM_THROW(RmError::NO_CG)
             if (n_outgoing_args_ > 0) {
-                // Bare call — rsp already aligned by build().
-#ifndef NDEBUG
-                if (rm_->live_gp_.count(0)) {
-                    fprintf(stderr,
-                            "CommittedLayout::emit_call: rax (index 0) is currently allocated — "
-                            "its value will be destroyed. Park it before calling.\n");
-                    assert(!rm_->live_gp_.count(0) &&
-                           "CommittedLayout::emit_call: rax is live and will be clobbered");
+                // Bare call -- rsp already aligned by build().
+                const uint8_t *target =
+                    reinterpret_cast<const uint8_t *>(func_ptr);
+                const intptr_t disp = target - (rm_->cg_->getCurr() + 5);
+                if (rm_->cg_->isAutoGrow() ||
+                        Xbyak::inner::IsInInt32(static_cast<uint64_t>(disp))) {
+                    rm_->cg_->call(target);
+                } else {
+                    rm_->cg_->mov(rm_->cg_->rax, func_ptr);
+                    rm_->cg_->call(rm_->cg_->rax);
                 }
-#endif
-                rm_->cg_->mov(rm_->cg_->rax, func_ptr);
-                rm_->cg_->call(rm_->cg_->rax);
             } else {
-                // Standard call — delegate to manager for sub/add alignment.
-                rm_->emit_call(func_ptr);
+                // Standard call -- delegate to manager for sub/add alignment.
+                rm_->emit_call(func_ptr, 0);
             }
         }
 
@@ -1455,7 +1452,7 @@ public:
         //   CommittedLayout::emit_call() is a bare "mov rax; call rax" with no sub/add.
         //   For rsp to be 16-aligned at the call instruction:
         //     rsp_at_call = rsp_entry − 8·P − total   (P = managed_push_count_)
-        //     rsp_entry = 16k − 8  (C caller's call pushed 8-byte return addr)
+        //     rsp_entry = 16k - 8  (caller's call pushed 8-byte return addr)
         //   Solving: (8 + 8P + total) % 16 == 0
         //     P even  → total ≡  8 (mod 16)
         //     P odd   → total ≡  0 (mod 16)  ← same as normal rounding
@@ -1645,44 +1642,56 @@ public:
     // Handles 16-byte stack alignment and (on Windows x64) the 32-byte shadow
     // space requirement automatically.
     //
-    // func_ptr — address of the target function.
+    // func_ptr     -- address of the target function.
+    // extra_pushes -- number of manual push instructions the caller emitted
+    //                 that the manager has not tracked (default: 0).  Used to
+    //                 compute the correct 16-byte alignment pad.  Pass this
+    //                 for any raw push() calls made directly on the CodeGenerator
+    //                 since the last emit_prologue() / reset().
     //
-    // Return-value note: emit_call() uses rax internally (mov rax, func_ptr;
-    //                call rax).  If rax is currently allocated, its value will
-    //                be destroyed.  Park it with CommittedLayout::park() before
-    //                the call and reload it afterwards.
+    // Near-call path (target within +-2 GB, or auto-grow mode):
+    //   [sub rsp, adj]     ; only if alignment pad / shadow space needed
+    //   call rel32         ; direct relative call -- no register consumed
+    //   [add rsp, adj]
     //
-    // In debug builds (NDEBUG not defined): asserts that rax is not currently
-    //                allocated and prints a diagnostic to stderr if it is.
+    // Far-call path (target > 2 GB away, fixed-size buffer only):
+    //   [sub rsp, adj]
+    //   mov  rax, func_ptr   ; rax holds the target address for the indirect call
+    //   call rax
+    //   [add rsp, adj]
     //
-    // Throws Xbyak::RegManagerError if no CodeGenerator has been provided.
-    void emit_call(uint64_t func_ptr) {
+    // Throws RmError::NO_CG if no CodeGenerator has been provided.
+    void emit_call(uint64_t func_ptr, size_t extra_pushes = 0) {
         if (!cg_) RM_THROW(RmError::NO_CG)
-#ifndef NDEBUG
-        if (live_gp_.count(0)) {
-            fprintf(stderr,
-                    "emit_call: rax (index 0) is currently allocated — its value will be "
-                    "destroyed by the call. Park it with CommittedLayout::park() before calling.\n");
-            assert(!live_gp_.count(0) && "emit_call: rax is live and will be clobbered");
-        }
-#endif
-        const bool needs_pad = (managed_push_count_ % 2) == 0;
+        const size_t total_pushes = managed_push_count_ + extra_pushes;
+        const bool needs_pad = (total_pushes % 2) == 0;
 #ifdef _WIN32
         const int adj = 32 + (needs_pad ? 8 : 0);
 #else
         const int adj = needs_pad ? 8 : 0;
 #endif
         if (adj > 0) cg_->sub(cg_->rsp, adj);
-        cg_->mov(cg_->rax, func_ptr);
-        cg_->call(cg_->rax);
+        // Prefer a direct near call (call rel32) -- no register consumed.
+        // The near-call instruction is 5 bytes (E8 rel32), so the displacement
+        // is relative to the byte immediately following it.
+        const uint8_t *target = reinterpret_cast<const uint8_t *>(func_ptr);
+        const intptr_t disp = target - (cg_->getCurr() + 5);
+        if (cg_->isAutoGrow() ||
+                Xbyak::inner::IsInInt32(static_cast<uint64_t>(disp))) {
+            cg_->call(target);
+        } else {
+            // Target is more than 2 GB away; load target address into rax.
+            cg_->mov(cg_->rax, func_ptr);
+            cg_->call(cg_->rax);
+        }
         if (adj > 0) cg_->add(cg_->rsp, adj);
     }
 
     // Convenience overload: accepts a typed function pointer.
     // The pointer is reinterpreted as a uint64_t address before emission.
     template <typename FuncT>
-    void emit_call(FuncT *func_ptr) {
-        emit_call(reinterpret_cast<uint64_t>(func_ptr));
+    void emit_call(FuncT *func_ptr, size_t extra_pushes = 0) {
+        emit_call(reinterpret_cast<uint64_t>(func_ptr), extra_pushes);
     }
 
     // Returns the indices of callee-saved GP registers promoted by alloc(),
