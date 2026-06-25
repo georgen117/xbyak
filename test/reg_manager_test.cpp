@@ -2297,7 +2297,7 @@ CYBOZU_TEST_AUTO(stackLayoutNegativeArgs)
     CYBOZU_TEST_EXCEPTION(k.build_negative_gp(),       Xbyak::RegManagerError);
     CYBOZU_TEST_EXCEPTION(k.build_negative_vec(),      Xbyak::RegManagerError);
     CYBOZU_TEST_EXCEPTION(k.build_negative_scratch(),  Xbyak::RegManagerError);
-    CYBOZU_TEST_EXCEPTION(k.build_empty(),             Xbyak::RegManagerError);
+    CYBOZU_TEST_NO_EXCEPTION(k.build_empty());
 }
 
 // =============================================================================
@@ -3398,10 +3398,8 @@ CYBOZU_TEST_AUTO(managedAliasReset)
     )
 
     // pending_aliases_ cleared: build() succeeds without stale alias data.
-    // gp_parks(1) provides the minimum frame content (build() throws on an
-    // empty layout when no alias or park slots exist).
     CYBOZU_TEST_NO_EXCEPTION(
-        auto sf = k.make_stack_frame().gp_parks(1).build();
+        auto sf = k.make_stack_frame().build();
         sf.destroy();
     )
     (void)a;
@@ -3418,7 +3416,7 @@ CYBOZU_TEST_AUTO(managedAliasNoSlotNoop)
             auto a = declare_alias(Reg64(10), Reg64(11), true);
             CYBOZU_TEST_ASSERT(!a.has_stack_slot());
 
-            auto sf = make_stack_frame().gp_parks(1).build();
+            auto sf = make_stack_frame().build();
 
             const size_t sz_before = getSize();
             a.save(sf);     // must emit no instructions

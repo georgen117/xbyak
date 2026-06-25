@@ -85,7 +85,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [ ] 24. Open Task: ABI-portable argument register mapping (Future Work)
 - [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`
 - [x] 26. Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`
-- [ ] 27. Allow `make_stack_frame().build()` with no slots (empty layout)
+- [x] 27. Allow `make_stack_frame().build()` with no slots (empty layout)
 
 ---
 
@@ -4046,7 +4046,7 @@ the need to manually assign specific indices.  Add it then, together with an
 
 ## 27. Allow `make_stack_frame().build()` with no slots (empty layout)
 
-**Status:** Open
+**Status:** Done
 
 **Problem:**
 

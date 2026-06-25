@@ -947,9 +947,11 @@ public:
                   n_outgoing_args_(n_outgoing_args),
                   alias_offsets_(std::move(alias_offsets)) {
             if (!rm_->cg_) RM_THROW(RmError::NO_CG)
-            rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
-            rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
-            rm_->allocated_stack_space_ += total_;
+            if (total_ != 0) {
+                rm_->cg_->sub(rm_->cg_->rsp, static_cast<uint32_t>(total_));
+                rm_->managed_push_count_ += static_cast<size_t>(total_) / 8;
+                rm_->allocated_stack_space_ += total_;
+            }
             rm_->layout_active_ = true;
         }
 
@@ -1267,9 +1269,11 @@ public:
             if (!rm_ || !rm_->cg_) return;
 #if !defined(XBYAK_NO_EXCEPTION)
             try {
-                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
-                rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
-                rm_->allocated_stack_space_ -= total_;
+                if (total_ != 0) {
+                    rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
+                    rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
+                    rm_->allocated_stack_space_ -= total_;
+                }
                 rm_->layout_active_ = false;
             } catch (...) {
 #ifndef NDEBUG
@@ -1277,9 +1281,11 @@ public:
 #endif
             }
 #else
-            rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
-            rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
-            rm_->allocated_stack_space_ -= total_;
+            if (total_ != 0) {
+                rm_->cg_->add(rm_->cg_->rsp, static_cast<uint32_t>(total_));
+                rm_->managed_push_count_ -= static_cast<size_t>(total_) / 8;
+                rm_->allocated_stack_space_ -= total_;
+            }
             rm_->layout_active_ = false;
 #endif
             rm_ = NULL;
@@ -1471,10 +1477,6 @@ public:
             // Round total up to nearest 16 bytes for stack alignment.
             total = (cursor + 15) & ~ptrdiff_t(15);
         }
-        if (total == 0)
-            RM_THROW_RET(RmError::LAYOUT_SLOT_OOB,
-                            StackFrame(*this,0,0,0,0,0,0,0,0,{},0,{},0,0,false))
-
         return StackFrame(*this, gp_base, gp_count, vec_base, vec_count,
                                vec_slot, scratch_base, scratch_bytes, total,
                                std::move(vol_gps), vol_gp_base,
