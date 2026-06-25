@@ -871,7 +871,14 @@ CYBOZU_TEST_AUTO(dynamicSaveRestore)
 
             // emit_call handles 16-byte alignment and the Win64 shadow space on all
             // platforms.  managed_push_count_ accounts for the outer push(rbx).
-            rm.emit_call(&call_function_that_clobbers_registers);
+            // All live registers (including rax) are already pushed above.
+            // rax is free to use as a call-target scratch register.
+            // Do not use rm.emit_call() here because rax is tracked as live
+            // by the manager (it is one of r1..r4), which would trip the
+            // emit_call safety assert.  The test manages saves/restores
+            // manually so a direct call is correct.
+            mov(rax, reinterpret_cast<uint64_t>(&call_function_that_clobbers_registers));
+            call(rax);
             mov(rbx, rax);  // stash the return value (210) in rbx
 
             // Generate restore code in reverse order.
@@ -1209,9 +1216,12 @@ CYBOZU_TEST_AUTO(volatileGPCallerSave)
             auto volatile_regs = rm.get_live_volatile_gps();
             for (int idx : volatile_regs) push(Reg64(idx));
 
-            // emit_call handles 16-byte alignment and the Win64 shadow space on all
-            // platforms.  managed_push_count_ accounts for the outer push(rbx).
-            rm.emit_call(&call_function_that_clobbers_registers);
+            // Volatile registers (including rax if allocated) are already pushed
+            // above.  Do not use rm.emit_call() because rax may be tracked as
+            // live by the manager, which would trip the emit_call safety assert.
+            // The test manages saves/restores manually, so a direct call is correct.
+            mov(rax, reinterpret_cast<uint64_t>(&call_function_that_clobbers_registers));
+            call(rax);
             mov(rbx, rax);  // stash return value (210)
 
             // Restore only volatile registers (in reverse order).
@@ -2021,15 +2031,19 @@ CYBOZU_TEST_AUTO(emitCall)
                     v.push_back(alloc<Reg64>());
                 Reg64 r_pres = alloc<Reg64>();  // promoted from preserved pool
 
-                // emit_prologue pushes r_pres → managed_push_count_ becomes 1.
+                // emit_prologue pushes r_pres -> managed_push_count_ becomes 1.
                 emit_prologue();
 
-                // total_pushes = 1 (odd) → no alignment pad on SysV,
+                // Release volatile registers before emit_call.  Their values are
+                // not needed after the call, and emit_call asserts that rax
+                // (index 0) is not live so it can safely return a value there.
+                for (auto &r : v) RegPoolManager::free(r);
+
+                // total_pushes = 1 (odd) -> no alignment pad on SysV,
                 // 32-byte shadow space only on Win64.
                 emit_call(&call_function_that_clobbers_registers);
                 // rax = 210 on return.
 
-                for (auto &r : v) RegPoolManager::free(r);
                 RegPoolManager::free(r_pres);
                 emit_epilogue();
                 ret();
