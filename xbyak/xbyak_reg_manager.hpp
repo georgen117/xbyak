@@ -21,7 +21,6 @@
 #include <set>
 #include <vector>
 #include <type_traits>
-
 #ifndef XBYAK64
 #  define XBYAK64
 #endif
@@ -469,12 +468,22 @@ public:
     // may cause incorrect behaviour in a subsequent alloc() on the same instance.
     //
     // In debug builds (NDEBUG not defined): triggers an assertion if any register is
-    // still allocated. A message listing the leaked register indices by family is
-    // printed to stderr before the assertion fires.
+    // still allocated, or if a pending TLS error was recorded in XBYAK_NO_EXCEPTION
+    // mode. A message listing the leaked register indices by family is printed to
+    // stderr before the assertion fires.
     //
-    // In release builds (NDEBUG defined): compiles to nothing — no check, no overhead.
+    // In release builds (NDEBUG defined): compiles to nothing - no check, no overhead.
     void assert_all_free() const {
 #ifndef NDEBUG
+#ifdef XBYAK_NO_EXCEPTION
+        if (HasRmError()) {
+            fprintf(stderr,
+                    "assert_all_free: pending RegManager error: %s\n",
+                    rm_what(GetRmError()));
+            ClearRmError();
+            assert(false && "assert_all_free: pending RegManager error from prior alloc/free call");
+        }
+#endif
         if (!live_gp_.empty()) {
             fprintf(stderr, "assert_all_free: GP registers still allocated:");
             for (int idx : live_gp_) fprintf(stderr, " %d", idx);
@@ -495,7 +504,7 @@ public:
             for (int idx : live_tile_) fprintf(stderr, " %d", idx);
             fprintf(stderr, "\n");
         }
-        assert(all_free() && "assert_all_free: registers are still allocated — missing free() call(s)");
+        assert(all_free() && "assert_all_free: registers are still allocated - missing free() call(s)");
 #endif
     }
 
@@ -515,17 +524,27 @@ public:
     // unreachable.
     //
     // In debug builds (NDEBUG not defined): prints diagnostic information to
-    // stderr and triggers an assertion.
+    // stderr and triggers an assertion. Also drains any pending TLS error
+    // recorded in XBYAK_NO_EXCEPTION mode.
     //
     // In release builds (NDEBUG defined): compiles to nothing.
     void assert_clean_stack() const {
 #ifndef NDEBUG
+#ifdef XBYAK_NO_EXCEPTION
+        if (HasRmError()) {
+            fprintf(stderr,
+                    "assert_clean_stack: pending RegManager error: %s\n",
+                    rm_what(GetRmError()));
+            ClearRmError();
+            assert(false && "assert_clean_stack: pending RegManager error from prior call");
+        }
+#endif
         if (allocated_stack_space_ != 0)
             fprintf(stderr,
                     "assert_clean_stack: StackFrame not destroyed (%td bytes still allocated)\n",
                     allocated_stack_space_);
         assert(clean_stack() &&
-               "assert_clean_stack: unbalanced stack — open StackFrame");
+               "assert_clean_stack: unbalanced stack - open StackFrame");
 #endif
     }
 
@@ -775,6 +794,25 @@ public:
     // save/restore are defined out-of-line after StackFrame is complete.
     class ManagedAlias {
     public:
+        // Default constructor -- creates an uninitialized (null) alias.
+        // A null alias must be assigned from rm.declare_alias() before any
+        // other method is called.  This enables C++11-compatible class-member
+        // storage: declare the member without an initializer, then assign in
+        // generate() before make_stack_frame().build().
+        //
+        //   class MyKernel {
+        //       Xbyak::RegPoolManager rm_;
+        //       Xbyak::RegPoolManager::ManagedAlias alias_ptr_; // null state
+        //       void generate() {
+        //           alias_ptr_ = rm_.declare_alias(rax);
+        //           auto sf = rm_.make_stack_frame().build();
+        //           ...
+        //       }
+        //   };
+        ManagedAlias()
+            : alias_id_(-1), desired_idx_(-1), needs_slot_(false),
+              is_active_(false), reg_(0), rm_(nullptr) {}
+
         // Returns the allocated register.  Asserts active state.
         const Xbyak::Reg64 &reg() const {
             if (!is_active_) RM_THROW_RET(RmError::GP_NOT_AVAILABLE, reg_)
@@ -787,47 +825,47 @@ public:
         // - Slot-backed: allocates the desired register (or any GP if anonymous).
         // - No-slot: no-op if already active; re-allocates if previously freed.
         // Throws GP_IN_USE if a named slot-backed register is not available.
-        void prime() {
+        // Returns *this for chaining: alias.prime().reg() or alias.prime().save(sf).
+        ManagedAlias& prime() {
             if (desired_idx_ >= 0) {
                 if (rm_->is_available_gp(desired_idx_)) {
                     reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
                     is_active_ = true;
-                    return;
+                    return *this;
                 }
                 // No-slot path: we already own the register in live_gp_.
-                if (!needs_slot_) return;
+                if (!needs_slot_) return *this;
                 // Named slot-backed register taken by another allocation.
-                RM_THROW(RmError::GP_IN_USE)
+                RM_THROW_RET(RmError::GP_IN_USE, *this)
             } else {
                 // Anonymous alias: pick any available GP register.
                 reg_       = rm_->alloc<Xbyak::Reg64>();
                 is_active_ = true;
             }
+            return *this;
         }
 
         // Spill to the stack slot and release the register.  Slot-backed only.
+        // Returns *this for chaining after prime(): alias.prime().save(sf).
         // Defined out-of-line after StackFrame.
-        void save(StackFrame &sf);
+        ManagedAlias& save(StackFrame &sf);
 
         // Reload from the stack slot and re-acquire the register.  Slot-backed only.
+        // Returns *this for chaining: alias.restore(sf).reg().
         // Defined out-of-line after StackFrame.
-        void restore(StackFrame &sf);
+        ManagedAlias& restore(StackFrame &sf);
 
-        // Release the register back to the pool without saving.  Slot-backed only.
-        void release() {
-            if (!needs_slot_) return;
-            rm_->free(reg_);
+        // Release the register back to the pool without saving.
+        // Safe to call on an inactive alias: only frees the register if
+        // is_active_ is true, then always clears is_active_.  This allows
+        // unconditional cleanup in error paths or at scope boundaries where
+        // the active/inactive state is unknown.
+        // Works for both slot-backed and no-slot aliases.
+        // Returns *this for chaining.
+        ManagedAlias& release() {
+            if (is_active_) rm_->free(reg_);
             is_active_ = false;
-        }
-
-        // Release the register back to the pool.  No-slot path: call before
-        // assert_all_free() to satisfy the "no live registers" invariant.
-        // Also works for slot-backed aliases as an unconditional drop.
-        void free() {
-            if (is_active_) {
-                rm_->free(reg_);
-                is_active_ = false;
-            }
+            return *this;
         }
 
     private:
@@ -2009,8 +2047,10 @@ private:
     std::vector<AliasPendingDecl> pending_aliases_;
 
     // Returns true if the GP register at the given index is currently free.
+    // Includes both caller-saved (free_gp_regs) and callee-saved registers
+    // not yet promoted (preserved_gp), since alloc() handles both.
     bool is_available_gp(int idx) const {
-        return free_gp_regs.count(idx) != 0;
+        return free_gp_regs.count(idx) != 0 || preserved_gp.count(idx) != 0;
     }
 
     std::set<int> live_gp_;
@@ -2134,23 +2174,27 @@ private:
 // Out-of-line definitions for ManagedAlias methods that reference StackFrame.
 // These must appear after the full definition of RegPoolManager::StackFrame.
 
-inline void Xbyak::RegPoolManager::ManagedAlias::save(
+inline Xbyak::RegPoolManager::ManagedAlias&
+Xbyak::RegPoolManager::ManagedAlias::save(
         Xbyak::RegPoolManager::StackFrame &sf) {
-    if (!needs_slot_) return;
+    if (!needs_slot_) return *this;
     sf.alias_store(alias_id_, reg_);
     rm_->free(reg_);
     is_active_ = false;
+    return *this;
 }
 
-inline void Xbyak::RegPoolManager::ManagedAlias::restore(
+inline Xbyak::RegPoolManager::ManagedAlias&
+Xbyak::RegPoolManager::ManagedAlias::restore(
         Xbyak::RegPoolManager::StackFrame &sf) {
-    if (!needs_slot_) return;
+    if (!needs_slot_) return *this;
     if (desired_idx_ >= 0)
         reg_ = rm_->alloc<Xbyak::Reg64>(desired_idx_);
     else
         reg_ = rm_->alloc<Xbyak::Reg64>();
     is_active_ = true;
     sf.alias_load(alias_id_, reg_);
+    return *this;
 }
 
 #endif // XBYAK_REG_MANAGER_HPP
