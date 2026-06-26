@@ -39,13 +39,17 @@
  *   stackLayout*            – StackFrameBuilder / StackFrame two-phase stack management
  *   managedAliasPatterns    – declare_alias overloads, has_stack_slot(), is_active()
  *   managedAliasPrime       – prime() allocates named/anonymous register; conflict throws
- *   managedAliasNoSlotActive – no-slot alias active immediately; prime() is a no-op
- *   managedAliasFreeAndReprime – free() then prime() re-acquires the register
+ *   managedAliasNoSlotActive – no-slot alias: lazy alloc(); throws GP_IN_USE on conflict
+ *   managedAliasFreeAndReprime – free() then alloc() re-acquires the register
  *   managedAliasReset       – reset() clears pending_aliases_; register usable again
  *   managedAliasNoSlotNoop  – save/restore emit no code when has_stack_slot()==false
  *   managedAliasSaveRestoreJIT – save/restore slot round-trip via JIT execution
  *   managedAliasMixedWithParks – alias slot and GP park slot coexist in one layout
  *   managedAliasAnonymous   – declare_alias<Reg64>() anonymous slot round-trip
+ *   aliasDeclareNoSlotBasic – declare_alias(reg, AliasMode::no_slot) lifecycle
+ *   aliasDeclareNoSlotMutualExclusion – two no-slot aliases on same reg, alloc conflict
+ *   aliasDeclareNoSlotSequential – sequential alloc/free/alloc across two aliases
+ *   aliasDeclareNoSlotViaThreeArg – three-arg declare_alias smoke test
  *
  * Build:
  *   # via CMake (from xbyak/test/build/):
@@ -3211,28 +3215,36 @@ CYBOZU_TEST_AUTO(managedAliasPatterns)
         rm.free(r);
     }
 
-    // APX-aware two-register form: APX target -> alt register, no slot, active immediately.
-    //                              non-APX    -> primary register, slot-backed, inactive.
+    // Three-argument form: use_alt=true -> no-slot alias on alt register (lazy allocation).
+    //                       use_alt=false -> slotted alias on primary register.
+    // This is also how the APX-portable pattern works: declare_alias(rax, r22, has_apx()).
     {
         RegPoolManager rm(g_cpu);
         if (rm.has_apx()) {
-            auto b = rm.declare_alias(Reg64(10), Reg64(16));
+            // On APX: r16 chosen, no stack slot, inactive until alloc().
+            auto b = rm.declare_alias(Reg64(10), Reg64(16), true);
             CYBOZU_TEST_ASSERT(!b.has_stack_slot());
+            CYBOZU_TEST_ASSERT(!b.is_active());  // lazy: not active until alloc()
+            b.alloc();
             CYBOZU_TEST_ASSERT(b.is_active());
             CYBOZU_TEST_EQUAL(b.reg().getIdx(), 16);
             b.free();
         } else {
-            auto b = rm.declare_alias(Reg64(10), Reg64(16));
+            // On non-APX: r16 is treated as no-slot regardless, but we use
+            // use_alt=false to get the slotted primary path.
+            auto b = rm.declare_alias(Reg64(10), Reg64(16), false);
             CYBOZU_TEST_ASSERT(b.has_stack_slot());
             CYBOZU_TEST_ASSERT(!b.is_active());
         }
     }
 
-    // Conditional form: use_alt=true -> alt register, no slot, active immediately.
+    // Conditional form: use_alt=true -> no-slot alias on alt register, inactive until alloc().
     {
         RegPoolManager rm(g_cpu);
         auto c = rm.declare_alias(Reg64(10), Reg64(11), true);
         CYBOZU_TEST_ASSERT(!c.has_stack_slot());
+        CYBOZU_TEST_ASSERT(!c.is_active());  // lazy: not active until alloc()
+        c.alloc();
         CYBOZU_TEST_ASSERT(c.is_active());
         CYBOZU_TEST_EQUAL(c.reg().getIdx(), 11);
         c.free();
@@ -3302,22 +3314,34 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
 }
 
 // -----------------------------------------------------------------------------
-// Test -- no-slot alias is active immediately; prime() is a no-op when active
+// Test -- no-slot alias uses lazy allocation; alloc() throws on conflict
 // -----------------------------------------------------------------------------
 CYBOZU_TEST_AUTO(managedAliasNoSlotActive)
 {
     RegPoolManager rm(g_cpu);
     auto a = rm.declare_alias(Reg64(10), Reg64(11), true);
-    CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+    // No-slot aliases are inactive at declaration time.
+    CYBOZU_TEST_ASSERT(!a.has_stack_slot());
+    CYBOZU_TEST_ASSERT(!a.is_active());
 
-    // prime() on an already-active no-slot alias is a no-op.
     a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
     CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
 
+    // alloc() when already active is a no-op.
+    a.alloc();
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+
+    // r11 is now live; another alloc of r11 must throw.
+    CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(11), Xbyak::RegManagerError);
+
     a.free();
     CYBOZU_TEST_ASSERT(!a.is_active());
+    // r11 back in pool.
+    auto r = rm.alloc<Reg64>(11);
+    CYBOZU_TEST_EQUAL(r.getIdx(), 11);
+    rm.free(r);
 }
 
 // -----------------------------------------------------------------------------
@@ -3347,10 +3371,13 @@ CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
         a.free();
     }
 
-    // No-slot: free -> prime re-acquires the same register.
+    // No-slot: alloc -> free -> alloc re-acquires the same register.
     {
         RegPoolManager rm(g_cpu);
         auto a = rm.declare_alias(Reg64(10), Reg64(11), true);
+        CYBOZU_TEST_ASSERT(!a.is_active());  // inactive at declaration
+
+        a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
 
         a.free();
@@ -3382,8 +3409,14 @@ CYBOZU_TEST_AUTO(managedAliasReset)
     };
 
     Kernel k;
-    // Declare a no-slot alias (r11 enters live_gp_).
+    // Declare a no-slot alias on r11; register is NOT live until alloc().
     auto a = k.declare_alias(Reg64(10), Reg64(11), true);
+    CYBOZU_TEST_ASSERT(!a.has_stack_slot());
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    // r11 is still free before alloc(); pool alloc must succeed.
+    CYBOZU_TEST_NO_EXCEPTION(auto r = k.alloc<Reg64>(11); k.free(r);)
+    // Now alloc the alias; r11 enters live_gp_.
+    a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
     // r11 is live; alloc(11) must throw.
     CYBOZU_TEST_EXCEPTION(k.alloc<Reg64>(11), Xbyak::RegManagerError);
@@ -3415,19 +3448,23 @@ CYBOZU_TEST_AUTO(managedAliasNoSlotNoop)
         void build() {
             auto a = declare_alias(Reg64(10), Reg64(11), true);
             CYBOZU_TEST_ASSERT(!a.has_stack_slot());
+            CYBOZU_TEST_ASSERT(!a.is_active());  // inactive at declaration
 
             auto sf = make_stack_frame().build();
 
+            // save/restore on an inactive no-slot alias emit no instructions.
             const size_t sz_before = getSize();
-            a.save(sf);     // must emit no instructions
-            a.restore(sf);  // must emit no instructions
+            a.save(sf);     // no-op: no slot assigned
+            a.restore(sf);  // no-op: no slot assigned
             const size_t sz_after = getSize();
 
             CYBOZU_TEST_EQUAL(sz_before, sz_after);
-            // is_active stays true through no-op save/restore.
-            CYBOZU_TEST_ASSERT(a.is_active());
+            CYBOZU_TEST_ASSERT(!a.is_active());  // still inactive after no-ops
 
+            a.alloc();
+            CYBOZU_TEST_ASSERT(a.is_active());
             a.free();
+            CYBOZU_TEST_ASSERT(!a.is_active());
             sf.destroy();
             ret();
         }
@@ -3608,7 +3645,100 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
 }
 
 // ---------------------------------------------------------------------------
-// §29 -- post-build declare_alias() guard
+// AliasMode::no_slot explicit overload
+// ---------------------------------------------------------------------------
+
+// declare_alias(reg, AliasMode::no_slot): inactive at declaration, alloc() activates.
+CYBOZU_TEST_AUTO(aliasDeclareNoSlotBasic)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(9), AliasMode::no_slot);
+    CYBOZU_TEST_ASSERT(!a.has_stack_slot());
+    CYBOZU_TEST_ASSERT(!a.is_active());
+
+    a.alloc();
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+
+    a.free();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+
+    // r9 is back in the pool after free().
+    auto r = rm.alloc<Reg64>(9);
+    CYBOZU_TEST_EQUAL(r.getIdx(), 9);
+    rm.free(r);
+}
+
+// Two no-slot aliases targeting the same register: alloc() on the second
+// throws GP_IN_USE while the first is active.
+CYBOZU_TEST_AUTO(aliasDeclareNoSlotMutualExclusion)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(9), AliasMode::no_slot);
+    auto b = rm.declare_alias(Reg64(9), AliasMode::no_slot);
+
+    a.alloc();
+    CYBOZU_TEST_ASSERT(a.is_active());
+
+    // b cannot alloc while a holds r9.
+    CYBOZU_TEST_EXCEPTION(b.alloc(), Xbyak::RegManagerError);
+
+    a.free();
+    // Now b can alloc.
+    CYBOZU_TEST_NO_EXCEPTION(b.alloc();)
+    CYBOZU_TEST_ASSERT(b.is_active());
+    CYBOZU_TEST_EQUAL(b.reg().getIdx(), 9);
+    b.free();
+}
+
+// Sequential use: alloc/free/alloc on alternate aliases sharing a register.
+CYBOZU_TEST_AUTO(aliasDeclareNoSlotSequential)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(9), AliasMode::no_slot);
+    auto b = rm.declare_alias(Reg64(9), AliasMode::no_slot);
+
+    a.alloc();
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+    a.free();
+
+    b.alloc();
+    CYBOZU_TEST_EQUAL(b.reg().getIdx(), 9);
+    b.free();
+
+    // Can cycle a again after b released r9.
+    a.alloc();
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+    a.free();
+}
+
+// declare_alias(primary, alt, use_alt) three-arg form with AliasMode semantics smoke test.
+CYBOZU_TEST_AUTO(aliasDeclareNoSlotViaThreeArg)
+{
+    // use_alt=true path: no-slot alias on alt register.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(8), Reg64(9), true);
+        CYBOZU_TEST_ASSERT(!a.has_stack_slot());
+        CYBOZU_TEST_ASSERT(!a.is_active());
+        a.alloc();
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+        a.free();
+    }
+    // use_alt=false path: slotted alias on primary register.
+    {
+        RegPoolManager rm(g_cpu);
+        auto a = rm.declare_alias(Reg64(8), Reg64(9), false);
+        CYBOZU_TEST_ASSERT(a.has_stack_slot());
+        CYBOZU_TEST_ASSERT(!a.is_active());
+        a.alloc();
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 8);
+        a.free();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// post-build declare_alias() guard
 // ---------------------------------------------------------------------------
 
 // All four declare_alias overloads must throw ALIAS_AFTER_BUILD when called

@@ -63,6 +63,18 @@ enum class RmError {
     ALIAS_AFTER_BUILD,      // declare_alias() called after make_stack_frame().build()
 };
 
+// Controls whether declare_alias(reg, mode) reserves a stack slot.
+//
+// slotted  -- default; an 8-byte stack slot is assigned by build_layout().
+//             save(sf) / restore(sf) emit the store / load.
+//
+// no_slot  -- no stack slot; register is acquired from the pool at alloc()
+//             and returned at free().  alloc() throws GP_IN_USE when the
+//             register is already live, enforcing mutual exclusion between
+//             any two aliases bound to the same physical register.
+//             save() and restore() are no-ops.
+enum class AliasMode { slotted, no_slot };
+
 // RegManager-specific exception.  Carries a typed RmError code and a
 // descriptive message, independent of Xbyak's error table.
 class RegManagerError : public std::exception {
@@ -824,21 +836,18 @@ public:
         bool is_active()      const { return is_active_; }
 
         // Allocate the register from the pool.
-        // - Slot-backed: allocates the desired register (or any GP if anonymous).
-        // - No-slot: no-op if already active; re-allocates if previously freed.
-        // Throws GP_IN_USE if a named slot-backed register is not available.
+        // Re-calling alloc() when already active is a silent no-op.
+        // Named aliases (slotted or no-slot): throw GP_IN_USE if the register
+        // is held by another allocation.
+        // Anonymous aliases: pick any available GP register.
         // Returns *this for chaining: alias.alloc().reg() or alias.alloc().save(sf).
         ManagedAlias& alloc() {
+            if (is_active_) return *this;
             if (desired_idx_ >= 0) {
-                if (rm_->is_available_gp(desired_idx_)) {
-                    reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
-                    is_active_ = true;
-                    return *this;
-                }
-                // No-slot path: we already own the register in live_gp_.
-                if (!needs_slot_) return *this;
-                // Named slot-backed register taken by another allocation.
-                RM_THROW_RET(RmError::GP_IN_USE, *this)
+                if (!rm_->is_available_gp(desired_idx_))
+                    RM_THROW_RET(RmError::GP_IN_USE, *this)
+                reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
+                is_active_ = true;
             } else {
                 // Anonymous alias: pick any available GP register.
                 reg_       = rm_->alloc<Xbyak::Reg64>();
@@ -1346,7 +1355,8 @@ public:
     }
 
     // Declare a named alias on a specific register, always backed by a stack slot.
-    // The register is not allocated until prime() is called.
+    // Declare a named slot-backed alias for a specific GP register.
+    // The register is not allocated until alloc() is called.
     // Call save(sf)/restore(sf) to spill/reload across time-sharing boundaries.
     ManagedAlias declare_alias(const Xbyak::Reg64 &reg) {
         if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
@@ -1355,34 +1365,41 @@ public:
         return ManagedAlias(id, reg.getIdx(), true, this);
     }
 
-    // Declare a named alias selecting between two registers based on APX support.
-    // On APX-capable targets: use alt_reg with no stack slot (register allocated
-    // immediately and held for the kernel lifetime; free() before assert_all_free).
-    // On base targets: use primary_reg with a stack slot.
-    ManagedAlias declare_alias(const Xbyak::Reg64 &primary_reg,
-                               const Xbyak::Reg64 &alt_reg) {
+    // Declare a named alias with explicit slot/no-slot control.
+    //
+    // AliasMode::slotted -- same as declare_alias(reg): stack slot assigned at
+    //   build_layout(); save()/restore() emit load/store instructions.
+    //
+    // AliasMode::no_slot -- no stack slot; alloc() acquires the register from
+    //   the pool at call time and throws GP_IN_USE if it is already live.
+    //   This enforces mutual exclusion: two no-slot aliases on the same register
+    //   cannot be active simultaneously.  free() returns the register to the
+    //   pool.  save() and restore() are no-ops.
+    //   Use case 1 -- sequential exclusive aliases: two names for the same
+    //     physical register used in non-overlapping code phases.
+    //   Use case 2 -- APX portable alias (via the three-argument overload):
+    //     on APX hardware alloc() acquires an extended register (r16-r31);
+    //     on non-APX hardware the alias falls back to a slotted allocation.
+    ManagedAlias declare_alias(const Xbyak::Reg64 &reg, AliasMode mode) {
         if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
-        return declare_alias(primary_reg, alt_reg, has_apx_);
+        const bool slot = (mode == AliasMode::slotted);
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({slot, reg.getIdx()});
+        return ManagedAlias(id, reg.getIdx(), slot, this);
     }
 
-    // Declare a named alias with a caller-supplied selection flag.
-    // use_alt == true  -> alt_reg, no stack slot; register allocated immediately.
-    // use_alt == false -> primary_reg, stack-backed; allocated at prime().
+    // Declare a named alias choosing between two registers.
+    // use_alt == true  -> alt_reg,     AliasMode::no_slot (register acquired at alloc())
+    // use_alt == false -> primary_reg, AliasMode::slotted (stack slot, alloc() at call time)
+    // Primary use case: APX-portable alias -- declare_alias(rax, r22, has_apx())
+    //   On APX:     r22 allocated at alloc(), freed at free().
+    //   On non-APX: rax with a stack slot, full save/restore lifecycle.
     ManagedAlias declare_alias(const Xbyak::Reg64 &primary_reg,
                                const Xbyak::Reg64 &alt_reg,
                                bool use_alt) {
         if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
-        const int id = static_cast<int>(pending_aliases_.size());
-        if (use_alt) {
-            pending_aliases_.push_back({false, alt_reg.getIdx()});
-            ManagedAlias a(id, alt_reg.getIdx(), false, this);
-            a.reg_       = alloc<Xbyak::Reg64>(alt_reg.getIdx());
-            a.is_active_ = true;
-            return a;
-        } else {
-            pending_aliases_.push_back({true, primary_reg.getIdx()});
-            return ManagedAlias(id, primary_reg.getIdx(), true, this);
-        }
+        return use_alt ? declare_alias(alt_reg,     AliasMode::no_slot)
+                       : declare_alias(primary_reg, AliasMode::slotted);
     }
 
     // Declare an anonymous slot-backed alias.  RegT must be Xbyak::Reg64.
