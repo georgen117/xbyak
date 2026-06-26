@@ -91,7 +91,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`
 - [x] 26. Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`
 - [x] 27. Allow `make_stack_frame().build()` with no slots (empty layout)
-- [ ] 28. RAII Wrapper for `ManagedAlias`: `ScopedAlias`
+- [x] 28. RAII Wrapper for `ManagedAlias`: `ScopedAlias`
 - [x] 29. Post-`build()` `declare_alias()` Detection
 - [x] 30. Exclusive Sequential Alias: `declare_alias(reg, AliasMode::no_slot)`
 - [ ] 31. `ManagedAlias` for Vector Registers: `ManagedVecAlias`

@@ -792,6 +792,7 @@ public:
 
     // Forward declarations for the builder and committed types.
     class StackFrame;
+    class ScopedAlias;
 
     // A register alias managed by RegPoolManager.
     //
@@ -879,6 +880,10 @@ public:
             return *this;
         }
 
+        // Allocate the alias and return a RAII guard that calls free()
+        // when the guard goes out of scope.
+        ScopedAlias scoped();
+
     private:
         friend class RegPoolManager;
         ManagedAlias(int alias_id, int desired_idx, bool needs_slot, RegPoolManager *rm)
@@ -891,6 +896,34 @@ public:
         bool            is_active_;
         Xbyak::Reg64    reg_{0};
         RegPoolManager *rm_;
+    };
+
+    // Move-only RAII guard for a ManagedAlias.
+    // Calls alias.free() in its destructor if the alias is still active.
+    // Constructed via ManagedAlias::scoped(), which calls alloc() first.
+    class ScopedAlias {
+    public:
+        explicit ScopedAlias(ManagedAlias &alias) : alias_(&alias) {}
+
+        ~ScopedAlias() {
+            if (alias_ && alias_->is_active()) alias_->free();
+        }
+
+        ScopedAlias(const ScopedAlias &)            = delete;
+        ScopedAlias &operator=(const ScopedAlias &) = delete;
+        ScopedAlias(ScopedAlias &&other) noexcept : alias_(other.alias_) {
+            other.alias_ = nullptr;
+        }
+
+        // Explicit early release -- disarms the destructor.
+        // No-op if the alias is already inactive.
+        void free() {
+            if (alias_ && alias_->is_active()) alias_->free();
+            alias_ = nullptr;
+        }
+
+    private:
+        ManagedAlias *alias_;
     };
 
     // Builder -- accumulates slot requirements before any code is emitted.
@@ -2221,6 +2254,12 @@ Xbyak::RegPoolManager::ManagedAlias::restore(
     is_active_ = true;
     sf.alias_load(alias_id_, reg_);
     return *this;
+}
+
+inline Xbyak::RegPoolManager::ScopedAlias
+Xbyak::RegPoolManager::ManagedAlias::scoped() {
+    alloc();
+    return ScopedAlias(*this);
 }
 
 #endif // XBYAK_REG_MANAGER_HPP

@@ -3828,3 +3828,116 @@ CYBOZU_TEST_AUTO(aliasDeclareAfterBuildThenReset)
     DummyKernel k;
     k.go();
 }
+
+// -----------------------------------------------------------------------------
+// Tests -- ScopedAlias RAII wrapper
+// -----------------------------------------------------------------------------
+
+// Basic: scoped() activates the alias; register is freed when guard exits scope.
+CYBOZU_TEST_AUTO(scopedAliasBasic)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(10));
+
+    {
+        auto g = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+    }  // guard destroyed here
+
+    // After the guard exits, the alias must be inactive and r10 back in pool.
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    auto r = rm.alloc<Reg64>(10);
+    CYBOZU_TEST_EQUAL(r.getIdx(), 10);
+    rm.free(r);
+}
+
+// Explicit free(): disarms the guard; destructor must not double-free.
+CYBOZU_TEST_AUTO(scopedAliasExplicitFree)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(10));
+
+    {
+        auto g = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+
+        g.free();  // explicit early release -- disarms destructor
+        CYBOZU_TEST_ASSERT(!a.is_active());
+
+        // r10 is now back in pool while guard is still in scope.
+        auto r = rm.alloc<Reg64>(10);
+        CYBOZU_TEST_EQUAL(r.getIdx(), 10);
+        rm.free(r);
+    }  // destructor runs; must not crash or double-free
+
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}
+
+// Move semantics: moved-from guard is disarmed; moved-to guard owns the release.
+CYBOZU_TEST_AUTO(scopedAliasMove)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(10));
+
+    RegPoolManager::ScopedAlias g2 = [&]() {
+        auto g1 = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        return g1;  // move-construct g2 from g1; g1 is disarmed
+    }();
+    // g1 is gone; alias must still be active (g2 owns it).
+    CYBOZU_TEST_ASSERT(a.is_active());
+
+    // g2 going out of scope releases the alias.
+    g2.free();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}
+
+// Works with AliasMode::no_slot aliases.
+CYBOZU_TEST_AUTO(scopedAliasNoSlot)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(10), Reg64(11), true);
+    CYBOZU_TEST_ASSERT(!a.is_active());
+
+    {
+        auto g = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+    }
+
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    // r11 is free again; can allocate it explicitly.
+    auto r = rm.alloc<Reg64>(11);
+    CYBOZU_TEST_EQUAL(r.getIdx(), 11);
+    rm.free(r);
+}
+
+// save() before guard exit: alias becomes inactive; destructor is a no-op.
+CYBOZU_TEST_AUTO(scopedAliasSaveFirst)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto a = declare_alias(Reg64(10));
+            auto sf = make_stack_frame().build();
+
+            {
+                auto g = a.scoped();
+                CYBOZU_TEST_ASSERT(a.is_active());
+
+                // save() spills to stack slot and releases the register.
+                a.save(sf);
+                CYBOZU_TEST_ASSERT(!a.is_active());
+
+                // Disarm guard so its destructor does not try to free again.
+                g.free();
+            }  // destructor runs on already-inactive alias -- must be a no-op
+
+            CYBOZU_TEST_ASSERT(!a.is_active());
+            sf.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+}
