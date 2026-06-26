@@ -42,6 +42,11 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 24. [Open Task: ABI-portable argument register mapping (Future Work)](#24-open-task-abi-portable-argument-register-mapping-future-work)
 25. [Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`](#25-stack-overflow-arguments-with_outgoing_args--stackframeemit_call)
 26. [Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`](#26-named-alias-register-lifecycle-declare_alias--managedalias)
+27. [Allow `make_stack_frame().build()` with no slots (empty layout)](#27-allow-make_stack_framebuild-with-no-slots-empty-layout)
+28. [RAII Wrapper for `ManagedAlias`: `ScopedAlias`](#28-raii-wrapper-for-managedalias-scopedalias)
+29. [Post-`build()` `declare_alias()` Detection](#29-post-build-declare_alias-detection)
+30. [Exclusive Sequential Alias: `declare_alias(reg, AliasMode::no_slot)`](#30-exclusive-sequential-alias-declare_aliasreg-aliasmodenostlot)
+31. [`ManagedAlias` for Vector Registers: `ManagedVecAlias`](#31-managedalias-for-vector-registers-managedvecalias)
 ---
 
 ## Implementation Status
@@ -86,6 +91,10 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 25. Stack-Overflow Arguments: `with_outgoing_args()` / `StackFrame::emit_call()`
 - [x] 26. Named-Alias Register Lifecycle: `declare_alias()` / `ManagedAlias`
 - [x] 27. Allow `make_stack_frame().build()` with no slots (empty layout)
+- [ ] 28. RAII Wrapper for `ManagedAlias`: `ScopedAlias`
+- [ ] 29. Post-`build()` `declare_alias()` Detection
+- [ ] 30. Exclusive Sequential Alias: `declare_alias(reg, AliasMode::no_slot)`
+- [ ] 31. `ManagedAlias` for Vector Registers: `ManagedVecAlias`
 
 ---
 
@@ -3555,13 +3564,14 @@ Transitions from ACTIVE to DORMANT:
 It frees the register if currently held and ends the alias lifetime.  It is
 symmetric with calling `rm.free(reg)` on a directly allocated register.
 
-For aliases with `needs_slot_ == false` (APX extended-register path): the
-register is allocated at `declare_alias` time and stays live for the full
-kernel duration.  `save`, `restore`, and `release` are all no-ops.  `prime()`
-must still be called for portability (the same call site works on non-APX
-systems where the alias resolves to the slotted path) but has no effect on
-the no-slot path.  `free()` is NOT a no-op -- it is the required call at
-end-of-kernel to return the register to the pool before `assert_all_free()`.
+For aliases with `needs_slot_ == false` (`AliasMode::no_slot` path, including the
+APX extended-register pattern from `declare_alias(primary, alt, has_apx())`): the
+register is NOT pre-allocated at `declare_alias` time.  It enters `live_gp_` when
+`prime()` is called, just like any slotted alias.  `prime()` throws `GP_IN_USE` if
+the register is already live.  `save`, `restore`, and `release()` on the slotted
+behavior do not apply: `save`/`restore` are no-ops; `release()` frees the register
+back to the pool.  `free()` is NOT a no-op -- it is the required terminal call to
+return the register to the pool before `assert_all_free()`.
 
 ### Internal State Changes
 
@@ -3613,20 +3623,36 @@ is currently free.
 #### `declare_alias` overloads (on `RegPoolManager`)
 
 ```cpp
-// Named, always backed by a stack slot.
+// Named, always backed by a stack slot (default).
 // Register is not allocated at declaration time.
 // Collision detected at the first prime() or restore() call.
+// Equivalent to declare_alias(reg, AliasMode::slotted).
 ManagedAlias declare_alias(Xbyak::Reg64 reg);
 
-// Named, APX-aware: uses ext_reg on APX hardware (no stack slot);
-// falls back to primary_reg with a stack slot on non-APX hardware.
-// On the APX path, ext_reg is allocated immediately at declare time.
-ManagedAlias declare_alias(Xbyak::Reg64 primary_reg, Xbyak::Reg64 ext_reg);
+// Named, with explicit slot/no-slot control.  See §30 for AliasMode definition.
+//
+// AliasMode::slotted (default): 8-byte stack slot assigned at build();
+//   save()/restore() emit the load/store.  Same as the single-arg overload.
+//
+// AliasMode::no_slot: no stack slot; register allocated at prime() and freed
+//   at release()/free(); prime() throws GP_IN_USE if the register is already
+//   live, enforcing mutual exclusion.  save() and restore() are no-ops.
+//   Primary use cases:
+//     1. Sequential exclusive aliases (§30): two names for the same physical
+//        register used in non-overlapping phases.
+//     2. APX permanent hold: declare_alias(rax, r22, has_apx()) -- see the
+//        three-argument overload below.
+ManagedAlias declare_alias(Xbyak::Reg64 reg, AliasMode mode);
 
-// Named, conditional: use_alt==true picks alt_reg (no slot);
-//                     use_alt==false picks primary_reg (slot).
-// Useful when the kernel can optionally use an unconstrained register
-// (e.g. rbp when no frame pointer is needed).
+// Named, conditional: use_alt==true picks alt_reg (AliasMode::no_slot);
+//                     use_alt==false picks primary_reg (AliasMode::slotted).
+// Primary use case -- APX-portable alias:
+//   declare_alias(rax, r22, has_apx())
+//   On APX: r22 allocated at prime(), permanent-hold pattern, free() at end.
+//   On non-APX: rax with a stack slot, full save/restore lifecycle.
+// The two-argument shorthand declare_alias(primary, alt) that hard-coded
+// has_apx() internally is intentionally omitted: the explicit has_apx() call
+// at the call site is self-documenting and adds no verbosity.
 ManagedAlias declare_alias(Xbyak::Reg64 primary_reg,
                            Xbyak::Reg64 alt_reg,
                            bool         use_alt);
@@ -3643,9 +3669,10 @@ All overloads append an `AliasPendingDecl` to `pending_aliases_` and return a
 `ManagedAlias`.  Stack slots are assigned when `make_stack_frame().build()` is
 called, exactly as with other `StackFrame` resources.
 
-Exception: the two-argument overload and the three-argument overload with
-`use_alt=true` call `alloc<Reg64>(desired_idx)` immediately when
-`needs_slot_=false`.  The register enters `live_gp_` at declaration time.
+No-slot overloads (`AliasMode::no_slot` or `use_alt=true`) do NOT allocate the
+register at declaration time.  The register enters `live_gp_` only when `prime()`
+is called.  This makes the call-site behavior uniform: `prime()` always does
+work on both slotted and no-slot paths.
 
 #### `ManagedAlias` class
 
@@ -3665,12 +3692,17 @@ public:
 
     // DORMANT -> ACTIVE: allocate register, emit no load.
     // Use for first-time initialization; write the value to reg() after calling.
-    // No-op when has_stack_slot() == false and the register is already live
-    // in live_gp_ (i.e. prime() was already called and free() has not been
-    // called since).
-    // Re-allocates if has_stack_slot() == false and free() was previously
-    // called (desired_idx is re-allocated when it returns to free_gp_regs).
-    void prime();
+    //
+    // Slotted path: allocates desired_idx_ (or any GP if anonymous).
+    //   Throws GP_IN_USE if the named register is not available.
+    //
+    // No-slot path (AliasMode::no_slot): allocates desired_idx_.
+    //   Throws GP_IN_USE if the register is already held in live_gp_ by any
+    //   other allocation -- this is the mutual-exclusion guarantee.
+    //   Re-prime after release() re-allocates the register (it returned to
+    //   the pool on release()).
+    //   Re-prime while already active is a silent no-op.
+    void alloc();
 
     // DORMANT -> ACTIVE: allocate register and load value from slot.
     // Use to retrieve a value that was previously saved.
@@ -3683,10 +3715,9 @@ public:
     void save(StackFrame &cl);
 
     // ACTIVE -> DORMANT: free register without emitting a store.
-    // Use when the value is unchanged since the last save(); the slot is
-    // still valid and the extra store is avoided.
-    // No-op when has_stack_slot() == false.
-    void release();
+    // Slotted: slot retains the value from the last save(); extra store avoided.
+    // No-slot: frees the register back to the pool.
+    void free();
 
     // Terminal: free register (if currently active) and end alias lifetime.
     // Symmetric with rm.free(reg) for directly allocated registers.
@@ -3839,19 +3870,19 @@ class MultiBufferKernel : public CodeGenerator, public RegPoolManager {
         // param holds the pointer to the params struct (e.g. from ABI arg reg).
 
         // Load all named values once into their slots.
-        src_ptr_.prime();
+        src_ptr_.alloc();
         mov(src_ptr_.reg(), ptr[param + 0]);
         src_ptr_.save(layout);        // store to slot, free register
 
-        dst_ptr_.prime();
+        dst_ptr_.alloc();
         mov(dst_ptr_.reg(), ptr[param + 8]);
         dst_ptr_.save(layout);
 
-        scale_ptr_.prime();
+        scale_ptr_.alloc();
         mov(scale_ptr_.reg(), ptr[param + 16]);
         scale_ptr_.save(layout);
 
-        bias_ptr_.prime();
+        bias_ptr_.alloc();
         mov(bias_ptr_.reg(), ptr[param + 24]);
         bias_ptr_.save(layout);
 
@@ -3861,15 +3892,15 @@ class MultiBufferKernel : public CodeGenerator, public RegPoolManager {
         scale_ptr_.restore(layout);
         src_ptr_.restore(layout);
         // ... use src_ptr_.reg() and scale_ptr_.reg() ...
-        src_ptr_.release();    // read-only: slot still valid, no store needed
-        scale_ptr_.release();
+        src_ptr_.free();    // read-only: slot still valid, no store needed
+        scale_ptr_.free();
 
         // Phase 2: write output using dst and bias.
         bias_ptr_.restore(layout);
         dst_ptr_.restore(layout);
         // ... write output using dst_ptr_.reg() and bias_ptr_.reg() ...
         dst_ptr_.save(layout);   // modified: must persist
-        bias_ptr_.release();
+        bias_ptr_.free();
 
         // End-of-kernel cleanup.
         src_ptr_.free();
@@ -3900,14 +3931,14 @@ ManagedAlias out_ptr = declare_alias(rax, r22);
 auto layout = make_stack_frame().build();
 
 // Initialization -- identical code on both paths.
-out_ptr.prime();
+out_ptr.alloc();
 mov(out_ptr.reg(), ptr[rdi + 0]);
 out_ptr.save(layout);   // APX: no-op; non-APX: mov [slot], rax; free rax
 
 // Use site -- identical code on both paths.
 out_ptr.restore(layout);          // APX: no-op; non-APX: alloc rax, load slot
 vmovaps(ptr[out_ptr.reg()], zmm0);
-out_ptr.release();                // APX: no-op; non-APX: free rax
+out_ptr.free();                // APX: no-op; non-APX: free rax
 
 // End of kernel.
 out_ptr.free();           // APX: frees r22; non-APX: no-op (already dormant)
@@ -3926,7 +3957,7 @@ bool const use_rbp = !needs_frame_pointer();
 ManagedAlias loop_var = declare_alias(rcx, rbp, use_rbp);
 
 auto layout = make_stack_frame().build();
-loop_var.prime();
+loop_var.alloc();
 xor_(loop_var.reg(), loop_var.reg());    // initialize counter to 0
 
 loop_var.save(layout);  // rbp path: no-op; rcx path: store slot, free rcx
@@ -3952,19 +3983,19 @@ emit on every read-only use.
 ManagedAlias cfg = declare_alias<Reg64>();
 
 auto layout = make_stack_frame().build();
-cfg.prime();
+cfg.alloc();
 mov(cfg.reg(), ptr[rdi + 8]);    // load config pointer from params
 cfg.save(layout);                // store to slot, free register
 
 // Read-only use 1.
 cfg.restore(layout);             // alloc reg, load from slot
 mov(rax, ptr[cfg.reg() + 0]);   // read first field
-cfg.release();                   // free reg; NO store emitted -- slot still valid
+cfg.free();                   // free reg; NO store emitted -- slot still valid
 
 // Read-only use 2, later in the kernel.
 cfg.restore(layout);
 vmovaps(zmm0, ptr[cfg.reg() + 64]);
-cfg.release();                   // again: free without store
+cfg.free();                   // again: free without store
 
 // Each restore/release pair costs one load and zero stores.
 // restore/save would emit a redundant store on every read-only use.
@@ -4083,3 +4114,649 @@ throws.  That assertion would need to be removed or changed to
   `save_volatiles()`, `restore_volatiles()` on an empty layout should continue
   to throw (slot count is 0, so any index is OOB).
 - `clean_stack()` should return `true` on an empty layout (nothing was pushed).
+
+---
+
+## 28. RAII Wrapper for `ManagedAlias`: `ScopedAlias`
+
+### Motivation
+
+`Scoped<RegT>` (returned by `makeScoped()`) calls `rm_.free(reg)` in its destructor
+for plain allocated registers.  No equivalent exists for `ManagedAlias`.  Without
+one, every `prime()` call requires a matching `release()` or `free()` somewhere in
+the code, including on every error path.  The pattern
+
+```cpp
+L("error_exit");
+alias_a.free();
+alias_b.free();
+```
+
+is both boilerplate and fragile: adding a third alias to the kernel silently misses
+the error-path cleanup unless every such label is updated by hand.
+
+In Phase 3c evaluation, Bug 4 required `alias_aux_A_vpad_bottom.free()` to be
+added unconditionally before `store_accumulators()` to ensure correctness on the
+FWD_I path.  Idempotent `free()` resolved the safety concern, but a `ScopedAlias`
+would have made the ownership intent self-documenting and independent of whether the
+alias was actually active at the exit point.
+
+### Proposed API
+
+`ScopedAlias` is a move-only RAII guard that calls `alias.free()` in its destructor
+if the alias is still active.  It is constructed by `ManagedAlias::scoped()`, which
+also calls `prime()` so that declaration and activation are a single step.
+
+```cpp
+// Move-only RAII owner for a ManagedAlias in ACTIVE state.
+// Calls alias.free() in its destructor if the alias is still active.
+class ScopedAlias {
+public:
+    explicit ScopedAlias(ManagedAlias &alias) : alias_(&alias) {}
+
+    ~ScopedAlias() {
+        if (alias_ && alias_->is_active()) alias_->release();
+    }
+
+    ScopedAlias(const ScopedAlias &)            = delete;
+    ScopedAlias &operator=(const ScopedAlias &) = delete;
+    ScopedAlias(ScopedAlias &&other) noexcept : alias_(other.alias_) {
+        other.alias_ = nullptr;
+    }
+
+    // Explicit early release -- disarms the destructor.
+    // No-op if the alias is already inactive.
+    void free() {
+        if (alias_ && alias_->is_active()) alias_->release();
+        alias_ = nullptr;
+    }
+
+private:
+    ManagedAlias *alias_;
+};
+
+// Factory on ManagedAlias -- prime() the alias and return a RAII guard.
+// After this call alias.is_active() == true and the guard owns the release.
+ScopedAlias ManagedAlias::scoped();
+```
+
+### Internal State Changes
+
+None on `RegPoolManager` or `StackFrame`.  `ScopedAlias` is a thin wrapper around
+`ManagedAlias &` with no additional manager state.
+
+### Usage Example -- Error-path cleanup
+
+```cpp
+// Without ScopedAlias: every exit path must list all active aliases manually.
+alias_src.alloc();
+alias_dst.alloc();
+if (error_condition) {
+    alias_src.free();  // easy to miss when a new alias is added later
+    alias_dst.free();
+    return;
+}
+use(alias_src.reg(), alias_dst.reg());
+alias_src.free();
+alias_dst.free();
+
+// With ScopedAlias: destructor handles free on all paths.
+auto g_src = alias_src.scoped();   // alloc() + RAII guard
+auto g_dst = alias_dst.scoped();
+if (error_condition) return;       // both freed automatically by destructors
+use(alias_src.reg(), alias_dst.reg());
+// both released when g_src and g_dst go out of scope
+```
+
+### Usage Example -- Explicit early release at a save point
+
+```cpp
+auto g = alias_binary_params.scoped();  // alloc(); guard armed
+
+// ... use alias_binary_params.reg() to load the binary params pointer ...
+
+// Must save before the register is needed by another alias.
+// Call save() explicitly, then disarm the guard (register is already free).
+alias_binary_params.save(*sf_main_);  // ACTIVE -> DORMANT; free(reg)
+g.free();                          // disarm: alias already inactive, no double-free
+```
+
+### Notes / Interactions
+
+- `ScopedAlias` calls `free()`, not `save()`.  It is appropriate only for aliases
+  whose value does not need to be persisted at scope exit.  Aliases that must be saved
+  before releasing should call `save()` explicitly first; the guard's `free()` then
+  becomes a no-op because `is_active()` is already false after `save()`.
+- `scoped()` calls `alloc()`.  If the alias is a no-slot alias (§30), `alloc()` throws
+  `GP_IN_USE` when another alias holds the same register; the `ScopedAlias` object is
+  never returned.  No cleanup is needed in the throwing path.
+- For slotted aliases that require `restore()` rather than `alloc()` at activation,
+  `ScopedAlias` is not directly applicable.  A `RestoredAlias` variant that calls
+  `restore(cl)` in its constructor could be added as a companion, but its destructor
+  semantics are less clear (should it `save()` or `release()`?).  This is left as a
+  future extension.
+- `ScopedVecAlias` (analogous wrapper for `ManagedVecAlias`, §31) should be added
+  alongside `ScopedAlias` for consistency.
+
+---
+
+## 29. Post-`build()` `declare_alias()` Detection
+
+### Motivation
+
+All `declare_alias()` calls must appear before `make_stack_frame().build()` because
+`build_layout()` assigns stack offsets to pending aliases at build time.  If
+`declare_alias()` is called after `build()` -- for example, in a refactoring that adds
+a new alias to an existing kernel -- the new alias receives no stack slot.  Subsequent
+`save()` and `restore()` calls on that alias either emit code at a wrong address or do
+nothing, depending on the implementation.  There is no diagnostic and no runtime
+assertion catches the mistake.
+
+Phase 3c evaluation noted this ordering constraint explicitly: all `declare_alias()`
+calls must appear before `make_stack_frame().build()` because `build_layout()` assigns
+stack offsets to pending aliases at build time.  The current implementation relies on
+the developer remembering this rule.
+
+### Proposed Change
+
+No new public API.  The fix is a guard inside all `declare_alias()` overloads that
+throws when `build()` has already been called on the current layout.
+
+**New error code** (add to `Xbyak::ErrorList` alongside the other `ERR_RM_*` entries
+from §11):
+
+```
+ERR_RM_ALIAS_AFTER_BUILD,  // declare_alias() called after make_stack_frame().build()
+```
+
+Add the matching string to `ConvertErrorToString`'s `errTbl`:
+
+```
+"declare_alias called after StackFrame build -- alias has no stack slot",
+```
+
+**Internal state change** (on `RegPoolManager`):
+
+```cpp
+// Set to true by StackFrame::build(); cleared by reset().
+// Guards all declare_alias() overloads from accepting registrations after
+// the layout has been committed.
+bool build_done_ = false;
+```
+
+**Guard inside all `declare_alias()` overloads** (including `declare_alias(reg, AliasMode::no_slot)`, §30):
+
+```cpp
+if (build_done_)
+    XBYAK_THROW(ERR_RM_ALIAS_AFTER_BUILD)
+pending_aliases_.push_back(...);
+```
+
+`reset()` clears `build_done_ = false` along with `pending_aliases_` so that a new
+`make_stack_frame().build()` cycle after `reset()` starts clean.
+
+No-slot aliases (§30) do not consume frame space, but they are still subject to the
+guard for consistency: allowing some overloads after `build()` while rejecting others
+creates a confusing partial contract that is harder to document and test.
+
+### Usage Example -- Incorrect code that the guard catches
+
+```cpp
+auto layout = make_stack_frame().gp_parks(2).build();  // build_done_ = true
+
+// Refactoring adds a new alias here -- WRONG ordering.
+ManagedAlias alias_new = declare_alias(rax);  // throws ERR_RM_ALIAS_AFTER_BUILD
+```
+
+The fix is to move `declare_alias(rax)` before the `make_stack_frame()` call.
+
+### Notes / Interactions
+
+- This guard fires in debug builds (via `XBYAK_THROW`) and is silently swallowed as a
+  TLS error in `XBYAK_NO_EXCEPTION` builds.  In release builds, the erroneous alias
+  simply has no slot and `save()`/`restore()` produce wrong code -- the same as
+  without the guard.  This is the standard debug-only protection model used throughout
+  the manager.
+- `declare_alias()` overloads that set `needs_slot_ = false` (the `AliasMode::no_slot`
+  path) do not modify `pending_aliases_`, so strictly speaking they could be exempt.
+  The guard is applied uniformly regardless to keep the rule simple: all alias
+  declarations precede `build()`.
+- `assert_clean_stack()` does not check `build_done_`.  Its job is to verify stack
+  balance, not declaration ordering.  The post-build guard is a separate concern.
+
+---
+
+## 30. Exclusive Sequential Alias: `declare_alias(reg, AliasMode::no_slot)`
+
+### Motivation
+
+Several oneDNN kernels use multiple C++ names for the same physical register with
+sequential (never concurrent) roles.  The pattern in `jit_brgemm_conv_comp_pad_kernel`
+is representative: `reg_icb` and `reg_aux_comp_out` are both bound to r9 at class
+definition time.  They are used in strictly non-overlapping phases and the developer
+must mentally track that only one is ever live at a time.
+
+The current single-alloc workaround -- allocate only the primary name, add a comment
+-- documents the aliasing but cannot detect if both roles are accidentally activated
+concurrently.  The Phase 2 evaluation design suggestion sketched an "alias group"
+mechanism with dedicated group registration and a `dissolve_group()` teardown call.
+
+Phase 3c evaluation demonstrated that this complexity is unnecessary.  Two no-slot
+`ManagedAlias` objects on the same physical register already get mutual exclusion for
+free from the pool's `live_gp_` tracking: when alias_a holds r9 in `live_gp_`, any
+attempt to `alloc(r9)` for alias_b throws `GP_IN_USE`.  The only gap is a variant of
+`declare_alias` that produces an alias with throw-on-conflict semantics at `prime()`,
+distinct from the existing no-slot path which is a no-op when the register is in use
+(correct for the APX permanent-hold case, wrong here).
+
+### API Naming: Parameter vs. Separate Function Name
+
+The new behavior could be exposed as either a separate function or a parameterized
+overload of the existing `declare_alias` family.  The parameterized approach is
+preferred because:
+
+- The `declare_alias(reg)` and `declare_alias(reg, AliasMode::no_slot)` pair expresses
+  that both create a single-register alias; the mode selects which backing strategy.
+- The second parameter is unambiguously distinct from the existing 2-argument overload
+  `declare_alias(primary, alt)`, where the second argument is always a `Reg64`.
+  `AliasMode` and `Reg64` are different types; no overload collision occurs.
+- The existing `declare_alias(primary, alt, bool)` can be reduced to a one-liner that
+  delegates to the two primitives:
+
+```cpp
+ManagedAlias declare_alias(const Reg64 &primary, const Reg64 &alt, bool use_alt) {
+    return use_alt ? declare_alias(alt,     AliasMode::no_slot)
+                   : declare_alias(primary, AliasMode::slotted);
+}
+```
+
+### `AliasMode` Enum
+
+```cpp
+// Controls whether declare_alias(reg, mode) reserves a stack slot.
+//
+// AliasMode::slotted  -- register is backed by an 8-byte slot in the StackFrame.
+//                        Slot is assigned at make_stack_frame().build() time.
+//                        save(sf) / restore(sf) emit the stack store/load.
+//                        This is the default for declare_alias(reg).
+//
+// AliasMode::no_slot  -- no stack slot is reserved; no slot assigned at build().
+//                        The register is acquired from the pool at prime() time
+//                        and returned at release() / free() time.
+//                        prime() throws GP_IN_USE if the register is already live,
+//                        enforcing mutual exclusion between any two aliases on the
+//                        same physical register.
+//                        save() and restore() are no-ops.
+enum class AliasMode { slotted, no_slot };
+```
+
+### Unification with the APX No-Slot Path
+
+The APX pattern previously used distinct implementation semantics: the register was
+pre-allocated at `declare_alias` time and held in `live_gp_` permanently, with
+`prime()` and `release()` both no-ops.  With the introduction of `AliasMode`,
+both the APX permanent-hold pattern and the sequential exclusive pattern are served
+by the same `AliasMode::no_slot` implementation.
+
+The 3-arg overload simplifies to a one-liner that delegates to the two primitives:
+
+```cpp
+// With AliasMode::no_slot covering both patterns, the 3-arg overload reduces to:
+ManagedAlias declare_alias(const Reg64 &primary, const Reg64 &alt, bool use_alt) {
+    return use_alt ? declare_alias(alt,     AliasMode::no_slot)
+                   : declare_alias(primary, AliasMode::slotted);
+}
+```
+
+The 2-arg APX convenience shorthand `declare_alias(primary, alt)` (which
+hard-coded `has_apx()` internally) is intentionally removed.  The explicit form
+`declare_alias(primary, alt, has_apx())` is equally terse and self-documenting.
+
+The behavioral change for the APX path: the register is no longer pre-allocated at
+`declare_alias` time.  The developer calls `prime()` once near the top of `generate()`
+to acquire it, and `free()` at end-of-kernel before `assert_all_free()`.
+For APX extended registers (r16-r31) this is always safe since those registers are
+never contested by the slotted path.
+
+The distinction between the two patterns is now purely a usage convention, not an
+implementation difference:
+
+| Pattern | prime() / release() usage | Stack slot |
+|---|---|---|
+| APX permanent hold | `prime()` once at start; `free()` at end-of-kernel | No |
+| Sequential exclusive | `prime()` / `release()` per active window | No |
+
+### Proposed API
+
+```cpp
+// Declare a named alias with explicit slot/no-slot control.
+//
+// AliasMode::slotted (default single-register overload behavior):
+//   Equivalent to declare_alias(reg) -- backed by a stack slot.
+//   Register is not allocated until prime() is called.
+//
+// AliasMode::no_slot:
+//   No stack slot is reserved; make_stack_frame().build() ignores this alias.
+//   Register is allocated by prime() and freed by release() or free().
+//   prime() throws GP_IN_USE if the register is already held in live_gp_,
+//   enforcing mutual exclusion between all aliases on the same physical register.
+//   save() and restore() are no-ops.
+//   The §29 post-build guard applies: declare before make_stack_frame().build().
+ManagedAlias declare_alias(const Xbyak::Reg64 &reg, AliasMode mode = AliasMode::slotted);
+
+// Existing single-register overload (unchanged behavior, calls the above with slotted).
+// Kept for backward compatibility and as the idiomatic default.
+// ManagedAlias declare_alias(const Xbyak::Reg64 &reg);  // equivalent to mode=slotted
+
+// APX-aware overload now delegates to the two primitives:
+ManagedAlias declare_alias(const Xbyak::Reg64 &primary, const Xbyak::Reg64 &alt,
+                           bool use_alt) {
+    return use_alt ? declare_alias(alt,     AliasMode::no_slot)
+                   : declare_alias(primary, AliasMode::slotted);
+}
+```
+
+### Internal State Changes
+
+`AliasPendingDecl` carries the `RegFamily` field introduced in §31.  No
+`exclusive_no_slot` flag is needed: all `AliasMode::no_slot` aliases share the
+same `prime()`/`release()` semantics (allocate at prime, throw on conflict, free
+at release):
+
+```cpp
+struct AliasPendingDecl {
+    bool      needs_slot;   // false for AliasMode::no_slot
+    int       desired_idx;  // -1: anonymous; >= 0: named register index
+    RegFamily family;       // RegFamily::GP (ManagedVecAlias adds RegFamily::Vec)
+};
+```
+
+`declare_alias(reg, AliasMode::no_slot)` sets `needs_slot = false`,
+`desired_idx = reg.getIdx()`, `family = RegFamily::GP`.
+
+### Implementation -- `prime()` for the no-slot path
+
+With the unified `AliasMode::no_slot` semantics, the APX-specific no-op branch is
+removed.  `prime()` always throws when the register is contested:
+
+```cpp
+void ManagedAlias::prime() {
+    if (!needs_slot_) {
+        if (!is_active_) {
+            if (!rm_->is_available_gp(desired_idx_))
+                XBYAK_THROW(ERR_RM_GP_IN_USE)  // mutual exclusion enforced
+            reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
+            is_active_ = true;
+        }
+        // else: already active on this alias -- re-prime is a no-op
+        return;
+    }
+    // ... slotted path unchanged ...
+}
+```
+
+### Implementation -- `release()` for the no-slot path
+
+```cpp
+void ManagedAlias::release() {
+    if (!needs_slot_) {
+        if (is_active_) {
+            rm_->free(reg_);
+            is_active_ = false;
+        }
+        return;
+    }
+    // ... slotted path ...
+}
+```
+
+### Usage Example -- Sequential GP aliases in a comp-pad kernel
+
+```cpp
+// Declaration (class members in the .hpp; no StackFrame slot consumed).
+ManagedAlias alias_icb      = declare_alias(r9, AliasMode::no_slot);
+ManagedAlias alias_aux_comp = declare_alias(r9, AliasMode::no_slot);
+
+// In icb_loop(): r9 serves as the icb loop counter.
+alias_icb.alloc();                        // alloc r9 from pool
+xor_(alias_icb.reg(), alias_icb.reg());  // initialize counter
+L("icb_loop_start");
+// ... loop body using alias_icb.reg() as r9 ...
+dec(alias_icb.reg());
+jnz("icb_loop_start");
+alias_icb.free();                      // free r9 back to pool
+
+// In store_accumulators(): r9 serves as an auxiliary output pointer.
+alias_aux_comp.alloc();                   // alloc r9: safe, alias_icb released it
+lea(alias_aux_comp.reg(), ptr[...]);
+// ... use alias_aux_comp.reg() as r9 ...
+alias_aux_comp.free();
+
+// Bug caught automatically:
+alias_icb.alloc();
+alias_aux_comp.alloc();  // GP_IN_USE: r9 is in live_gp_ under alias_icb
+```
+
+End-of-kernel cleanup (before `assert_all_free()`):
+
+```cpp
+alias_icb.free();       // no-op if already released
+alias_aux_comp.free();  // no-op if already released
+assert_all_free();
+```
+
+### Notes / Interactions
+
+- No "group" registration, no `dissolve_group()` call, and no new pool state are
+  required.  The mutual exclusion derives entirely from `live_gp_` tracking that the
+  pool already performs.  `declare_alias(reg, AliasMode::no_slot)` is the only new
+  surface; no additional flag is added to `AliasPendingDecl` or `ManagedAlias`.
+- Any number of `AliasMode::no_slot` aliases may be bound to the same physical
+  register.  The pool enforces that at most one is active at any time.
+- `assert_all_free()` catches a no-slot alias that was primed and never released,
+  just as it catches any live GP register.
+- `ScopedAlias` (§28) works with `AliasMode::no_slot` aliases: `scoped()` calls
+  `prime()` which may throw; the destructor calls `release()` which frees the register.
+- `make_stack_frame().build()` ignores `AliasMode::no_slot` aliases (no slot is
+  reserved).  The §29 post-build guard still applies: declare before `build()`.
+- The APX permanent-hold pattern (§26) now also uses `AliasMode::no_slot` internally
+  via `declare_alias(primary, alt, has_apx())`.  The implementation is shared;
+  the distinction is purely in usage (single prime/free per kernel vs. per-window
+  prime/release cycles).
+
+---
+
+## 31. `ManagedAlias` for Vector Registers: `ManagedVecAlias`
+
+### Motivation
+
+`ManagedAlias` is currently GP-only.  In kernels that call `jit_uni_postops_injector`
+with `preserve_vmm = true`, vector registers are saved and restored by the injector
+via `register_preserve_guard_t` -- a push-based mechanism separate from
+`RegPoolManager`.  Phase 3 evaluation confirmed that unifying those two systems
+requires redesigning the injector interface and is out of scope for a register manager
+change alone.
+
+However, for kernels that do NOT use the injector (or that control their own vector
+save/restore), there is no reason to exclude Zmm/Ymm from the same lifecycle-tracking
+safety that GP aliases provide.  A typical scenario: a kernel broadcasts a scale
+constant into a ZMM register early in `generate()`, needs to park it to the stack
+during a clobber window, and restores it afterwards.  Without `ManagedVecAlias` the
+developer must manage a raw `StackFrame` vec-park slot index manually.
+
+### Design
+
+`ManagedVecAlias` mirrors `ManagedAlias` with the same five-operation lifecycle but
+operates on `Xbyak::Zmm` (the widest form; callers narrow to `Ymm` or `Xmm` at use
+sites if needed) and uses `vmovdqu32` / `vmovdqu` for stack I/O, matching the
+instruction selection already used in `StackFrame::park_vec()` and `reload_vec()`.
+
+Slot sizing follows the same rule as `StackFrameBuilder::vec_parks()`: 64 bytes per
+slot on AVX-512 hardware, 32 bytes otherwise.
+
+### Proposed API
+
+**New factory overloads on `RegPoolManager`:**
+
+```cpp
+// Declare a named vector alias backed by a vec park slot in the StackFrame.
+// Slot size: 64 bytes (Zmm) when has_avx512() is true, 32 bytes (Ymm) otherwise.
+// A narrower reload (Ymm or Xmm) into a Zmm slot is legal but only the lower
+// lanes are meaningful -- the caller is responsible for lane-width consistency.
+ManagedVecAlias declare_vec_alias(Xbyak::Zmm reg);
+ManagedVecAlias declare_vec_alias(Xbyak::Ymm reg);
+ManagedVecAlias declare_vec_alias(Xbyak::Xmm reg);
+```
+
+**`ManagedVecAlias` class:**
+
+```cpp
+class ManagedVecAlias {
+public:
+    // DORMANT -> ACTIVE: alloc register, no load.
+    // Caller writes the initial value to reg() after calling prime().
+    ManagedVecAlias &prime();
+
+    // DORMANT -> ACTIVE: alloc register and load value from slot.
+    // Emits vmovdqu32 reg, [rsp+slot]  (Zmm) or  vmovdqu reg, [rsp+slot]  (Ymm/Xmm)
+    ManagedVecAlias &restore(StackFrame &cl);
+
+    // ACTIVE -> DORMANT: emit store to slot and free register.
+    // Emits vmovdqu32 [rsp+slot], reg  or  vmovdqu [rsp+slot], reg
+    ManagedVecAlias &save(StackFrame &cl);
+
+    // ACTIVE -> DORMANT: free register, no store.
+    // Slot retains the value from the last save().  Avoids a redundant store on
+    // read-only use sites.
+    ManagedVecAlias &release();
+
+    // Terminal: free register if active, end alias lifetime.
+    // Callable from ACTIVE or DORMANT state.  Must be called before assert_all_free().
+    void free();
+
+    // Returns the currently active register (always Zmm; caller narrows as needed).
+    // Precondition: is_active() == true.
+    const Xbyak::Zmm &reg() const;
+
+    bool is_active() const;
+};
+```
+
+All lifecycle methods return `ManagedVecAlias &` for chaining, consistent with
+`ManagedAlias` after the Phase 3c chainable-methods improvement.
+
+**`ScopedVecAlias`** -- RAII companion (see §28):
+
+```cpp
+class ScopedVecAlias {
+public:
+    explicit ScopedVecAlias(ManagedVecAlias &alias) : alias_(&alias) {}
+    ~ScopedVecAlias() { if (alias_ && alias_->is_active()) alias_->release(); }
+    ScopedVecAlias(const ScopedVecAlias &)            = delete;
+    ScopedVecAlias &operator=(const ScopedVecAlias &) = delete;
+    ScopedVecAlias(ScopedVecAlias &&other) noexcept : alias_(other.alias_) {
+        other.alias_ = nullptr;
+    }
+    void free() {
+        if (alias_ && alias_->is_active()) alias_->release();
+        alias_ = nullptr;
+    }
+private:
+    ManagedVecAlias *alias_;
+};
+
+ScopedVecAlias ManagedVecAlias::scoped();  // prime() + RAII guard
+```
+
+### Internal State Changes
+
+`AliasPendingDecl` (introduced in §26, extended in §30) carries the `RegFamily` field
+that `build_layout()` reads to assign the correct slot size:
+
+```cpp
+struct AliasPendingDecl {
+    bool      needs_slot;
+    int       desired_idx;
+    RegFamily family;   // RegFamily::GP or RegFamily::Vec
+};
+```
+
+`StackFrame` internal layout after `build_layout()` processes both GP and Vec alias
+declarations:
+
+```
+[rsp + 0       ]  GP alias slots     (8 bytes each; from declare_alias() calls)
+[rsp + A       ]  Vec alias slots    (32 or 64 bytes each, 64-byte aligned)
+[rsp + A+B     ]  GP park slots      (from gp_parks(n))
+[rsp + A+B+C   ]  Vec park slots     (from vec_parks(n))
+[rsp + ...     ]  volatile save area (from with_volatile_save())
+[rsp + ...     ]  scratch            (from scratch(bytes))
+[rsp + ...     ]  outgoing args      (from with_outgoing_args(n))
+```
+
+### Usage Example -- Scale constant parked across a clobber window
+
+```cpp
+class ScaleKernel : public Xbyak::CodeGenerator,
+                    public Xbyak::RegPoolManager {
+    ManagedVecAlias alias_scale;   // default-constructible class member
+
+    void generate() {
+        alias_scale = declare_vec_alias(zmm0);  // zmm0 with a 64-byte stack slot
+
+        auto sf = make_stack_frame()
+            .with_volatile_save()
+            .build();              // alias_scale slot allocated inside build()
+
+        emit_prologue();
+
+        // Broadcast the scale constant from the params pointer.
+        alias_scale.alloc();
+        vbroadcastss(alias_scale.reg(), ptr[rdi + offsetof(params_t, scale)]);
+        alias_scale.save(sf);      // store to slot; zmm0 free for clobber window
+
+        // --- clobber window: zmm0 used freely for computation ---
+        auto zmm_tmp = alloc<Zmm>();  // may return zmm0
+        // ... use zmm_tmp ...
+        free(zmm_tmp);
+
+        // --- use the scale constant again ---
+        alias_scale.restore(sf);   // reload zmm0 from slot
+        // ... use alias_scale.reg() ...
+        alias_scale.free();     // read-only: slot still valid, no store needed
+
+        alias_scale.free();
+        sf.destroy();
+        emit_epilogue();
+        ret();
+        assert_all_free();
+        assert_clean_stack();
+    }
+};
+```
+
+### Limitation: injector boundary
+
+`ManagedVecAlias` does NOT address the `preserve_vmm = true` injector scenario.
+That scenario requires the injector to participate in the pool protocol at the
+call boundary.  `ManagedVecAlias` covers only kernels that own their own vector
+save/restore path without relying on `register_preserve_guard_t`.  For
+injector-using kernels, the existing `preserve_vmm = true` push/pop mechanism
+remains the correct approach until the injector interface is redesigned.
+
+### Notes / Interactions
+
+- The store/load instruction emitted by `save()` and `restore()` matches the slot
+  width selected at `declare_vec_alias()` time (Zmm -> `vmovdqu32`; Ymm/Xmm ->
+  `vmovdqu`).  Accessing the slot with a narrower type than declared is legal but
+  only the lower bits are meaningful; the caller is responsible for lane-width
+  consistency.
+- `assert_all_free()` checks `live_vec_` for leaks.  Every `ManagedVecAlias` that
+  was primed must have `free()` called before `assert_all_free()`.
+- Opmask registers (`k1`-`k7`, 8 bytes each) could follow the same pattern with a
+  `ManagedOpmaskAlias` variant.  Their use in save/restore scenarios is rare enough
+  that this extension is deferred until a concrete kernel use case emerges.
+- `declare_vec_alias_no_slot()` -- an exclusive-sequential variant for vector registers
+  analogous to §30 -- is not proposed here.  The pattern of two C++ names sharing one
+  physical vector register with sequential roles has not appeared in evaluated kernels.
+  Add if a concrete use case is identified.

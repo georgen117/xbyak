@@ -825,8 +825,8 @@ public:
         // - Slot-backed: allocates the desired register (or any GP if anonymous).
         // - No-slot: no-op if already active; re-allocates if previously freed.
         // Throws GP_IN_USE if a named slot-backed register is not available.
-        // Returns *this for chaining: alias.prime().reg() or alias.prime().save(sf).
-        ManagedAlias& prime() {
+        // Returns *this for chaining: alias.alloc().reg() or alias.alloc().save(sf).
+        ManagedAlias& alloc() {
             if (desired_idx_ >= 0) {
                 if (rm_->is_available_gp(desired_idx_)) {
                     reg_       = rm_->alloc<Xbyak::Reg64>(desired_idx_);
@@ -846,7 +846,7 @@ public:
         }
 
         // Spill to the stack slot and release the register.  Slot-backed only.
-        // Returns *this for chaining after prime(): alias.prime().save(sf).
+        // Returns *this for chaining after alloc(): alias.alloc().save(sf).
         // Defined out-of-line after StackFrame.
         ManagedAlias& save(StackFrame &sf);
 
@@ -862,7 +862,7 @@ public:
         // the active/inactive state is unknown.
         // Works for both slot-backed and no-slot aliases.
         // Returns *this for chaining.
-        ManagedAlias& release() {
+        ManagedAlias& free() {
             if (is_active_) rm_->free(reg_);
             is_active_ = false;
             return *this;

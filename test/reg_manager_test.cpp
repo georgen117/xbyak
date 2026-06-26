@@ -3244,10 +3244,10 @@ CYBOZU_TEST_AUTO(managedAliasPatterns)
         auto c = rm.declare_alias(Reg64(10), Reg64(11), false);
         CYBOZU_TEST_ASSERT(c.has_stack_slot());
         CYBOZU_TEST_ASSERT(!c.is_active());
-        c.prime();
+        c.alloc();
         CYBOZU_TEST_ASSERT(c.is_active());
         CYBOZU_TEST_EQUAL(c.reg().getIdx(), 10);
-        c.release();
+        c.free();
     }
 }
 
@@ -3262,7 +3262,7 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
         auto a = rm.declare_alias(Reg64(10));
         CYBOZU_TEST_ASSERT(!a.is_active());
 
-        a.prime();
+        a.alloc();
 
         CYBOZU_TEST_ASSERT(a.is_active());
         CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
@@ -3270,7 +3270,7 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
         // r10 is now live; a second named alloc must throw.
         CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), Xbyak::RegManagerError);
 
-        a.release();
+        a.free();
         CYBOZU_TEST_ASSERT(!a.is_active());
 
         // After release, r10 is back in the free pool.
@@ -3284,7 +3284,7 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
         RegPoolManager rm(g_cpu);
         auto a = rm.declare_alias(Reg64(10));
         auto r10 = rm.alloc<Reg64>(10);  // take r10 first
-        CYBOZU_TEST_EXCEPTION(a.prime(), Xbyak::RegManagerError);
+        CYBOZU_TEST_EXCEPTION(a.alloc(), Xbyak::RegManagerError);
         rm.free(r10);
     }
 
@@ -3293,11 +3293,11 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
         RegPoolManager rm(g_cpu);
         auto a = rm.declare_alias<Reg64>();
         CYBOZU_TEST_ASSERT(!a.is_active());
-        a.prime();
+        a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
         // reg() returns a valid register (index in [0,15]).
         CYBOZU_TEST_ASSERT(a.reg().getIdx() < 16);
-        a.release();
+        a.free();
     }
 }
 
@@ -3312,7 +3312,7 @@ CYBOZU_TEST_AUTO(managedAliasNoSlotActive)
     CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
 
     // prime() on an already-active no-slot alias is a no-op.
-    a.prime();
+    a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
     CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
 
@@ -3330,7 +3330,7 @@ CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
     {
         RegPoolManager rm(g_cpu);
         auto a = rm.declare_alias(Reg64(10));
-        a.prime();
+        a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
 
         a.free();
@@ -3341,7 +3341,7 @@ CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
         rm.free(r);
 
         // Re-prime.
-        a.prime();
+        a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
         CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
         a.free();
@@ -3356,7 +3356,7 @@ CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
         a.free();
         CYBOZU_TEST_ASSERT(!a.is_active());
 
-        a.prime();
+        a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
         CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
         a.free();
@@ -3448,7 +3448,7 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
             auto a = declare_alias(Reg64(10));
             auto sf = make_stack_frame().build();
 
-            a.prime();                          // allocate r10
+            a.alloc();                          // allocate r10
             mov(a.reg(), 0xABCD1234ULL);        // r10 = 0xABCD1234
 
             a.save(sf);                         // [rsp+<off>] = r10; free r10
@@ -3464,7 +3464,7 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
             CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
 
             mov(rax, a.reg());                  // rax = 0xABCD1234
-            a.release();
+            a.free();
 
             sf.destroy();
             ret();
@@ -3486,7 +3486,7 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
             auto a = declare_alias(Reg64(10));
             auto sf = make_stack_frame().gp_parks(1).build();
 
-            a.prime();
+            a.alloc();
 
             // Use r11 for the park slot.
             auto park_reg = alloc<Reg64>(11);
@@ -3516,7 +3516,7 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
             mov(rax, park_reg);
             add(rax, a.reg());
 
-            a.release();
+            a.free();
             free(park_reg);
             sf.destroy();
             ret();
@@ -3540,7 +3540,7 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
             auto sf = make_stack_frame().build();
 
             CYBOZU_TEST_ASSERT(!a.is_active());
-            a.prime();
+            a.alloc();
             CYBOZU_TEST_ASSERT(a.is_active());
 
             // Write a known value, save to slot, clobber, restore, read back.
@@ -3555,7 +3555,7 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
 
             a.restore(sf);
             mov(rax, a.reg());
-            a.release();
+            a.free();
 
             sf.destroy();
             ret();
@@ -3577,7 +3577,7 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
             auto a = declare_alias(Reg64(10));
             auto sf = make_stack_frame().build();
 
-            a.prime();
+            a.alloc();
             mov(a.reg(), 0xBEEFCAFEULL);
 
             a.save(sf);                  // slot = 0xBEEFCAFE; r10 freed
@@ -3587,7 +3587,7 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
             CYBOZU_TEST_ASSERT(a.is_active());
 
             // Value not modified; release instead of save -- no store emitted.
-            a.release();
+            a.free();
             CYBOZU_TEST_ASSERT(!a.is_active());
 
             // Slot must still hold the value written by save().
@@ -3596,7 +3596,7 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
             CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
 
             mov(rax, a.reg());           // rax = 0xBEEFCAFE
-            a.release();
+            a.free();
 
             sf.destroy();
             ret();
