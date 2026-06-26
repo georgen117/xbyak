@@ -60,6 +60,7 @@ enum class RmError {
     LAYOUT_SCRATCH_OOB,
     LAYOUT_SAVE_NOT_DECLARED,
     LAYOUT_ALREADY_ACTIVE,
+    ALIAS_AFTER_BUILD,      // declare_alias() called after make_stack_frame().build()
 };
 
 // RegManager-specific exception.  Carries a typed RmError code and a
@@ -93,6 +94,7 @@ class RegManagerError : public std::exception {
             "reg manager: stack layout scratch offset out of bounds",
             "reg manager: save_volatiles called but with_volatile_save() was not declared",
             "reg manager: a StackFrame is already active on this manager",
+            "reg manager: declare_alias called after StackFrame build -- alias has no stack slot",
         };
         const int idx = static_cast<int>(e);
         return (idx >= 0 && idx < static_cast<int>(sizeof(tbl) / sizeof(*tbl)))
@@ -1347,6 +1349,7 @@ public:
     // The register is not allocated until prime() is called.
     // Call save(sf)/restore(sf) to spill/reload across time-sharing boundaries.
     ManagedAlias declare_alias(const Xbyak::Reg64 &reg) {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
         const int id = static_cast<int>(pending_aliases_.size());
         pending_aliases_.push_back({true, reg.getIdx()});
         return ManagedAlias(id, reg.getIdx(), true, this);
@@ -1358,6 +1361,7 @@ public:
     // On base targets: use primary_reg with a stack slot.
     ManagedAlias declare_alias(const Xbyak::Reg64 &primary_reg,
                                const Xbyak::Reg64 &alt_reg) {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
         return declare_alias(primary_reg, alt_reg, has_apx_);
     }
 
@@ -1367,6 +1371,7 @@ public:
     ManagedAlias declare_alias(const Xbyak::Reg64 &primary_reg,
                                const Xbyak::Reg64 &alt_reg,
                                bool use_alt) {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
         const int id = static_cast<int>(pending_aliases_.size());
         if (use_alt) {
             pending_aliases_.push_back({false, alt_reg.getIdx()});
@@ -1384,6 +1389,7 @@ public:
     // The register is chosen at prime() time from whatever GP is free then.
     template <class RegT>
     ManagedAlias declare_alias() {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
         static_assert(std::is_same<RegT, Xbyak::Reg64>::value,
                       "ManagedAlias only supports Xbyak::Reg64");
         const int id = static_cast<int>(pending_aliases_.size());
@@ -1515,6 +1521,7 @@ public:
             // Round total up to nearest 16 bytes for stack alignment.
             total = (cursor + 15) & ~ptrdiff_t(15);
         }
+        build_done_ = true;
         return StackFrame(*this, gp_base, gp_count, vec_base, vec_count,
                                vec_slot, scratch_base, scratch_bytes, total,
                                std::move(vol_gps), vol_gp_base,
@@ -1616,6 +1623,7 @@ public:
         allocated_stack_space_ = 0;
         layout_active_ = false;
         pending_aliases_.clear();
+        build_done_    = false;
     }
 
     // Emits a push instruction for each callee-saved GP register promoted by
@@ -2045,6 +2053,7 @@ private:
         int  desired_idx;  // -1: anonymous; >= 0: named register index
     };
     std::vector<AliasPendingDecl> pending_aliases_;
+    bool build_done_ = false;  // set by build_layout(); guards declare_alias()
 
     // Returns true if the GP register at the given index is currently free.
     // Includes both caller-saved (free_gp_regs) and callee-saved registers

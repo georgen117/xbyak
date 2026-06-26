@@ -3606,3 +3606,95 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
     k.build();
     CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xBEEFCAFEULL);
 }
+
+// ---------------------------------------------------------------------------
+// §29 -- post-build declare_alias() guard
+// ---------------------------------------------------------------------------
+
+// All four declare_alias overloads must throw ALIAS_AFTER_BUILD when called
+// after make_stack_frame().build() has been called on the same manager.
+CYBOZU_TEST_AUTO(aliasDeclareAfterBuildNamed)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            auto sf = make_stack_frame().build();
+            // declare_alias after build -- must throw
+            CYBOZU_TEST_EXCEPTION(declare_alias(r10), Xbyak::RegManagerError);
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
+
+CYBOZU_TEST_AUTO(aliasDeclareAfterBuildTwoArg)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            auto sf = make_stack_frame().build();
+            CYBOZU_TEST_EXCEPTION(declare_alias(rax, r16, false), Xbyak::RegManagerError);
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
+
+CYBOZU_TEST_AUTO(aliasDeclareAfterBuildThreeArg)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            auto sf = make_stack_frame().build();
+            CYBOZU_TEST_EXCEPTION(declare_alias(rax, r16, false), Xbyak::RegManagerError);
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
+
+CYBOZU_TEST_AUTO(aliasDeclareAfterBuildAnonymous)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            auto sf = make_stack_frame().build();
+            CYBOZU_TEST_EXCEPTION(declare_alias<Xbyak::Reg64>(), Xbyak::RegManagerError);
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
+
+// Declaring before build() is fine; the guard must not fire.
+CYBOZU_TEST_AUTO(aliasDeclareBeforeBuildOk)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            CYBOZU_TEST_NO_EXCEPTION(declare_alias(r10));
+            auto sf = make_stack_frame().build();
+            sf.destroy();
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
+
+// After reset(), build_done_ is cleared and declare_alias() works again.
+CYBOZU_TEST_AUTO(aliasDeclareAfterBuildThenReset)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            auto sf = make_stack_frame().build();
+            CYBOZU_TEST_EXCEPTION(declare_alias(r10), Xbyak::RegManagerError);
+            sf.destroy();
+            RegPoolManager::reset();
+            // After reset, declare_alias must work again.
+            CYBOZU_TEST_NO_EXCEPTION(declare_alias(r10));
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
