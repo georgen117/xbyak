@@ -252,13 +252,25 @@ public:
             }
         }
 
-        // XCR0[1] = SSE state (XMM registers), XCR0[2] = AVX state (YMM upper half)
-        // Both must be OS-enabled before vector registers can be safely used
+        // XCR0[1] = SSE/XMM state, XCR0[2] = AVX/YMM upper half.
+        //
+        // has_xmm_base: XMM register pool is safe to use.  On OSXSAVE-capable
+        // CPUs the OS must have set XCR0[1] (SSE state save).  On older CPUs
+        // without OSXSAVE (e.g. Nehalem/SSE4.2), the OS saves XMM state via
+        // FXSAVE, so SSE2 presence is sufficient.
+        //
+        // has_vec_base: YMM/VEX capability -- requires both XCR0[1] and XCR0[2]
+        // (YMM upper-half save).  Guards VEX-encoded emission (vmovdqu ymm,
+        // vmovdqu32 zmm) in save_volatiles / restore_volatiles.
+        const bool has_xmm_base = cpu.has(Xbyak::util::Cpu::tOSXSAVE)
+            ? ((xcr0 >> 1) & 1) == 1
+            : cpu.has(Xbyak::util::Cpu::tSSE2);
         const bool has_vec_base = ((xcr0 >> 1) & 3) == 3;
-        if (has_vec_base) {
+        if (has_xmm_base) {
             free_vec_regs = base_free_vec();
             preserved_vec = base_preserved_vec();
         }
+        has_xmm_base_ = has_xmm_base;
         has_vec_base_ = has_vec_base;
 
         // If AVX-512 is available, add zmm16-zmm31 to the free pool
@@ -1820,7 +1832,7 @@ public:
                 free_gp_regs.insert(i);
         }
         live_vec_.clear();
-        if (has_vec_base_) {
+        if (has_xmm_base_) {
             free_vec_regs = base_free_vec();
             preserved_vec = base_preserved_vec();
         } else {
@@ -2372,9 +2384,12 @@ private:
     bool has_opmask_ = false; // true when XCR0[5] set (k registers available; subset of AVX-512)
     // 15 without (SSE/AVX/AVX2), 31 with AVX-512
     int max_vec_reg_idx_ = 15;
-    // True when the OS has enabled XMM and YMM state saving (XCR0[1:2] == 3).
-    // Determines whether base_free_vec() / base_preserved_vec() are applied.
+    // True when the OS has enabled YMM state saving (XCR0[1:2] == 3).
+    // Guards VEX-encoded emission in save_volatiles / restore_volatiles.
     bool has_vec_base_ = false;
+    // True when XMM registers are available (SSE2 present; or OSXSAVE + XCR0[1]).
+    // Determines whether base_free_vec() / base_preserved_vec() are applied.
+    bool has_xmm_base_ = false;
 
     // AMX tile registers (tmm0-tmm7): no preserved tiles, all caller-saved
     // Pool is empty by default; tmm0-tmm7 are added in constructor if AMX detected
