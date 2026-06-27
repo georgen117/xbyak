@@ -793,6 +793,8 @@ public:
     // Forward declarations for the builder and committed types.
     class StackFrame;
     class ScopedAlias;
+    class ManagedVecAlias;
+    class ScopedVecAlias;
 
     // A register alias managed by RegPoolManager.
     //
@@ -924,6 +926,115 @@ public:
 
     private:
         ManagedAlias *alias_;
+    };
+
+    // A vector register alias managed by RegPoolManager.
+    //
+    // Lifecycle mirrors ManagedAlias but operates on Zmm/Ymm/Xmm registers.
+    // The active register is always represented as Xbyak::Zmm; callers narrow
+    // to Ymm or Xmm at use sites via Ymm(reg().getIdx()) if needed.
+    //
+    // Lifecycle:
+    //   1. declare_vec_alias(zmm/ymm/xmm)  -- created by RegPoolManager
+    //   2. alloc()     -- allocates the vector register (no load)
+    //   3. save(sf)    -- spill to vec alias slot and release register
+    //   4. restore(sf) -- reload from slot and re-acquire register
+    //   5. free()      -- release register without storing (no-op if inactive)
+    //
+    // save/restore are defined out-of-line after StackFrame is complete.
+    class ManagedVecAlias {
+    public:
+        // Default constructor -- creates an uninitialized (null) alias.
+        ManagedVecAlias()
+            : alias_id_(-1), desired_idx_(-1),
+              is_active_(false), rm_(nullptr) {}
+
+        // Returns the currently active register (always Zmm).
+        // Throws GP_NOT_AVAILABLE if the alias is not active.
+        const Xbyak::Zmm &reg() const {
+            if (!is_active_) RM_THROW_RET(RmError::GP_NOT_AVAILABLE, reg_)
+            return reg_;
+        }
+
+        bool is_active()     const { return is_active_; }
+        bool has_stack_slot() const { return alias_id_ >= 0; }
+
+        // DORMANT -> ACTIVE: allocate the register, no load from slot.
+        // No-op if already active.
+        ManagedVecAlias &alloc() {
+            if (is_active_) return *this;
+            if (desired_idx_ >= 0) {
+                if (!rm_->is_available_vec(desired_idx_))
+                    RM_THROW_RET(RmError::GP_IN_USE, *this)
+                reg_ = rm_->alloc<Xbyak::Zmm>(desired_idx_);
+            } else {
+                reg_ = rm_->alloc<Xbyak::Zmm>();
+            }
+            is_active_ = true;
+            return *this;
+        }
+
+        // ACTIVE -> DORMANT: store to slot and release register.
+        // Emits vmovdqu32 (Zmm slot) or vmovdqu (Ymm slot) depending on hardware.
+        // No-op if the alias has no slot.
+        // Declaration only -- defined out-of-line after StackFrame.
+        ManagedVecAlias &save(StackFrame &sf);
+
+        // DORMANT -> ACTIVE: allocate register and load from slot.
+        // Declaration only -- defined out-of-line after StackFrame.
+        ManagedVecAlias &restore(StackFrame &sf);
+
+        // ACTIVE -> DORMANT: release register without storing.
+        // Idempotent: safe to call when already inactive.
+        ManagedVecAlias &free() {
+            if (is_active_) rm_->free(reg_);
+            is_active_ = false;
+            return *this;
+        }
+
+        // Allocate the alias and return a RAII guard that calls free()
+        // when the guard goes out of scope.
+        ScopedVecAlias scoped();
+
+    private:
+        friend class RegPoolManager;
+        ManagedVecAlias(int alias_id, int desired_idx, RegPoolManager *rm)
+            : alias_id_(alias_id), desired_idx_(desired_idx),
+              is_active_(false), rm_(rm) {}
+
+        int              alias_id_;
+        int              desired_idx_;  // -1: anonymous; >= 0: named register index
+        bool             is_active_;
+        Xbyak::Zmm       reg_{0};
+        RegPoolManager  *rm_;
+    };
+
+    // Move-only RAII guard for a ManagedVecAlias.
+    // Calls alias.free() in its destructor if the alias is still active.
+    // Constructed via ManagedVecAlias::scoped(), which calls alloc() first.
+    class ScopedVecAlias {
+    public:
+        explicit ScopedVecAlias(ManagedVecAlias &alias) : alias_(&alias) {}
+
+        ~ScopedVecAlias() {
+            if (alias_ && alias_->is_active()) alias_->free();
+        }
+
+        ScopedVecAlias(const ScopedVecAlias &)            = delete;
+        ScopedVecAlias &operator=(const ScopedVecAlias &) = delete;
+        ScopedVecAlias(ScopedVecAlias &&other) noexcept : alias_(other.alias_) {
+            other.alias_ = nullptr;
+        }
+
+        // Explicit early release -- disarms the destructor.
+        // No-op if the alias is already inactive.
+        void free() {
+            if (alias_ && alias_->is_active()) alias_->free();
+            alias_ = nullptr;
+        }
+
+    private:
+        ManagedVecAlias *alias_;
     };
 
     // Builder -- accumulates slot requirements before any code is emitted.
@@ -1275,6 +1386,35 @@ public:
             rm_->cg_->mov(reg, rm_->cg_->qword[rm_->cg_->rsp + off]);
         }
 
+        // Store a vector register to the alias vec slot identified by alias_id.
+        // Uses vmovdqu32 (Zmm) on AVX-512 hardware, vmovdqu (Ymm) otherwise.
+        // Used by ManagedVecAlias::save().
+        void alias_vec_store(int alias_id, const Xbyak::Zmm &reg) {
+            if (alias_id < 0 || alias_id >= static_cast<int>(alias_offsets_.size()))
+                return;
+            const ptrdiff_t off = alias_offsets_[alias_id];
+            if (off < 0) return;
+            if (rm_->has_avx512_)
+                rm_->cg_->vmovdqu32(rm_->cg_->ptr[rm_->cg_->rsp + off], reg);
+            else
+                rm_->cg_->vmovdqu(rm_->cg_->ptr[rm_->cg_->rsp + off],
+                                   Xbyak::Ymm(reg.getIdx()));
+        }
+
+        // Load a vector register from the alias vec slot identified by alias_id.
+        // Used by ManagedVecAlias::restore().
+        void alias_vec_load(int alias_id, Xbyak::Zmm &reg) {
+            if (alias_id < 0 || alias_id >= static_cast<int>(alias_offsets_.size()))
+                return;
+            const ptrdiff_t off = alias_offsets_[alias_id];
+            if (off < 0) return;
+            if (rm_->has_avx512_)
+                rm_->cg_->vmovdqu32(reg, rm_->cg_->ptr[rm_->cg_->rsp + off]);
+            else
+                rm_->cg_->vmovdqu(Xbyak::Ymm(reg.getIdx()),
+                                   rm_->cg_->ptr[rm_->cg_->rsp + off]);
+        }
+
     private:
         RegPoolManager *rm_;
         ptrdiff_t gp_base_;
@@ -1394,7 +1534,7 @@ public:
     ManagedAlias declare_alias(const Xbyak::Reg64 &reg) {
         if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
         const int id = static_cast<int>(pending_aliases_.size());
-        pending_aliases_.push_back({true, reg.getIdx()});
+        pending_aliases_.push_back({true, reg.getIdx(), RegFamily::GP});
         return ManagedAlias(id, reg.getIdx(), true, this);
     }
 
@@ -1417,7 +1557,7 @@ public:
         if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedAlias())
         const bool slot = (mode == AliasMode::slotted);
         const int id = static_cast<int>(pending_aliases_.size());
-        pending_aliases_.push_back({slot, reg.getIdx()});
+        pending_aliases_.push_back({slot, reg.getIdx(), RegFamily::GP});
         return ManagedAlias(id, reg.getIdx(), slot, this);
     }
 
@@ -1443,8 +1583,45 @@ public:
         static_assert(std::is_same<RegT, Xbyak::Reg64>::value,
                       "ManagedAlias only supports Xbyak::Reg64");
         const int id = static_cast<int>(pending_aliases_.size());
-        pending_aliases_.push_back({true, -1});
+        pending_aliases_.push_back({true, -1, RegFamily::GP});
         return ManagedAlias(id, -1, true, this);
+    }
+
+    // Declare a named vector alias backed by a vec slot in the StackFrame.
+    // The register is not allocated until alloc() is called.
+    // Slot size: 64 bytes when has_avx512() is true, 32 bytes otherwise.
+    // All three overloads accept Zmm, Ymm, or Xmm; the alias always holds
+    // the register as Xbyak::Zmm -- narrow at use sites if needed.
+    ManagedVecAlias declare_vec_alias(const Xbyak::Zmm &reg) {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedVecAlias())
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({true, reg.getIdx(), RegFamily::Vec});
+        return ManagedVecAlias(id, reg.getIdx(), this);
+    }
+    ManagedVecAlias declare_vec_alias(const Xbyak::Ymm &reg) {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedVecAlias())
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({true, reg.getIdx(), RegFamily::Vec});
+        return ManagedVecAlias(id, reg.getIdx(), this);
+    }
+    ManagedVecAlias declare_vec_alias(const Xbyak::Xmm &reg) {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedVecAlias())
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({true, reg.getIdx(), RegFamily::Vec});
+        return ManagedVecAlias(id, reg.getIdx(), this);
+    }
+
+    // Declare an anonymous vector alias -- register chosen at alloc() time.
+    template <class RegT>
+    ManagedVecAlias declare_vec_alias() {
+        if (build_done_) RM_THROW_RET(RmError::ALIAS_AFTER_BUILD, ManagedVecAlias())
+        static_assert(std::is_same<RegT, Xbyak::Zmm>::value ||
+                      std::is_same<RegT, Xbyak::Ymm>::value ||
+                      std::is_same<RegT, Xbyak::Xmm>::value,
+                      "declare_vec_alias<RegT>: RegT must be Zmm, Ymm, or Xmm");
+        const int id = static_cast<int>(pending_aliases_.size());
+        pending_aliases_.push_back({true, -1, RegFamily::Vec});
+        return ManagedVecAlias(id, -1, this);
     }
 
     // build() is defined here so it can reference StackFrame's constructor.
@@ -1499,16 +1676,23 @@ public:
         }
 
         // Alias slots come next, one 8-byte slot per slot-backed alias.
-        // No-slot aliases (no-stack path) record offset -1.
-        std::vector<ptrdiff_t> alias_offsets;
-        alias_offsets.reserve(pending_aliases_.size());
-        for (const auto &decl : pending_aliases_) {
+        // Alias slots: GP first (8 bytes each), then Vec (vec_slot bytes each).
+        // No-slot GP aliases record offset -1.
+        std::vector<ptrdiff_t> alias_offsets(pending_aliases_.size(), ptrdiff_t(-1));
+        for (size_t i = 0; i < pending_aliases_.size(); ++i) {
+            const auto &decl = pending_aliases_[i];
+            if (decl.family != RegFamily::GP) continue;
             if (decl.needs_slot) {
-                alias_offsets.push_back(cursor);
+                alias_offsets[i] = cursor;
                 cursor += 8;
-            } else {
-                alias_offsets.push_back(ptrdiff_t(-1));
             }
+            // no_slot GP aliases: offset stays -1
+        }
+        for (size_t i = 0; i < pending_aliases_.size(); ++i) {
+            const auto &decl = pending_aliases_[i];
+            if (decl.family != RegFamily::Vec) continue;
+            alias_offsets[i] = cursor;
+            cursor += vec_slot;
         }
 
         const ptrdiff_t gp_base = cursor;
@@ -2097,10 +2281,11 @@ private:
 #endif
 
     // Pending alias declarations recorded before build_layout() is called.
-    // Each element captures the needs_slot flag and the desired register index.
+    // Each element captures the needs_slot flag, desired register index, and family.
     struct AliasPendingDecl {
         bool needs_slot;
-        int  desired_idx;  // -1: anonymous; >= 0: named register index
+        int desired_idx;  // -1: anonymous; >= 0: named register index
+        RegFamily family;       // GP or Vec
     };
     std::vector<AliasPendingDecl> pending_aliases_;
     bool build_done_ = false;  // set by build_layout(); guards declare_alias()
@@ -2110,6 +2295,11 @@ private:
     // not yet promoted (preserved_gp), since alloc() handles both.
     bool is_available_gp(int idx) const {
         return free_gp_regs.count(idx) != 0 || preserved_gp.count(idx) != 0;
+    }
+
+    // Returns true if the vector register at the given index is currently free.
+    bool is_available_vec(int idx) const {
+        return free_vec_regs.count(idx) != 0 || preserved_vec.count(idx) != 0;
     }
 
     std::set<int> live_gp_;
@@ -2260,6 +2450,36 @@ inline Xbyak::RegPoolManager::ScopedAlias
 Xbyak::RegPoolManager::ManagedAlias::scoped() {
     alloc();
     return ScopedAlias(*this);
+}
+
+// Out-of-line definitions for ManagedVecAlias methods that reference StackFrame.
+
+inline Xbyak::RegPoolManager::ManagedVecAlias&
+Xbyak::RegPoolManager::ManagedVecAlias::save(
+        Xbyak::RegPoolManager::StackFrame &sf) {
+    if (!is_active_) return *this;
+    sf.alias_vec_store(alias_id_, reg_);
+    rm_->free(reg_);
+    is_active_ = false;
+    return *this;
+}
+
+inline Xbyak::RegPoolManager::ManagedVecAlias&
+Xbyak::RegPoolManager::ManagedVecAlias::restore(
+        Xbyak::RegPoolManager::StackFrame &sf) {
+    if (desired_idx_ >= 0)
+        reg_ = rm_->alloc<Xbyak::Zmm>(desired_idx_);
+    else
+        reg_ = rm_->alloc<Xbyak::Zmm>();
+    is_active_ = true;
+    sf.alias_vec_load(alias_id_, reg_);
+    return *this;
+}
+
+inline Xbyak::RegPoolManager::ScopedVecAlias
+Xbyak::RegPoolManager::ManagedVecAlias::scoped() {
+    alloc();
+    return ScopedVecAlias(*this);
 }
 
 #endif // XBYAK_REG_MANAGER_HPP

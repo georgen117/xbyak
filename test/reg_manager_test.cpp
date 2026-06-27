@@ -3941,3 +3941,250 @@ CYBOZU_TEST_AUTO(scopedAliasSaveFirst)
     Kernel k;
     k.build();
 }
+
+// -----------------------------------------------------------------------------
+// Tests -- ManagedVecAlias and ScopedVecAlias
+// -----------------------------------------------------------------------------
+
+// Basic lifecycle: declare, alloc, check idx, free.
+CYBOZU_TEST_AUTO(managedVecAliasBasic)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    CYBOZU_TEST_ASSERT(a.has_stack_slot());
+
+    a.alloc();
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+
+    a.free();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+
+    // zmm5 is back in pool.
+    auto v = rm.alloc<Zmm>(5);
+    CYBOZU_TEST_EQUAL(v.getIdx(), 5);
+    rm.free(v);
+}
+
+// free() on inactive alias is idempotent (no crash).
+CYBOZU_TEST_AUTO(managedVecAliasFreeIdempotent)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    CYBOZU_TEST_NO_EXCEPTION(a.free();)
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}
+
+// alloc() when already active is a no-op (re-alloc idempotent).
+CYBOZU_TEST_AUTO(managedVecAliasAllocIdempotent)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+    a.alloc();
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_NO_EXCEPTION(a.alloc();)  // second alloc: no-op, no throw
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+    a.free();
+}
+
+// Declare after build() throws ALIAS_AFTER_BUILD.
+CYBOZU_TEST_AUTO(managedVecAliasPostBuild)
+{
+    struct DummyKernel : Xbyak::CodeGenerator, Xbyak::RegPoolManager {
+        DummyKernel() : Xbyak::CodeGenerator(4096), Xbyak::RegPoolManager(g_cpu, this) {}
+        void go() {
+            auto sf = make_stack_frame().build();
+            CYBOZU_TEST_EXCEPTION(declare_vec_alias(zmm5), Xbyak::RegManagerError);
+            sf.destroy();
+            RegPoolManager::reset();
+            CYBOZU_TEST_NO_EXCEPTION(declare_vec_alias(zmm5));
+        }
+    };
+    DummyKernel k;
+    k.go();
+}
+
+// Anonymous vec alias: alloc() picks any free vector register.
+CYBOZU_TEST_AUTO(managedVecAliasAnonymous)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias<Zmm>();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    CYBOZU_TEST_ASSERT(a.has_stack_slot());
+
+    a.alloc();
+    CYBOZU_TEST_ASSERT(a.is_active());
+    CYBOZU_TEST_ASSERT(a.reg().getIdx() >= 0);
+    a.free();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}
+
+// reset() clears pending vec aliases; register is usable again.
+CYBOZU_TEST_AUTO(managedVecAliasReset)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+    };
+    Kernel k;
+    if (k.get_free_vecs().empty() && !k.has_avx512()) return;
+
+    auto a = k.declare_vec_alias(Zmm(5));
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    CYBOZU_TEST_ASSERT(a.has_stack_slot());
+
+    k.RegPoolManager::reset();
+
+    // After reset, zmm5 is back in pool and declare is allowed again.
+    CYBOZU_TEST_NO_EXCEPTION(k.declare_vec_alias(Zmm(5)));
+}
+
+// GP and vec aliases coexist in the same layout -- GP part is JIT-executed.
+CYBOZU_TEST_AUTO(managedVecAliasMixedWithGP)
+{
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            // Declare both before build.
+            auto gp_alias  = declare_alias(Reg64(10));
+            auto vec_alias = declare_vec_alias(Zmm(5));
+            auto sf        = make_stack_frame().build();
+
+            gp_alias.alloc();
+            mov(gp_alias.reg(), 0xABCD1234ULL);
+            gp_alias.save(sf);           // spill GP to its alias slot
+
+            if (has_avx512() || !get_free_vecs().empty()) {
+                vec_alias.alloc();
+                vec_alias.free();        // release without store (no-op path)
+            }
+
+            gp_alias.restore(sf);
+            mov(rax, gp_alias.reg());
+            gp_alias.free();
+            sf.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xABCD1234ULL);
+}
+
+// JIT execution: write a 32-bit value to a vec alias, save, clobber, restore,
+// read back.  Guarded on AVX availability.
+CYBOZU_TEST_AUTO(managedVecAliasSaveRestoreJIT)
+{
+    if (!g_cpu.has(Xbyak::util::Cpu::tAVX)) return;
+
+    struct Kernel : CodeGenerator, RegPoolManager {
+        Kernel() : CodeGenerator(4096), RegPoolManager(g_cpu, this) {}
+        void build() {
+            auto a  = declare_vec_alias(Zmm(5));
+            auto sf = make_stack_frame().build();
+
+            a.alloc();
+
+            // Write 0xABCD1234 into the low 32 bits of the vec register.
+            mov(eax, 0xABCD1234U);
+            vmovd(Xmm(a.reg().getIdx()), eax);
+
+            a.save(sf);  // spill to vec alias slot
+            CYBOZU_TEST_ASSERT(!a.is_active());
+
+            // Clobber: zero the register so the slot is the only copy.
+            if (has_avx512()) {
+                vpxord(Zmm(5), Zmm(5), Zmm(5));
+            } else {
+                vpxor(Ymm(5), Ymm(5), Ymm(5));
+            }
+
+            a.restore(sf);
+            CYBOZU_TEST_ASSERT(a.is_active());
+            CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+
+            // Read low 32 bits back into rax (32-bit write zero-extends to rax).
+            vmovd(eax, Xmm(a.reg().getIdx()));
+
+            a.free();
+            sf.destroy();
+            ret();
+        }
+    };
+    Kernel k;
+    k.build();
+    CYBOZU_TEST_EQUAL(call_jit(k.getCode()), (uint64_t)0xABCD1234ULL);
+}
+
+// ScopedVecAlias: basic RAII -- freed on scope exit.
+CYBOZU_TEST_AUTO(scopedVecAliasBasic)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+
+    {
+        auto g = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+    }
+
+    CYBOZU_TEST_ASSERT(!a.is_active());
+    auto v = rm.alloc<Zmm>(5);
+    CYBOZU_TEST_EQUAL(v.getIdx(), 5);
+    rm.free(v);
+}
+
+// ScopedVecAlias: explicit free() disarms the destructor.
+CYBOZU_TEST_AUTO(scopedVecAliasExplicitFree)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+
+    {
+        auto g = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+
+        g.free();  // explicit early release -- disarms destructor
+        CYBOZU_TEST_ASSERT(!a.is_active());
+
+        // zmm5 back in pool while guard still in scope.
+        auto v = rm.alloc<Zmm>(5);
+        CYBOZU_TEST_EQUAL(v.getIdx(), 5);
+        rm.free(v);
+    }  // destructor runs; must not double-free
+
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}
+
+// ScopedVecAlias: move semantics -- moved-from is disarmed.
+CYBOZU_TEST_AUTO(scopedVecAliasMove)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+
+    RegPoolManager::ScopedVecAlias g2 = [&]() {
+        auto g1 = a.scoped();
+        CYBOZU_TEST_ASSERT(a.is_active());
+        return g1;  // move-construct g2; g1 is disarmed
+    }();
+    CYBOZU_TEST_ASSERT(a.is_active());  // g2 still owns the alias
+
+    g2.free();
+    CYBOZU_TEST_ASSERT(!a.is_active());
+}

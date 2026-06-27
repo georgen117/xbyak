@@ -94,7 +94,7 @@ The existing `alloc<T>()`, `free()`, `makeScoped()`, `reg_in_use()` etc. are unc
 - [x] 28. RAII Wrapper for `ManagedAlias`: `ScopedAlias`
 - [x] 29. Post-`build()` `declare_alias()` Detection
 - [x] 30. Exclusive Sequential Alias: `declare_alias(reg, AliasMode::no_slot)`
-- [ ] 31. `ManagedAlias` for Vector Registers: `ManagedVecAlias`
+- [x] 31. `ManagedAlias` for Vector Registers: `ManagedVecAlias`
 
 ---
 
