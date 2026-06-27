@@ -4103,10 +4103,11 @@ CYBOZU_TEST_AUTO(managedVecAliasSaveRestoreJIT)
             CYBOZU_TEST_ASSERT(!a.is_active());
 
             // Clobber: zero the register so the slot is the only copy.
+            // Use vxorps (float XOR) on AVX because vpxor ymm requires AVX2.
             if (has_avx512()) {
                 vpxord(Zmm(5), Zmm(5), Zmm(5));
             } else {
-                vpxor(Ymm(5), Ymm(5), Ymm(5));
+                vxorps(Ymm(5), Ymm(5), Ymm(5));  // AVX: 256-bit float XOR
             }
 
             a.restore(sf);
