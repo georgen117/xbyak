@@ -4189,3 +4189,45 @@ CYBOZU_TEST_AUTO(scopedVecAliasMove)
     g2.free();
     CYBOZU_TEST_ASSERT(!a.is_active());
 }
+
+// ScopedAlias register accessors: get(), implicit conversion, getIdx(), getBit().
+// The guard itself should be usable directly at Xbyak instruction sites without
+// a separate ManagedAlias reference.
+CYBOZU_TEST_AUTO(scopedAliasAccessors)
+{
+    RegPoolManager rm(g_cpu);
+    auto a = rm.declare_alias(Reg64(10));
+    auto g = a.scoped();
+
+    // get() returns the underlying Reg64.
+    CYBOZU_TEST_EQUAL(g.get().getIdx(), 10);
+
+    // Forwarding accessors.
+    CYBOZU_TEST_EQUAL(g.getIdx(), 10);
+    CYBOZU_TEST_EQUAL(g.getBit(), 64);
+
+    // Implicit conversion: const Reg64& binds directly from the guard.
+    const Xbyak::Reg64 &r = g;
+    CYBOZU_TEST_EQUAL(r.getIdx(), 10);
+}
+
+// ScopedVecAlias register accessors: get(), implicit conversion, getIdx(), getBit().
+CYBOZU_TEST_AUTO(scopedVecAliasAccessors)
+{
+    RegPoolManager rm(g_cpu);
+    if (rm.get_free_vecs().empty() && !rm.has_avx512()) return;
+
+    auto a = rm.declare_vec_alias(Zmm(5));
+    auto g = a.scoped();
+
+    // get() returns the underlying Zmm.
+    CYBOZU_TEST_EQUAL(g.get().getIdx(), 5);
+
+    // Forwarding accessors.
+    CYBOZU_TEST_EQUAL(g.getIdx(), 5);
+    CYBOZU_TEST_EQUAL(g.getBit(), 512);
+
+    // Implicit conversion: const Zmm& binds directly from the guard.
+    const Xbyak::Zmm &z = g;
+    CYBOZU_TEST_EQUAL(z.getIdx(), 5);
+}

@@ -947,6 +947,15 @@ public:
             alias_ = nullptr;
         }
 
+        // Register accessors -- forward to the underlying ManagedAlias.
+        // Allow ScopedAlias to be used directly at Xbyak instruction sites
+        // without keeping a separate ManagedAlias reference in scope.
+        // Asserts active state (delegates to ManagedAlias::get()).
+        const Xbyak::Reg64 &get()  const { return alias_->get(); }
+        operator const Xbyak::Reg64 &()  const { return get(); }
+        int getIdx() const { return alias_->get().getIdx(); }
+        int getBit() const { return alias_->get().getBit(); }
+
     private:
         ManagedAlias *alias_;
     };
@@ -1058,6 +1067,15 @@ public:
             if (alias_ && alias_->is_active()) alias_->free();
             alias_ = nullptr;
         }
+
+        // Register accessors -- forward to the underlying ManagedVecAlias.
+        // Allow ScopedVecAlias to be used directly at Xbyak instruction sites
+        // without keeping a separate ManagedVecAlias reference in scope.
+        // Asserts active state (delegates to ManagedVecAlias::get()).
+        const Xbyak::Zmm &get()  const { return alias_->get(); }
+        operator const Xbyak::Zmm &()  const { return get(); }
+        int getIdx() const { return alias_->get().getIdx(); }
+        int getBit() const { return alias_->get().getBit(); }
 
     private:
         ManagedVecAlias *alias_;

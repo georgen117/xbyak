@@ -4129,39 +4129,32 @@ throws.  That assertion would need to be removed or changed to
 
 `Scoped<RegT>` (returned by `makeScoped()`) calls `rm_.free(reg)` in its destructor
 for plain allocated registers.  No equivalent exists for `ManagedAlias`.  Without
-one, every `prime()` call requires a matching `release()` or `free()` somewhere in
-the code, including on every error path.  The pattern
-
-```cpp
-L("error_exit");
-alias_a.free();
-alias_b.free();
-```
-
-is both boilerplate and fragile: adding a third alias to the kernel silently misses
-the error-path cleanup unless every such label is updated by hand.
+one, every `alloc()` call requires a matching `free()` somewhere in the code,
+including on every error path.
 
 In Phase 3c evaluation, Bug 4 required `alias_aux_A_vpad_bottom.free()` to be
 added unconditionally before `store_accumulators()` to ensure correctness on the
 FWD_I path.  Idempotent `free()` resolved the safety concern, but a `ScopedAlias`
-would have made the ownership intent self-documenting and independent of whether the
-alias was actually active at the exit point.
+makes ownership intent self-documenting and independent of whether the alias was
+actually active at the exit point.
 
 ### Proposed API
 
 `ScopedAlias` is a move-only RAII guard that calls `alias.free()` in its destructor
 if the alias is still active.  It is constructed by `ManagedAlias::scoped()`, which
-also calls `prime()` so that declaration and activation are a single step.
+also calls `alloc()` so declaration and activation are a single step.
+
+It also exposes `get()`, `getIdx()`, `getBit()`, and `operator const Reg64&()` so the
+guard itself can be passed directly to Xbyak instruction helpers without keeping a
+separate `ManagedAlias` reference in scope.
 
 ```cpp
-// Move-only RAII owner for a ManagedAlias in ACTIVE state.
-// Calls alias.free() in its destructor if the alias is still active.
 class ScopedAlias {
 public:
     explicit ScopedAlias(ManagedAlias &alias) : alias_(&alias) {}
 
     ~ScopedAlias() {
-        if (alias_ && alias_->is_active()) alias_->release();
+        if (alias_ && alias_->is_active()) alias_->free();
     }
 
     ScopedAlias(const ScopedAlias &)            = delete;
@@ -4173,44 +4166,53 @@ public:
     // Explicit early release -- disarms the destructor.
     // No-op if the alias is already inactive.
     void free() {
-        if (alias_ && alias_->is_active()) alias_->release();
+        if (alias_ && alias_->is_active()) alias_->free();
         alias_ = nullptr;
     }
+
+    // Register accessors -- forward to the underlying ManagedAlias.
+    // Allow the guard to be used directly at Xbyak instruction sites.
+    const Xbyak::Reg64 &get()             const { return alias_->get(); }
+    operator const Xbyak::Reg64 &()       const { return get(); }
+    int getIdx()                           const { return alias_->get().getIdx(); }
+    int getBit()                           const { return alias_->get().getBit(); }
 
 private:
     ManagedAlias *alias_;
 };
 
-// Factory on ManagedAlias -- prime() the alias and return a RAII guard.
-// After this call alias.is_active() == true and the guard owns the release.
+// Factory on ManagedAlias -- alloc() the alias and return a RAII guard.
 ScopedAlias ManagedAlias::scoped();
 ```
 
+`ScopedVecAlias` has the same accessors for `Xbyak::Zmm`.
+
 ### Internal State Changes
 
-None on `RegPoolManager` or `StackFrame`.  `ScopedAlias` is a thin wrapper around
-`ManagedAlias &` with no additional manager state.
+None.  `ScopedAlias` is a thin wrapper around `ManagedAlias &`.
+
+### Usage Example -- Using the guard directly at instruction sites
+
+```cpp
+// Without the accessors: must keep both the guard AND the alias in scope.
+auto a   = rm.declare_alias(rax);
+auto g   = a.scoped();
+mov(a, qword[rdi]);   // implicit conversion on ManagedAlias
+
+// With the accessors: guard is the only variable needed.
+auto g = rm.declare_alias(rax).scoped();
+mov(g, qword[rdi]);   // implicit conversion on ScopedAlias directly
+// rax freed automatically when g goes out of scope
+```
 
 ### Usage Example -- Error-path cleanup
 
 ```cpp
-// Without ScopedAlias: every exit path must list all active aliases manually.
-alias_src.alloc();
-alias_dst.alloc();
-if (error_condition) {
-    alias_src.free();  // easy to miss when a new alias is added later
-    alias_dst.free();
-    return;
-}
-use(alias_src, alias_dst);
-alias_src.free();
-alias_dst.free();
-
-// With ScopedAlias: destructor handles free on all paths.
+// ScopedAlias: destructor handles free on all paths.
 auto g_src = alias_src.scoped();   // alloc() + RAII guard
 auto g_dst = alias_dst.scoped();
 if (error_condition) return;       // both freed automatically by destructors
-use(alias_src, alias_dst);
+use(g_src, g_dst);                 // use guards directly -- no alias_ needed
 // both released when g_src and g_dst go out of scope
 ```
 
@@ -4219,30 +4221,22 @@ use(alias_src, alias_dst);
 ```cpp
 auto g = alias_binary_params.scoped();  // alloc(); guard armed
 
-// ... use alias_binary_params to load the binary params pointer ...
+// ... use g directly to load the pointer ...
+mov(g, qword[rdi + offset]);
 
-// Must save before the register is needed by another alias.
-// Call save() explicitly, then disarm the guard (register is already free).
-alias_binary_params.save(*sf_main_);  // ACTIVE -> DORMANT; free(reg)
-g.free();                          // disarm: alias already inactive, no double-free
+// Save before the register is needed elsewhere, then disarm.
+alias_binary_params.save(sf);  // ACTIVE -> DORMANT; reg returned to pool
+g.free();                      // disarm: alias already inactive, no double-free
 ```
 
 ### Notes / Interactions
 
-- `ScopedAlias` calls `free()`, not `save()`.  It is appropriate only for aliases
-  whose value does not need to be persisted at scope exit.  Aliases that must be saved
-  before releasing should call `save()` explicitly first; the guard's `free()` then
-  becomes a no-op because `is_active()` is already false after `save()`.
-- `scoped()` calls `alloc()`.  If the alias is a no-slot alias (§30), `alloc()` throws
-  `GP_IN_USE` when another alias holds the same register; the `ScopedAlias` object is
-  never returned.  No cleanup is needed in the throwing path.
-- For slotted aliases that require `restore()` rather than `alloc()` at activation,
-  `ScopedAlias` is not directly applicable.  A `RestoredAlias` variant that calls
-  `restore(cl)` in its constructor could be added as a companion, but its destructor
-  semantics are less clear (should it `save()` or `release()`?).  This is left as a
-  future extension.
-- `ScopedVecAlias` (analogous wrapper for `ManagedVecAlias`, §31) should be added
-  alongside `ScopedAlias` for consistency.
+- `ScopedAlias` calls `free()`, not `save()`.  Aliases whose value must persist at
+  scope exit should call `save()` explicitly first; the guard's destructor then
+  becomes a no-op because `is_active()` is already false.
+- `scoped()` calls `alloc()`.  If the alias is no-slot (§30) and another alias already
+  holds the same register, `alloc()` throws `GP_IN_USE`; the guard is never returned.
+- `ScopedVecAlias` mirrors `ScopedAlias` for `ManagedVecAlias` (§31).
 
 ---
 
