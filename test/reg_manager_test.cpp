@@ -3206,7 +3206,7 @@ CYBOZU_TEST_AUTO(managedAliasPatterns)
         CYBOZU_TEST_ASSERT(a.has_stack_slot());
         CYBOZU_TEST_ASSERT(!a.is_active());
         // reg() must throw before prime().
-        CYBOZU_TEST_EXCEPTION(a.reg(), Xbyak::RegManagerError);
+        CYBOZU_TEST_EXCEPTION(a.get(), Xbyak::RegManagerError);
         // r10 is not reserved -- declare_alias does not lock it from alloc().
         CYBOZU_TEST_ASSERT(!rm.is_reserved<Reg64>(10));
         // general alloc is free to return r10.
@@ -3227,7 +3227,7 @@ CYBOZU_TEST_AUTO(managedAliasPatterns)
             CYBOZU_TEST_ASSERT(!b.is_active());  // lazy: not active until alloc()
             b.alloc();
             CYBOZU_TEST_ASSERT(b.is_active());
-            CYBOZU_TEST_EQUAL(b.reg().getIdx(), 16);
+            CYBOZU_TEST_EQUAL(b.get().getIdx(), 16);
             b.free();
         } else {
             // On non-APX: r16 is treated as no-slot regardless, but we use
@@ -3246,7 +3246,7 @@ CYBOZU_TEST_AUTO(managedAliasPatterns)
         CYBOZU_TEST_ASSERT(!c.is_active());  // lazy: not active until alloc()
         c.alloc();
         CYBOZU_TEST_ASSERT(c.is_active());
-        CYBOZU_TEST_EQUAL(c.reg().getIdx(), 11);
+        CYBOZU_TEST_EQUAL(c.get().getIdx(), 11);
         c.free();
     }
 
@@ -3258,7 +3258,7 @@ CYBOZU_TEST_AUTO(managedAliasPatterns)
         CYBOZU_TEST_ASSERT(!c.is_active());
         c.alloc();
         CYBOZU_TEST_ASSERT(c.is_active());
-        CYBOZU_TEST_EQUAL(c.reg().getIdx(), 10);
+        CYBOZU_TEST_EQUAL(c.get().getIdx(), 10);
         c.free();
     }
 }
@@ -3277,7 +3277,7 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
         a.alloc();
 
         CYBOZU_TEST_ASSERT(a.is_active());
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 10);
 
         // r10 is now live; a second named alloc must throw.
         CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(10), Xbyak::RegManagerError);
@@ -3308,7 +3308,7 @@ CYBOZU_TEST_AUTO(managedAliasPrime)
         a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
         // reg() returns a valid register (index in [0,15]).
-        CYBOZU_TEST_ASSERT(a.reg().getIdx() < 16);
+        CYBOZU_TEST_ASSERT(a.get().getIdx() < 16);
         a.free();
     }
 }
@@ -3326,12 +3326,12 @@ CYBOZU_TEST_AUTO(managedAliasNoSlotActive)
 
     a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 11);
 
     // alloc() when already active is a no-op.
     a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 11);
 
     // r11 is now live; another alloc of r11 must throw.
     CYBOZU_TEST_EXCEPTION(rm.alloc<Reg64>(11), Xbyak::RegManagerError);
@@ -3367,7 +3367,7 @@ CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
         // Re-prime.
         a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 10);
         a.free();
     }
 
@@ -3385,7 +3385,7 @@ CYBOZU_TEST_AUTO(managedAliasFreeAndReprime)
 
         a.alloc();
         CYBOZU_TEST_ASSERT(a.is_active());
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 11);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 11);
         a.free();
     }
 
@@ -3486,7 +3486,7 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
             auto sf = make_stack_frame().build();
 
             a.alloc();                          // allocate r10
-            mov(a.reg(), 0xABCD1234ULL);        // r10 = 0xABCD1234
+            mov(a.get(), 0xABCD1234ULL);        // r10 = 0xABCD1234
 
             a.save(sf);                         // [rsp+<off>] = r10; free r10
             CYBOZU_TEST_ASSERT(!a.is_active());
@@ -3498,9 +3498,9 @@ CYBOZU_TEST_AUTO(managedAliasSaveRestoreJIT)
 
             a.restore(sf);                      // allocate r10; load from slot
             CYBOZU_TEST_ASSERT(a.is_active());
-            CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+            CYBOZU_TEST_EQUAL(a.get().getIdx(), 10);
 
-            mov(rax, a.reg());                  // rax = 0xABCD1234
+            mov(rax, a.get());                  // rax = 0xABCD1234
             a.free();
 
             sf.destroy();
@@ -3528,7 +3528,7 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
             // Use r11 for the park slot.
             auto park_reg = alloc<Reg64>(11);
 
-            mov(a.reg(),  0x1111111111111111ULL);
+            mov(a.get(),  0x1111111111111111ULL);
             mov(park_reg, 0x2222222222222222ULL);
 
             // Save both independently.
@@ -3549,9 +3549,9 @@ CYBOZU_TEST_AUTO(managedAliasMixedWithParks)
 
             // Return sum: must equal 0x1111... + 0x2222... = 0x3333...
             // Use park_reg as base so that if reload allocated rax, the
-            // subsequent mov(rax, a.reg()) does not clobber it first.
+            // subsequent mov(rax, a.get()) does not clobber it first.
             mov(rax, park_reg);
-            add(rax, a.reg());
+            add(rax, a.get());
 
             a.free();
             free(park_reg);
@@ -3581,8 +3581,8 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
             CYBOZU_TEST_ASSERT(a.is_active());
 
             // Write a known value, save to slot, clobber, restore, read back.
-            const int idx = a.reg().getIdx();
-            mov(a.reg(), 0xCAFEBABEULL);
+            const int idx = a.get().getIdx();
+            mov(a.get(), 0xCAFEBABEULL);
             a.save(sf);
 
             // Use the same physical register with a different value.
@@ -3591,7 +3591,7 @@ CYBOZU_TEST_AUTO(managedAliasAnonymous)
             free(r_tmp);
 
             a.restore(sf);
-            mov(rax, a.reg());
+            mov(rax, a.get());
             a.free();
 
             sf.destroy();
@@ -3615,7 +3615,7 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
             auto sf = make_stack_frame().build();
 
             a.alloc();
-            mov(a.reg(), 0xBEEFCAFEULL);
+            mov(a.get(), 0xBEEFCAFEULL);
 
             a.save(sf);                  // slot = 0xBEEFCAFE; r10 freed
             CYBOZU_TEST_ASSERT(!a.is_active());
@@ -3630,9 +3630,9 @@ CYBOZU_TEST_AUTO(managedAliasReleaseNoStore)
             // Slot must still hold the value written by save().
             a.restore(sf);
             CYBOZU_TEST_ASSERT(a.is_active());
-            CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+            CYBOZU_TEST_EQUAL(a.get().getIdx(), 10);
 
-            mov(rax, a.reg());           // rax = 0xBEEFCAFE
+            mov(rax, a.get());           // rax = 0xBEEFCAFE
             a.free();
 
             sf.destroy();
@@ -3658,7 +3658,7 @@ CYBOZU_TEST_AUTO(aliasDeclareNoSlotBasic)
 
     a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 9);
 
     a.free();
     CYBOZU_TEST_ASSERT(!a.is_active());
@@ -3687,7 +3687,7 @@ CYBOZU_TEST_AUTO(aliasDeclareNoSlotMutualExclusion)
     // Now b can alloc.
     CYBOZU_TEST_NO_EXCEPTION(b.alloc();)
     CYBOZU_TEST_ASSERT(b.is_active());
-    CYBOZU_TEST_EQUAL(b.reg().getIdx(), 9);
+    CYBOZU_TEST_EQUAL(b.get().getIdx(), 9);
     b.free();
 }
 
@@ -3699,16 +3699,16 @@ CYBOZU_TEST_AUTO(aliasDeclareNoSlotSequential)
     auto b = rm.declare_alias(Reg64(9), AliasMode::no_slot);
 
     a.alloc();
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 9);
     a.free();
 
     b.alloc();
-    CYBOZU_TEST_EQUAL(b.reg().getIdx(), 9);
+    CYBOZU_TEST_EQUAL(b.get().getIdx(), 9);
     b.free();
 
     // Can cycle a again after b released r9.
     a.alloc();
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 9);
     a.free();
 }
 
@@ -3722,7 +3722,7 @@ CYBOZU_TEST_AUTO(aliasDeclareNoSlotViaThreeArg)
         CYBOZU_TEST_ASSERT(!a.has_stack_slot());
         CYBOZU_TEST_ASSERT(!a.is_active());
         a.alloc();
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 9);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 9);
         a.free();
     }
     // use_alt=false path: slotted alias on primary register.
@@ -3732,7 +3732,7 @@ CYBOZU_TEST_AUTO(aliasDeclareNoSlotViaThreeArg)
         CYBOZU_TEST_ASSERT(a.has_stack_slot());
         CYBOZU_TEST_ASSERT(!a.is_active());
         a.alloc();
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 8);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 8);
         a.free();
     }
 }
@@ -3842,7 +3842,7 @@ CYBOZU_TEST_AUTO(scopedAliasBasic)
     {
         auto g = a.scoped();
         CYBOZU_TEST_ASSERT(a.is_active());
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 10);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 10);
     }  // guard destroyed here
 
     // After the guard exits, the alias must be inactive and r10 back in pool.
@@ -3958,7 +3958,7 @@ CYBOZU_TEST_AUTO(managedVecAliasBasic)
 
     a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 5);
 
     a.free();
     CYBOZU_TEST_ASSERT(!a.is_active());
@@ -3992,7 +3992,7 @@ CYBOZU_TEST_AUTO(managedVecAliasAllocIdempotent)
     CYBOZU_TEST_ASSERT(a.is_active());
     CYBOZU_TEST_NO_EXCEPTION(a.alloc();)  // second alloc: no-op, no throw
     CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+    CYBOZU_TEST_EQUAL(a.get().getIdx(), 5);
     a.free();
 }
 
@@ -4025,7 +4025,7 @@ CYBOZU_TEST_AUTO(managedVecAliasAnonymous)
 
     a.alloc();
     CYBOZU_TEST_ASSERT(a.is_active());
-    CYBOZU_TEST_ASSERT(a.reg().getIdx() >= 0);
+    CYBOZU_TEST_ASSERT(a.get().getIdx() >= 0);
     a.free();
     CYBOZU_TEST_ASSERT(!a.is_active());
 }
@@ -4061,7 +4061,7 @@ CYBOZU_TEST_AUTO(managedVecAliasMixedWithGP)
             auto sf        = make_stack_frame().build();
 
             gp_alias.alloc();
-            mov(gp_alias.reg(), 0xABCD1234ULL);
+            mov(gp_alias.get(), 0xABCD1234ULL);
             gp_alias.save(sf);           // spill GP to its alias slot
 
             if (has_avx512() || !get_free_vecs().empty()) {
@@ -4070,7 +4070,7 @@ CYBOZU_TEST_AUTO(managedVecAliasMixedWithGP)
             }
 
             gp_alias.restore(sf);
-            mov(rax, gp_alias.reg());
+            mov(rax, gp_alias.get());
             gp_alias.free();
             sf.destroy();
             ret();
@@ -4097,7 +4097,7 @@ CYBOZU_TEST_AUTO(managedVecAliasSaveRestoreJIT)
 
             // Write 0xABCD1234 into the low 32 bits of the vec register.
             mov(eax, 0xABCD1234U);
-            vmovd(Xmm(a.reg().getIdx()), eax);
+            vmovd(Xmm(a.get().getIdx()), eax);
 
             a.save(sf);  // spill to vec alias slot
             CYBOZU_TEST_ASSERT(!a.is_active());
@@ -4112,10 +4112,10 @@ CYBOZU_TEST_AUTO(managedVecAliasSaveRestoreJIT)
 
             a.restore(sf);
             CYBOZU_TEST_ASSERT(a.is_active());
-            CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+            CYBOZU_TEST_EQUAL(a.get().getIdx(), 5);
 
             // Read low 32 bits back into rax (32-bit write zero-extends to rax).
-            vmovd(eax, Xmm(a.reg().getIdx()));
+            vmovd(eax, Xmm(a.get().getIdx()));
 
             a.free();
             sf.destroy();
@@ -4138,7 +4138,7 @@ CYBOZU_TEST_AUTO(scopedVecAliasBasic)
     {
         auto g = a.scoped();
         CYBOZU_TEST_ASSERT(a.is_active());
-        CYBOZU_TEST_EQUAL(a.reg().getIdx(), 5);
+        CYBOZU_TEST_EQUAL(a.get().getIdx(), 5);
     }
 
     CYBOZU_TEST_ASSERT(!a.is_active());

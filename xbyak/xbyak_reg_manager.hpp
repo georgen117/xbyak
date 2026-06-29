@@ -252,16 +252,24 @@ public:
             }
         }
 
-        // XCR0[1] = SSE/XMM state, XCR0[2] = AVX/YMM upper half.
+        // XMM register availability (xmm0-xmm15), has_xmm_base:
         //
-        // has_xmm_base: XMM register pool is safe to use.  On OSXSAVE-capable
-        // CPUs the OS must have set XCR0[1] (SSE state save).  On older CPUs
-        // without OSXSAVE (e.g. Nehalem/SSE4.2), the OS saves XMM state via
-        // FXSAVE, so SSE2 presence is sufficient.
+        //   Pre-XSAVE CPUs (no OSXSAVE, e.g. Nehalem/SSE4.2):
+        //     FXSAVE/FXRSTOR are the sole OS context-switch mechanism for
+        //     XMM state, and they save all 16 XMM registers unconditionally.
+        //     SSE2 presence implies FXSAVE support (CPUID EDX[24] = FXSR),
+        //     so tSSE2 is sufficient to confirm xmm0-xmm15 are available.
         //
-        // has_vec_base: YMM/VEX capability -- requires both XCR0[1] and XCR0[2]
-        // (YMM upper-half save).  Guards VEX-encoded emission (vmovdqu ymm,
-        // vmovdqu32 zmm) in save_volatiles / restore_volatiles.
+        //   XSAVE-capable CPUs (OSXSAVE present, e.g. Sandy Bridge and later):
+        //     XCR0[1] is the "SSE state" bit.  The OS sets it to indicate that
+        //     XMM registers are included in XSAVE context saves, confirming
+        //     xmm0-xmm15 are available.
+        //
+        // YMM/VEX capability, has_vec_base:
+        //     Requires both XCR0[1] (SSE/XMM state) and XCR0[2] (AVX state --
+        //     the upper 128 bits of each YMM register).  Only meaningful when
+        //     OSXSAVE is present.  Guards VEX-encoded emission (vmovdqu ymm,
+        //     vmovdqu32 zmm) in save_volatiles / restore_volatiles.
         const bool has_xmm_base = cpu.has(Xbyak::util::Cpu::tOSXSAVE)
             ? ((xcr0 >> 1) & 1) == 1
             : cpu.has(Xbyak::util::Cpu::tSSE2);
@@ -843,10 +851,13 @@ public:
               is_active_(false), reg_(0), rm_(nullptr) {}
 
         // Returns the allocated register.  Asserts active state.
-        const Xbyak::Reg64 &reg() const {
+        const Xbyak::Reg64 &get() const {
             if (!is_active_) RM_THROW_RET(RmError::GP_NOT_AVAILABLE, reg_)
             return reg_;
         }
+        // Implicit conversion -- allows passing a ManagedAlias directly to
+        // Xbyak instruction helpers.  Asserts active state.
+        operator const Xbyak::Reg64 &() const { return get(); }
         bool has_stack_slot() const { return needs_slot_; }
         bool is_active()      const { return is_active_; }
 
@@ -855,7 +866,7 @@ public:
         // Named aliases (slotted or no-slot): throw GP_IN_USE if the register
         // is held by another allocation.
         // Anonymous aliases: pick any available GP register.
-        // Returns *this for chaining: alias.alloc().reg() or alias.alloc().save(sf).
+        // Returns *this for chaining: alias.alloc().get() or alias.alloc().save(sf).
         ManagedAlias& alloc() {
             if (is_active_) return *this;
             if (desired_idx_ >= 0) {
@@ -877,7 +888,7 @@ public:
         ManagedAlias& save(StackFrame &sf);
 
         // Reload from the stack slot and re-acquire the register.  Slot-backed only.
-        // Returns *this for chaining: alias.restore(sf).reg().
+        // Returns *this for chaining: alias.restore(sf).get().
         // Defined out-of-line after StackFrame.
         ManagedAlias& restore(StackFrame &sf);
 
@@ -944,7 +955,7 @@ public:
     //
     // Lifecycle mirrors ManagedAlias but operates on Zmm/Ymm/Xmm registers.
     // The active register is always represented as Xbyak::Zmm; callers narrow
-    // to Ymm or Xmm at use sites via Ymm(reg().getIdx()) if needed.
+    // to Ymm or Xmm at use sites via Ymm(alias.get().getIdx()) if needed.
     //
     // Lifecycle:
     //   1. declare_vec_alias(zmm/ymm/xmm)  -- created by RegPoolManager
@@ -963,10 +974,13 @@ public:
 
         // Returns the currently active register (always Zmm).
         // Throws GP_NOT_AVAILABLE if the alias is not active.
-        const Xbyak::Zmm &reg() const {
+        const Xbyak::Zmm &get() const {
             if (!is_active_) RM_THROW_RET(RmError::GP_NOT_AVAILABLE, reg_)
             return reg_;
         }
+        // Implicit conversion -- allows passing a ManagedVecAlias directly to
+        // Xbyak instruction helpers.  Asserts active state.
+        operator const Xbyak::Zmm &() const { return get(); }
 
         bool is_active()     const { return is_active_; }
         bool has_stack_slot() const { return alias_id_ >= 0; }

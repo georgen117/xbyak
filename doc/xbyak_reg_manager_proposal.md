@@ -3681,7 +3681,12 @@ class ManagedAlias {
 public:
     // Returns the currently active register.
     // Precondition: is_active() == true. Asserts or throws otherwise.
-    const Xbyak::Reg64 &reg() const;
+    const Xbyak::Reg64 &get() const;
+
+    // Implicit conversion to the underlying register type.
+    // Allows passing a ManagedAlias directly to Xbyak instruction helpers.
+    // Precondition: is_active() == true. Asserts or throws otherwise.
+    operator const Xbyak::Reg64 &() const;
 
     // True when a stack slot was reserved for this alias.
     // False on the APX no-slot path.
@@ -3691,7 +3696,8 @@ public:
     bool is_active() const;
 
     // DORMANT -> ACTIVE: allocate register, emit no load.
-    // Use for first-time initialization; write the value to reg() after calling.
+    // Use for first-time initialization; write the value after calling
+    // (the alias converts implicitly to Reg64, or call .get() explicitly).
     //
     // Slotted path: allocates desired_idx_ (or any GP if anonymous).
     //   Throws GP_IN_USE if the named register is not available.
@@ -3871,19 +3877,19 @@ class MultiBufferKernel : public CodeGenerator, public RegPoolManager {
 
         // Load all named values once into their slots.
         src_ptr_.alloc();
-        mov(src_ptr_.reg(), ptr[param + 0]);
+        mov(src_ptr_, ptr[param + 0]);
         src_ptr_.save(layout);        // store to slot, free register
 
         dst_ptr_.alloc();
-        mov(dst_ptr_.reg(), ptr[param + 8]);
+        mov(dst_ptr_, ptr[param + 8]);
         dst_ptr_.save(layout);
 
         scale_ptr_.alloc();
-        mov(scale_ptr_.reg(), ptr[param + 16]);
+        mov(scale_ptr_, ptr[param + 16]);
         scale_ptr_.save(layout);
 
         bias_ptr_.alloc();
-        mov(bias_ptr_.reg(), ptr[param + 24]);
+        mov(bias_ptr_, ptr[param + 24]);
         bias_ptr_.save(layout);
 
         free(param);
@@ -3891,14 +3897,14 @@ class MultiBufferKernel : public CodeGenerator, public RegPoolManager {
         // Phase 1: process with src and scale.
         scale_ptr_.restore(layout);
         src_ptr_.restore(layout);
-        // ... use src_ptr_.reg() and scale_ptr_.reg() ...
+        // ... use src_ptr_ and scale_ptr_ directly (implicit conversion to Reg64) ...
         src_ptr_.free();    // read-only: slot still valid, no store needed
         scale_ptr_.free();
 
         // Phase 2: write output using dst and bias.
         bias_ptr_.restore(layout);
         dst_ptr_.restore(layout);
-        // ... write output using dst_ptr_.reg() and bias_ptr_.reg() ...
+        // ... write output using dst_ptr_ and bias_ptr_ directly ...
         dst_ptr_.save(layout);   // modified: must persist
         bias_ptr_.free();
 
@@ -3932,12 +3938,12 @@ auto layout = make_stack_frame().build();
 
 // Initialization -- identical code on both paths.
 out_ptr.alloc();
-mov(out_ptr.reg(), ptr[rdi + 0]);
+mov(out_ptr, ptr[rdi + 0]);
 out_ptr.save(layout);   // APX: no-op; non-APX: mov [slot], rax; free rax
 
 // Use site -- identical code on both paths.
 out_ptr.restore(layout);          // APX: no-op; non-APX: alloc rax, load slot
-vmovaps(ptr[out_ptr.reg()], zmm0);
+vmovaps(ptr[out_ptr], zmm0);
 out_ptr.free();                // APX: no-op; non-APX: free rax
 
 // End of kernel.
@@ -3958,15 +3964,15 @@ ManagedAlias loop_var = declare_alias(rcx, rbp, use_rbp);
 
 auto layout = make_stack_frame().build();
 loop_var.alloc();
-xor_(loop_var.reg(), loop_var.reg());    // initialize counter to 0
+xor_(loop_var, loop_var);    // initialize counter to 0
 
 loop_var.save(layout);  // rbp path: no-op; rcx path: store slot, free rcx
 
 L("loop_top");
 // ... body that uses rcx for other work ...
 loop_var.restore(layout);
-inc(loop_var.reg());
-cmp(loop_var.reg(), trip_count);
+inc(loop_var);
+cmp(loop_var, trip_count);
 loop_var.save(layout);
 jl("loop_top");
 
@@ -3984,17 +3990,17 @@ ManagedAlias cfg = declare_alias<Reg64>();
 
 auto layout = make_stack_frame().build();
 cfg.alloc();
-mov(cfg.reg(), ptr[rdi + 8]);    // load config pointer from params
+mov(cfg, ptr[rdi + 8]);    // load config pointer from params
 cfg.save(layout);                // store to slot, free register
 
 // Read-only use 1.
 cfg.restore(layout);             // alloc reg, load from slot
-mov(rax, ptr[cfg.reg() + 0]);   // read first field
+mov(rax, ptr[cfg + 0]);   // read first field; .get() available for explicit access
 cfg.free();                   // free reg; NO store emitted -- slot still valid
 
 // Read-only use 2, later in the kernel.
 cfg.restore(layout);
-vmovaps(zmm0, ptr[cfg.reg() + 64]);
+vmovaps(zmm0, ptr[cfg + 64]);
 cfg.free();                   // again: free without store
 
 // Each restore/release pair costs one load and zero stores.
@@ -4196,7 +4202,7 @@ if (error_condition) {
     alias_dst.free();
     return;
 }
-use(alias_src.reg(), alias_dst.reg());
+use(alias_src, alias_dst);
 alias_src.free();
 alias_dst.free();
 
@@ -4204,7 +4210,7 @@ alias_dst.free();
 auto g_src = alias_src.scoped();   // alloc() + RAII guard
 auto g_dst = alias_dst.scoped();
 if (error_condition) return;       // both freed automatically by destructors
-use(alias_src.reg(), alias_dst.reg());
+use(alias_src, alias_dst);
 // both released when g_src and g_dst go out of scope
 ```
 
@@ -4213,7 +4219,7 @@ use(alias_src.reg(), alias_dst.reg());
 ```cpp
 auto g = alias_binary_params.scoped();  // alloc(); guard armed
 
-// ... use alias_binary_params.reg() to load the binary params pointer ...
+// ... use alias_binary_params to load the binary params pointer ...
 
 // Must save before the register is needed by another alias.
 // Call save() explicitly, then disarm the guard (register is already free).
@@ -4519,17 +4525,17 @@ ManagedAlias alias_aux_comp = declare_alias(r9, AliasMode::no_slot);
 
 // In icb_loop(): r9 serves as the icb loop counter.
 alias_icb.alloc();                        // alloc r9 from pool
-xor_(alias_icb.reg(), alias_icb.reg());  // initialize counter
+xor_(alias_icb, alias_icb);  // initialize counter
 L("icb_loop_start");
-// ... loop body using alias_icb.reg() as r9 ...
-dec(alias_icb.reg());
+// ... loop body using alias_icb as r9 ...
+dec(alias_icb);
 jnz("icb_loop_start");
 alias_icb.free();                      // free r9 back to pool
 
 // In store_accumulators(): r9 serves as an auxiliary output pointer.
 alias_aux_comp.alloc();                   // alloc r9: safe, alias_icb released it
-lea(alias_aux_comp.reg(), ptr[...]);
-// ... use alias_aux_comp.reg() as r9 ...
+lea(alias_aux_comp, ptr[...]);
+// ... use alias_aux_comp as r9 ...
 alias_aux_comp.free();
 
 // Bug caught automatically:
@@ -4614,7 +4620,8 @@ ManagedVecAlias declare_vec_alias(Xbyak::Xmm reg);
 class ManagedVecAlias {
 public:
     // DORMANT -> ACTIVE: alloc register, no load.
-    // Caller writes the initial value to reg() after calling prime().
+    // Caller writes the initial value after calling prime()
+    // (the alias converts implicitly to Zmm, or call .get() explicitly).
     ManagedVecAlias &prime();
 
     // DORMANT -> ACTIVE: alloc register and load value from slot.
@@ -4636,7 +4643,12 @@ public:
 
     // Returns the currently active register (always Zmm; caller narrows as needed).
     // Precondition: is_active() == true.
-    const Xbyak::Zmm &reg() const;
+    const Xbyak::Zmm &get() const;
+
+    // Implicit conversion to the underlying register type.
+    // Allows passing a ManagedVecAlias directly to Xbyak instruction helpers.
+    // Precondition: is_active() == true. Asserts or throws otherwise.
+    operator const Xbyak::Zmm &() const;
 
     bool is_active() const;
 };
@@ -4712,7 +4724,7 @@ class ScaleKernel : public Xbyak::CodeGenerator,
 
         // Broadcast the scale constant from the params pointer.
         alias_scale.alloc();
-        vbroadcastss(alias_scale.reg(), ptr[rdi + offsetof(params_t, scale)]);
+        vbroadcastss(alias_scale, ptr[rdi + offsetof(params_t, scale)]);
         alias_scale.save(sf);      // store to slot; zmm0 free for clobber window
 
         // --- clobber window: zmm0 used freely for computation ---
@@ -4722,7 +4734,7 @@ class ScaleKernel : public Xbyak::CodeGenerator,
 
         // --- use the scale constant again ---
         alias_scale.restore(sf);   // reload zmm0 from slot
-        // ... use alias_scale.reg() ...
+        // ... use alias_scale directly (implicit Zmm conversion) ...
         alias_scale.free();     // read-only: slot still valid, no store needed
 
         alias_scale.free();
